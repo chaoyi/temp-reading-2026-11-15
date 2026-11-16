@@ -27,7 +27,8 @@ to open in Perfetto or DevTools next to the page.
 | 10 | The libraries' own showcases and benchmarks | `showcases.html` |
 | 11 | Diagnose these traces; study design; synthesis | `clinic.html` |
 
-Each step holds one question, shows the trace evidence (a thread-lane chart
+Modules 2–11 add 168 steps to Module 1's 32, over about 200 recorded
+scenarios. Each step holds one question, shows the trace evidence (a thread-lane chart
 drawn from the trace, a table of numbers read from it, or the trace itself to
 open), names the source file that explains it, and states what may and may
 not be concluded. Steps marked *Hard learning* record a belief the trace
@@ -42,6 +43,7 @@ contradicted.
 | `traces/<id>.json.gz` | the raw traces: Chrome JSON trace format, gzipped, with the backend's spans merged in as the process "Backend (node)" |
 | `data/<id>.js`, `data/index.js` | the analysis of each trace that the pages draw from |
 | `lab/` | everything needed to re-run a case: the lab pages, the backend, the harness |
+| `notes/` | the source-reading notes the modules were written from: Chromium's frame production, scheduler and WebSocket path; regular-table and TanStack Virtual internals; Perspective's layers. Every claim carries `path:line` at the pinned revision and a tag (read in source, stated in docs, inferred) |
 
 ## Open a trace
 
