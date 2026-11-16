@@ -1,0 +1,1099 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What JavaScript costs per frame · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">4 · What JavaScript costs per frame</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="event">scroll event</span><span class="sep">→</span><span data-node="js">JavaScript</span><span class="sep">→</span>
+    <span data-node="dom">DOM writes</span><span class="sep">→</span><span data-node="layout">style + layout</span><span class="sep">→</span><span data-node="frame">frame</span>
+    <span class="sep">·</span><span data-node="sampler">sampler</span><span class="sep">·</span><span data-node="counters">counters</span>
+    <span class="sep">·</span><span data-node="gc">GC</span><span class="sep">·</span><span data-node="jit">JIT</span>
+    <span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 4 · recorded 2026-11-16</p>
+  <h1>A table scrolls. How much JavaScript runs in each frame, and what does that amount grow with?</h1>
+  <p class="lede">The same wheel scroll goes through three table designs: a keyed row pool on TanStack Virtual, regular-table, and React on the same range math. Each runs JavaScript in every frame, but not the same amount, and not for the same reason: one does work for the rows that enter, one for every cell on screen, one renders every row and writes almost none. This module measures that work, changes one input at a time (cells, speed, formatting, memoization, allocation, warm-up), and reads each result three ways: counters, spans and the sampled profile.</p>
+  <p>At the end you should be able to look at a table design and say what its per-frame JavaScript scales with, find the function that owns the time in a sampled profile and say what the sampler can and cannot tell you, recognize garbage collection and JIT warm-up in a trace, and judge an abstraction by what it adds per frame.</p>
+  <p><b>Why this matters for Tablelab.</b> The study plan asks where the DOM rendering cost is and what should cross to the renderer. The JavaScript share of that cost is set by a design decision made before any code is optimized: whether a scroll step's work is proportional to the cells that changed or to the cells that are visible. The traces here put numbers on both, and on what formatting, an abstraction layer, allocation and cold code add on top.</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>) for the trace vocabulary, especially step 3 (JavaScript bars come from samples). Module 3 (<a href="anatomy.html">Three designs read in source</a>) explains who owns the DOM in each panel; this module only counts what that ownership costs. Frame outcomes belong to <a href="frames.html">Module 2</a>, style and layout to <a href="rendering.html">Module 5</a>; they are linked where they appear and not re-taught.</p>
+  <p><b>Three kinds of evidence.</b> A <b>counter</b> is a number the page itself counted (<code>cellsWritten</code>, <code>rowRenders</code>): exact, and it survives a noisy run. A <b>span</b> is a named interval in the trace (<code>EventDispatch</code>, our <code>app: draw</code> measure): exact in time, only where someone instrumented. A <b>sample</b> is one look at the JavaScript stack about every 0.15 ms: it sees everything, statistically. Most steps use two of the three against each other.</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57 (V8 at <code>671f7c2</code>), device scale factor 1.75, one traced run per scenario. Each scenario's wheel gesture is played twice back to back, so a scroll named 2400 px/s moves the table about <b data-m="j-cells-L-regular/content.scrolledPx"></b> px in about <b data-m="j-cells-L-regular/content.scrollMs" data-unit="ms"></b>, at <b data-m="j-cells-L-regular/content.pxPerSec"></b> px/s: about 39 px, or 1.6 rows of 24 px, per frame. Ten repeated runs of one scenario move its script total by a quarter (step 4), so differences smaller than that are not findings. Bold numbers and charts are generated from the traces; plain numbers in a <code>pre</code> block were read once from the recording named there.</p>
+  <div class="foot"><button class="primary" data-start>Start: 16 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · The unit of JavaScript work" data-title="One frame of each panel: how much JavaScript, for how many cells?" data-node="event js dom counters"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>Three panels show the same viewport, about 33 rows × 17 columns, under the same scroll. In one frame, how long does JavaScript run in each, and how many cells does it touch?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The React panel gives every row a <code>key</code>, so React keeps the DOM of a row that stays on screen, as the hand-written keyed pool does. The scroll moves 1.6 rows per frame. How many cells does the React panel <em>format</em> (call <code>formatCell</code> for) per scroll event?</p>
+    <div class="opts"><button data-k="a">About 30: the cells of the rows that entered</button><button data-k="b">About 600: every visible cell</button><button data-k="c">None: the strings are cached with the DOM</button></div>
+    <div class="reveal"><p>About 600. A key decides which DOM elements React <em>keeps</em>; it does not stop React from <em>calling the row function again</em>. The counters below show both numbers.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three recordings of one scenario at the large viewport (<code>w=1560&amp;h=792&amp;cols=100</code>): <code>j-cells-L-tanstack</code> (virtual-core with our keyed render, <code>lab/pages/src/tanstack.ts</code>), <code>j-cells-L-regular</code> (regular-table, <code>regular.ts</code>) and <code>j-cells-L-react</code> (react-virtual, <code>react.tsx</code>). I take the main-thread frame that begins 500 ms after the first wheel event in each, and I read the page's own counters, which the harness saved when the scroll ended.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-cells-L-tanstack">Pin <code>CrRendererMain</code>; zoom to 500–503 ms after the first <code>InputLatency::MouseWheel</code>.</div>
+  <div class="tracelink" data-trace="j-cells-L-regular"></div>
+  <div class="tracelink" data-trace="j-cells-L-react"></div>
+  <div class="lanes" data-lanes='{"traces":["j-cells-L-tanstack","j-cells-L-regular","j-cells-L-react"],"titles":["Keyed pool on TanStack Virtual (j-cells-L-tanstack)","regular-table (j-cells-L-regular)","React rows on react-virtual (j-cells-L-react)"],"from":499.6,"to":508.6,"rows":["mainFrames","main","app"],"pins":[[1,500.68,"main.js",0],[2,501.1,"main.layout",0],[3,500.74,"main.js",1],[4,500.95,"main.js",1],[5,503.42,"main.layout",1],[6,500.72,"main.js",2],[7,500.82,"app",2]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>Keyed pool: <code>Event: scroll</code>, 0.73 ms.</b> Two listeners run in it, because two virtualizers watch one scroller. The row virtualizer's (0.30 ms) calls our <code>render()</code>, the 0.17 ms <code>draw</code> bar below: 2 rows entered, 34 cells written.</li>
+    <li><i>2</i>The column virtualizer's listener (0.42 ms) is almost entirely a <b>forced style and layout</b>: it reads <code>scrollLeft</code> after the first listener changed the DOM. That time is not JavaScript; <a href="rendering.html">Module 5</a> owns it. It matters here in step 2, because the profile will blame a JavaScript function for it.</li>
+    <li><i>3</i><b>regular-table: <code>Event: scroll</code>, 0.20 ms.</b> Its <code>_on_scroll</code> starts a draw and awaits our data listener, which formats 576 cells in 0.07 ms.</li>
+    <li><i>4</i><b><code>FireAnimationFrame</code>, 1.43 ms</b>, in the same frame: regular-table writes the text of every visible cell.</li>
+    <li><i>5</i>Then the frame's own style and layout: 616 elements restyled, 1123 of 1228 layout objects dirty. Twice this frame's JavaScript. Module 5 again.</li>
+    <li><i>6</i><b>React: <code>Event: scroll</code>, 1.29 ms.</b> The adapter calls <code>flushSync</code> inside the scroll listener (step 10), so React renders and commits before the listener returns. The same forced layout (0.46 ms) follows in the second listener, inside this bar.</li>
+    <li><i>7</i>Our <code>draw</code> measure, 0.49 ms, from the start of <code>Grid()</code> to its layout effect; its detail says <code>rowRenders: 36</code>.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <table class="mtable" data-rows="j-cells-L-tanstack,j-cells-L-regular,j-cells-L-react" data-names="keyed pool,regular-table,React rows" data-head="Whole scroll, large viewport" data-cols="main.scrollEvents|scroll events,state.formatted|formatCell calls,state.cellsInDom|cells in DOM at the end,main.scriptMs|script|ms,frames.mainFrameMs.p50|main frame p50|ms"></table>
+    <p>The counters say what each panel did per scroll event:</p>
+    <ul>
+      <li><b>Keyed pool:</b> <b data-m="j-cells-L-tanstack/state.counters.renders"></b> renders created <b data-m="j-cells-L-tanstack/state.counters.rowsCreated"></b> rows and wrote <b data-m="j-cells-L-tanstack/state.counters.cellsWritten"></b> cells since the page loaded. The first 35 rows were created at mount, so the scroll itself created about 1.6 rows and wrote about 27 cells per scroll event.</li>
+      <li><b>regular-table:</b> <b data-m="j-cells-L-regular/state.counters.draws"></b> draws formatted <b data-m="j-cells-L-regular/state.counters.cellsFormatted"></b> cells: about 584 per draw, the whole viewport.</li>
+      <li><b>React:</b> <b data-m="j-cells-L-react/state.counters.renders"></b> renders of <code>Grid</code> ran the row function <b data-m="j-cells-L-react/state.counters.rowRenders"></b> times (35 per render) and formatted <b data-m="j-cells-L-react/state.counters.cellsFormatted"></b> cells (595 per render). Its DOM ends with the same <b data-m="j-cells-L-react/state.cellsInDom"></b> cells as the keyed pool's.</li>
+    </ul>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The three panels have three different <b>units of work</b>. The keyed pool works for the rows that <em>enter</em>: speed ÷ 60 ÷ 24 rows per frame, times the visible columns. regular-table works for every cell that is <em>visible</em>. React computes like regular-table (every visible row runs again, every cell is formatted again) and writes like the keyed pool (its diff finds that only the entering rows are new). A 19-fold difference in <code>formatCell</code> calls between the keyed pool and React sits behind a 3-fold difference in script time, so most of the script time is not formatting. Finding out what it is needs the profile.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/tanstack.ts:123–128 · regular.ts:48–52 · react.tsx:28–36</span>
+      <p>The three places where a cell is produced, to see what bounds each loop.</p>
+<pre><span class="c">// tanstack.ts, keyed pool: only a row with no element yet is filled</span>
+<span class="n">122</span>        let el = pool.get(item.index);
+<span class="n">123</span>        <mark>if (el === undefined) {</mark>
+<span class="n">124</span>          el = newRow();
+<span class="n">127</span>          fill(el, item.index, x0, x1, row);
+<span class="c">// regular.ts, data listener: every row and column regular-table asked for</span>
+<span class="n"> 48</span>    <mark>for (let col = x0; col &lt; x1; col++) {</mark>
+<span class="n"> 50</span>      for (let r = 0; r &lt; rows.length; r++) column[r] = formatCell(rows[r][col - x0], col);
+<span class="c">// react.tsx, the row component: runs whenever React renders the row</span>
+<span class="n"> 28</span>function RowImpl({ index, start, x0, x1, data }: RowProps) {
+<span class="n"> 29</span>  <mark>c.rowRenders++;</mark>
+<span class="n"> 36</span>        {v === undefined ? "…" : formatCell(v, col)}</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Unit of work</dt><dd>What one step of the workload makes the code do once. Here the step is a scroll event (one per frame); the unit is "cells produced" or "cells written". Cost per frame = fixed part + unit cost × units.</dd>
+      <dt>Counter</dt><dd>A number the page increments itself. It costs almost nothing, is exact, and is the same in a slow run and a fast one. It says how often, never how long.</dd>
+      <dt>render, draw</dt><dd>This page says <em>render</em> for one call of our <code>render()</code> or of React's <code>Grid</code>, and <em>draw</em> for one regular-table draw. Each happens at most once per scroll event.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> how many cells each design produces and writes per scroll event at this viewport and speed. The counts are exact and would repeat.</p>
+    <p><b>No:</b> a ranking by time. The script totals contain our own instrumentation (step 3) and come from one run each (step 4).</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-L-tanstack tree 500 503</code> prints the frame as nested spans. Expect one <code>EventDispatch {"type":"scroll"}</code> of 0.73 ms holding two <code>FunctionCall</code> spans (0.29 and 0.41 ms), with <code>Layout {"dirtyObjects":72 …}</code> inside the second.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Per scroll event at 33 × 17 visible cells: the keyed pool writes about 27 cells, regular-table about 584, React formats 595 and keeps the keyed pool's DOM (counters of j-cells-L-*).</li>
+    <li data-kind="measured">In one frame, JavaScript ran 0.3 ms (keyed), 1.6 ms (regular-table: scroll event plus animation-frame callback) and 0.8 ms (React), not counting the layout forced inside the keyed and React scroll events.</li>
+    <li data-kind="read">A React key decides which elements are kept, not whether the row function runs: react.tsx:28–36 runs for every row of every Grid render unless memoized.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The keyed pool's scroll event takes 0.73 ms and writes 34 cells. Which functions is that time in?</p>
+</section>
+
+<section class="step" data-part="A · The unit of JavaScript work" data-title="Who owns the time: self time, total time, and (program)" data-node="js sampler"
+  data-ask="profile|What can the sampled profile tell me about a frame's JavaScript, and what can it not?">
+  <p class="holding"><span class="label">Question I hold</span><span>Over the whole scroll of the keyed pool, which functions was the main thread in, and does the answer match what the code does?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Module 1, step 3 showed that JavaScript bars are rebuilt from <code>ProfileChunk</code> samples. Here I add the samples up instead of drawing them: for each sample, the time since the previous one is credited to the function on top of the stack (<b>self time</b>) and to every function below it (<b>total time</b>). The table is what the analysis stored for this trace; the listing is the same data over the 2.1 s of scrolling, with samples put in time order first (step 3 says why that matters).</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-cells-L-tanstack">DevTools: Bottom-up tab, with Settings → Ignore list switched off so library frames show.</div>
+  <div class="prof" data-prof="j-cells-L-tanstack" data-top="8" data-by="self"></div>
+<pre>j-cells-L-tanstack, 0–2100 ms, 14,142 samples, median interval 153 µs
+     self ms  function
+<span class="cp">1</span>   1840.5   (idle)
+<span class="cp">2</span>    182.1   (program)
+<span class="cp">3</span>     39.7   <mark>(anonymous) assets/index.js:384</mark>      <span class="c">el =&gt; horizontal ? el.scrollLeft : el.scrollTop</span>
+<span class="cp">4</span>     10.5   measure                              <span class="c">performance.measure, native</span>
+       3.7   remove                               <span class="c">Element.remove, native</span>
+       3.4   render assets/tanstack.js:60
+       3.2   mark
+       2.0   writeCell assets/tanstack.js:26
+       1.3   appendChild
+    total ms  function
+<span class="cp">5</span>     76.3   (anonymous) assets/index.js:365      <span class="c">virtual-core's scroll listener (createHandler)</span>
+      39.7   (anonymous) assets/index.js:384
+      30.0   render assets/tanstack.js:60         <span class="c">called through memoizedFunction → notify → onChange</span>
+      11.6   measure assets/grid.js:184           <span class="c">our timing.ts wrapper</span>
+       4.1   fill assets/tanstack.js:31
+       3.3   markComplete assets/tanstack.js:118</pre>
+  <ol class="pins">
+    <li><i>1</i><b>(idle)</b>: no task was running. 88% of the scroll.</li>
+    <li><i>2</i><b>(program)</b>: the thread was busy with no JavaScript frame on the stack. This is the frame's own style, layout, paint and commit, plus task overhead.</li>
+    <li><i>3</i>The largest JavaScript self time belongs to a one-line arrow function that reads one property.</li>
+    <li><i>4</i><code>measure</code> is second. It is our instrumentation (step 3).</li>
+    <li><i>5</i>Total time of the scroll listener: everything that ran under it, including pins 3 and 4.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The function at <code>index.js:384</code> cannot spend 39.7 ms in its own instructions. Step 1, pin 2 showed what runs inside it: Blink recalculates style and layout when <code>scrollLeft</code> is read after a DOM write. The trace has that as <code>UpdateLayoutTree</code> and <code>Layout</code> spans (<b data-m="j-cells-L-tanstack/main.forcedLayouts"></b> forced layouts, <b data-m="j-cells-L-tanstack/main.forcedMs" data-unit="ms"></b> in this recording); the sampler has only the JavaScript stack, and the innermost JavaScript frame at that moment is the arrow function.</p>
+    <p>Native functions do get rows of their own when V8 knows them as callbacks: <code>measure</code>, <code>remove</code>, <code>appendChild</code>, <code>createElement</code>, <code>setTimeout</code>. In these traces no property getter or setter has a row: there is no <code>scrollLeft</code>, no <code>textContent</code>. Their time is in the self time of whoever touched the property.</p>
+    <p>What our code and the library do for the 34 cells of a frame is small next to all of this: <code>render</code> has 30 ms of total time over 129 renders, and 15 ms of that is <code>measure</code> and <code>markComplete</code>.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/profiler/symbolizer.cc#L99-L105">v8 src/profiler/symbolizer.cc:99–105, 168–176</a>
+      <p>How a sample's stack gets its top entry: a native callback by name when V8 is inside one, and a state name when no frame could be named at all.</p>
+<pre><span class="n"> 99</span>    <mark>if (sample.has_external_callback &amp;&amp; IsExternal(sample.state)) {</mark>
+<span class="n">103</span>      stack_trace.push_back(
+<span class="n">104</span>          {FindEntry(reinterpret_cast&lt;Address&gt;(sample.external_callback_entry)),
+<span class="n">168</span>    // If no frames were symbolized, put the VM state entry in.
+<span class="n">176</span>      stack_trace.push_back({<mark>EntryForVMState(sample.state)</mark>, LineAndColumn{}});</pre>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/profiler/profile-generator.cc#L102-L104">v8 src/profiler/profile-generator.cc:102–104</a>
+<pre><span class="n">102</span>const char* const CodeEntry::kProgramEntryName = "(program)";
+<span class="n">103</span>const char* const CodeEntry::kIdleEntryName = "(idle)";
+<span class="n">104</span>const char* const CodeEntry::kGarbageCollectorEntryName = "(garbage collector)";</pre>
+      <p>The built file <code>assets/index-….js</code> is virtual-core; its line 384 is the offset reader passed by <code>observeElementOffset</code>, line 365 the listener returned by <code>createHandler</code> (<a href="anatomy.html">Module 3</a> maps these to <code>index.ts</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Self time</dt><dd>Time during which this function was the innermost <em>named</em> frame. It includes native work done on its behalf that has no name in the profile.</dd>
+      <dt>Total time</dt><dd>Time during which the function was anywhere on the stack. Use it to ask "what does calling this cost"; use self time to ask "where exactly".</dd>
+      <dt>(program), (idle), (garbage collector)</dt><dd>Not functions: names for samples with no JavaScript frame. <code>(program)</code> in a renderer is mostly the rendering pipeline.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the main thread was idle for most of this scroll; most of its busy time had no JavaScript on the stack; under the scroll listener, the largest share is a layout forced by a property read.</p>
+    <p><b>No:</b> that <code>index.js:384</code> is slow code, or that removing it would save 40 ms. The layout it triggers would otherwise run later in the same frame (whether it would be the same size is Module 5's question).</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read self time as "time in this function's own code" and went looking for what was slow in a one-line function. The trace showed a <code>Layout</code> span inside the call. Rule: when a small function owns a large self time, print the spans under it (<code>q.mjs … tree</code>) before reading its source; a native span there (style, layout, GC) is the owner.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-L-tanstack stack 501.2</code> prints the sample nearest 501.2 ms, inside the forced layout of step 1: <code>(anonymous) …:384</code> ← <code>(anonymous) …:365</code> ← <code>(root)</code>. No layout function appears, because the sampler records JavaScript frames only.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Keyed pool, 2.1 s of scrolling: 88% idle; 182 ms with no JavaScript on the stack; the largest JavaScript self time (40 ms) is the one-line scrollLeft reader, which is a forced layout.</li>
+    <li data-kind="read">A sample's top entry is a native callback when V8 is inside one, a JavaScript frame otherwise, and a VM state name such as (program) when no frame was symbolized (symbolizer.cc:99–105, 168–176).</li>
+    <li data-kind="rejected">"Self time is the function's own code": it includes unnamed native work such as a forced layout or a property setter.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> <code>measure</code> is the second JavaScript function in the profile, above every DOM operation. Is our instrumentation really that expensive, or is the profile telling me something else?</p>
+</section>
+
+<section class="step" data-part="A · The unit of JavaScript work" data-title="What sampling cannot say: call counts, and samples that are not random" data-node="sampler counters method">
+  <p class="holding"><span class="label">Question I hold</span><span><code>formatCell</code> ran 3,961 times in this scroll and <code>measure</code> 126 times. Why does the profile show <code>measure</code> at 10 ms and <code>formatCell</code> at almost nothing, and why does one tool print a negative time?</span></p>
+
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>A sampler looks at the stack about 6,500 times a second. <code>formatCell</code> was called <b data-m="j-fmt-plain/state.formatted"></b> times in the trace <code>j-fmt-plain</code>. In how many samples is it on top of the stack?</p>
+    <div class="opts"><button data-k="a">Thousands</button><button data-k="b">A few hundred</button><button data-k="c">About fifteen</button></div>
+    <div class="reveal"><p>Fifteen. A call that takes well under a microsecond is almost never the one running when the sampler looks. The profile is right that the function is cheap, and silent about how often it ran.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I count samples per function and set them beside the call counts from the page's counters. Then I print the raw samples of one render, in the order the trace file has them, with the <code>timeDeltas</code> value of each.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-cells-L-tanstack"></div>
+<pre>function            trace                 calls                           samples on top of stack
+formatCell          j-fmt-plain           71,869  (counter)               15
+formatCell          j-cells-L-tanstack     3,961  (counter)                3
+calculateRangeImpl  j-cells-L-tanstack     123+   (once per scroll event,  1
+                                                  read in source)
+<mark>measure             j-cells-L-tanstack     126    (draw spans in trace)    153</mark>
+
+One render in j-cells-L-tanstack (draw measure at 1000.57 ms, 0.19 ms), samples in file order:
+  time ms    timeDelta µs   top of stack
+  1000.547        49        externalRetiresCommand ← scroll listener
+<span class="cp">1</span> 1000.766       219        measure ← render
+<span class="cp">2</span> 1000.821        55        mark ← markComplete ← render
+<span class="cp">3</span> 1000.699      <mark>-122</mark>        formatCell ← writeCell ← fill ← render
+  1000.866       167        (program)</pre>
+  <ol class="pins">
+    <li><i>1</i>A sample inside <code>performance.measure</code>, 219 µs after the previous one in the file.</li>
+    <li><i>2</i>A sample inside <code>performance.mark</code>, 55 µs later: closer than the sampler's interval.</li>
+    <li><i>3</i>A sample that is <em>earlier</em> than the two before it, with a negative delta. This is the timer's sample, taken while the row was being filled.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><code>measure</code> has more samples than calls. A timer cannot do that. Blink asks V8 for a sample on purpose each time <code>performance.measure</code> or <code>performance.mark</code> is called while tracing; the trace event carries a <code>sampleTraceId</code> that ties it to that sample. Those samples go into a second queue, and V8's profiler thread writes that queue out before the timer's samples it is holding, so the file is not in time order.</p>
+    <p>Adding up deltas in file order then goes wrong in a specific direction: the forced <code>measure</code> sample is credited with the 219 µs since the last sample in the file, which is the time the row was being filled, and the real sample of the filling gets −122 µs. DevTools sorts samples by time before it uses them. The harness's <code>q.mjs prof</code>, and the profile tables on this page, do not.</p>
+<pre>j-cells-L-tanstack, whole scroll     file order (q.mjs prof)   time order (as DevTools)
+measure (self)                             21.8 ms                  10.5 ms
+mark (self)                                 5.8                      3.2
+remove (self)                               1.6                      3.7
+appendChild (self)                         -0.7                      1.3
+fill (total)                               -0.8                      4.1
+render (total)                             28.4                     30.0
+scroll listener index.js:365 (total)       80.1                     76.3</pre>
+    <p>Functions high on the stack agree in both columns. Leaves that run just before a <code>measure</code> or <code>mark</code> call lose time to it. Even in time order, the forced sample is credited with the interval before it, so 10.5 ms is an upper estimate for <code>measure</code>. A direct test is better: the same scroll with every mark and measure removed took <b data-m="j-nomarks-keyed/main.scriptMs" data-unit="ms"></b> of script against <b data-m="j-cells-L-tanstack/main.scriptMs" data-unit="ms"></b> with them, about 0.1 ms per render in this pair of runs. <a href="frames.html">Module 2</a> measures the observer effect properly.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/timing/performance_user_timing.cc#L271">third_party/blink/renderer/core/timing/performance_user_timing.cc:271 (measure), 93 (mark)</a>
+      <p>Why <code>measure</code> is sampled once per call.</p>
+<pre><span class="n">271</span>    <mark>v8::CpuProfiler::CollectSample(isolate, hash);</mark>
+<span class="n">272</span>    // One event is dispatched for the performance.measure call itself
+<span class="n">277</span>    TRACE_EVENT("devtools.timeline", "UserTiming::Measure", "sampleTraceId",</pre>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/profiler/cpu-profiler.cc#L258-L279">v8 src/profiler/cpu-profiler.cc:179, 258–278</a>
+      <p>Why the file is out of order: requested samples have their own queue, and it is drained first.</p>
+<pre><span class="n">179</span>  ticks_from_vm_buffer_.Enqueue(record);      <span class="c">// AddCurrentStack: a sample asked for by the embedder</span>
+<span class="n">260</span>  <mark>if (ticks_from_vm_buffer_.Peek(&amp;record1) &amp;&amp;</mark>
+<span class="n">261</span>      (record1.order == last_processed_code_event_id_)) {
+<span class="n">264</span>    SymbolizeAndAddToProfiles(&amp;record);
+<span class="n">268</span>  const TickSampleEventRecord* record = ticks_buffer_.Peek();   <span class="c">// the timer's samples, after</span></pre>
+      <a class="path" href="https://github.com/ChromeDevTools/devtools-frontend/blob/66df492aaa0129d090937e933dd44c5389ab24d2/front_end/models/cpu_profile/CPUProfileDataModel.ts#L258-L266">devtools-frontend front_end/models/cpu_profile/CPUProfileDataModel.ts:258–266</a>
+<pre><span class="n">258</span>  private sortSamples(): void {
+<span class="n">266</span>    <mark>orderedIndices.sort((a, b) =&gt; timestamps[a] - timestamps[b]);</mark></pre>
+      <p>The interval the tracing profiler asks for is 100 µs (<code>tracing-cpu-profiler.cc:90</code>, <code>int sampling_interval_us = 100;</code>); the median gap in these recordings is 153 µs.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>What a sample count means</dt><dd>For timer samples: time on the stack ÷ interval, with random error. A function with 3 samples ran for something between almost nothing and about 1 ms. It says nothing about calls.</dd>
+      <dt>Requested samples</dt><dd>Samples taken because code asked (<code>performance.mark</code>, <code>measure</code>, each <code>FunctionCall</code> span, <code>console.timeStamp</code>). They are exact in time and not random, so they over-represent the place that asked.</dd>
+      <dt>Negative <code>timeDeltas</code></dt><dd>Each delta is the difference to the previous sample <em>in the file</em> (<code>profile-generator.cc:770–778</code>). Out-of-order samples make it negative. Sort first.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> which functions the main thread spends its time in, within about a sample interval per occurrence; and, from counters, exactly how often each ran.</p>
+    <p><b>No:</b> a call count from samples; a cost for <code>measure</code> from its samples; a leaf self time from <code>q.mjs prof</code> or from this page's profile tables without allowing a factor of two near a mark or measure. Where a later step needs such a number it uses a time-ordered listing and says so.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I took "<code>measure</code> is my top function" as a measurement of my instrumentation, and nearly removed the measures. The samples were ones the browser took <em>because</em> I called <code>measure</code>, written ahead of older samples, so a naive sum handed <code>measure</code> the time of the DOM work before it. Rule: before trusting a profile's leaf numbers, check that samples are in time order and ask whether any were requested rather than timed; test an instrument's cost by switching it off (<code>marks=0</code>), not by sampling it.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: keep counters (cells written, rows created, draws, no-op draws) in the painter from the start and export them beside any timing. They are the only numbers here that did not move between runs, and each design's cost model in this module is read off them.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-L-tanstack prof 1000 1002.5</code> sums one frame in file order. Expect <code>measure</code> at 0.22 ms and a last self-time line <code>-0.12 ms formatCell</code>: pins 1 and 3 above. Then open the trace in DevTools and select the same frame; its Bottom-up table has no negative entry.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">formatCell: 71,869 calls, 15 samples (j-fmt-plain). measure: 126 calls, 153 samples (j-cells-L-tanstack). Sample counts do not track call counts in either direction.</li>
+    <li data-kind="read">performance.measure and performance.mark request a profiler sample on every call while tracing (performance_user_timing.cc:271, 93); V8 writes requested samples before queued timer samples (cpu-profiler.cc:258–278), so timeDeltas can be negative.</li>
+    <li data-kind="measured">Summing deltas in file order doubles measure's self time (21.8 against 10.5 ms in time order) and makes DOM leaves negative; the harness and this page's profile tables sum in file order.</li>
+    <li data-kind="rejected">"measure is the most expensive JavaScript in my frame": the profile over-represents it; switching marks off saved about 0.1 ms per render.</li>
+  </ul>
+  <p class="next" data-answer="profile"><b>Next question →</b> With the instruments understood: the viewport gets bigger. Which panel's JavaScript grows with it?</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · Scaling with cells" data-title="Three viewport sizes: whose JavaScript grows?" data-node="js dom counters method"
+  data-ask="unit|For each design: what does its per-frame JavaScript scale with, and what does one unit cost?">
+  <p class="holding"><span class="label">Question I hold</span><span>The viewport grows from about 100 visible cells to about 580, at the same scroll speed. Which panel's script time follows the cell count?</span></p>
+
+  <div class="predict" data-right="a"><span class="label">Predict first</span>
+    <p>The keyed pool's viewport grows from 15 × 8 cells in the DOM to 35 × 17, five times as many. The scroll speed stays at 1.6 rows per frame. Its script time over the scroll:</p>
+    <div class="opts"><button data-k="a">Stays within run-to-run noise</button><button data-k="b">About doubles</button><button data-k="c">Grows about five-fold</button></div>
+    <div class="reveal"><p>It stays within noise. A taller viewport does not make more rows enter per frame; a wider one adds cells to each entering row (8 → 17), which at under a microsecond each is below what one run can show.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Nine recordings: sizes S (<code>640×312</code>, the first walkthrough's), M (<code>1000×504</code>) and L (<code>1560×792</code>), each with the three panels, all scrolled at the same speed. The bars are main-thread time over the whole scroll, by DevTools category. Script excludes the style and layout that script forced; those are in their own colors.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-cells-S-regular">The S and M traces are <code>j-cells-S-*</code> and <code>j-cells-M-*</code>.</div>
+  <div class="bars" data-bars='{"ids":["j-cells-S-tanstack","j-cells-M-tanstack","j-cells-L-tanstack","j-cells-S-regular","j-cells-M-regular","j-cells-L-regular","j-cells-S-react","j-cells-M-react","j-cells-L-react"],"labels":["keyed S","keyed M","keyed L","regular-table S","regular-table M","regular-table L","React S","React M","React L"],"series":[{"path":"main.scriptMs","label":"script","color":"#d9a800"},{"path":"main.styleMs","label":"style","color":"#c9a6ea"},{"path":"main.layoutMs","label":"layout","color":"#9b59d0"}],"stack":true,"unit":"ms","title":"Main-thread time over the scroll, by category"}'></div>
+  <table class="mtable" data-rows="j-cells-S-tanstack,j-cells-M-tanstack,j-cells-L-tanstack,j-cells-S-regular,j-cells-M-regular,j-cells-L-regular,j-cells-S-react,j-cells-M-react,j-cells-L-react" data-names="keyed S,keyed M,keyed L,regular-table S,regular-table M,regular-table L,React S,React M,React L" data-head="Panel and size" data-cols="state.cellsInDom|cells in DOM,state.formatted|formatCell calls,main.scrollEvents|scroll events,main.scriptMs|script|ms,frames.mainFrameMs.p50|main frame p50|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Dividing each script total by its scroll events (about 122 in every run):</p>
+<pre>script per scroll event      S          M          L        cells produced per event (S → L)
+keyed pool                 0.34 ms    0.39 ms    0.39 ms    13 → 27   written
+regular-table              0.51       0.80       1.27       111 → 584 formatted and written
+React rows                 0.71       0.85       1.21       121 → 595 formatted, 13 → 27 written</pre>
+    <p><b>Keyed:</b> flat. <b>regular-table:</b> a straight line in visible cells: (1.27 − 0.51) ms ÷ (584 − 111) cells ≈ 1.6 µs of script per extra visible cell, on a fixed part of about 0.3 ms. <b>React:</b> also grows, by about 1 µs per extra cell <em>rendered</em>, although it writes no more cells than the keyed pool. Its fixed part is the largest, about 0.6 ms. At S React runs twice the keyed pool's script; at L three times, and as much as regular-table.</p>
+    <p>The purple bars grow much faster than the yellow ones for regular-table, and hardly at all for the other two. That is the larger cost of rewriting every cell, and it belongs to <a href="rendering.html">Module 5</a>.</p>
+    <p>How far to trust one run per bar? The harness recorded one scenario ten times (regular-table at L with 6 columns):</p>
+    <table class="mtable runs" data-runs="f-variance" data-cols="main.scriptMs|script|ms,main.layoutMs|layout|ms,frames.mainFrameMs.p50|main frame p50|ms"></table>
+    <p>The script total moves by about a quarter between the fastest and slowest of ten identical runs. The trends above span factors of 1.7 to 2.5 and follow the counters, so they stand; the difference between keyed M and keyed L does not.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Fixed part and unit cost</dt><dd>Fit cost per step = a + b × units to two or three sizes. <em>a</em> is what a scroll event costs with nothing to write (listeners, range math, bookkeeping); <em>b</em> is the price of one more cell. A design is described by which units multiply <em>b</em>.</dd>
+      <dt>Noise floor</dt><dd>The spread of repeated runs of one scenario. A difference below it may be real but one run cannot show it. A counter has no noise floor.</dd>
+    </dl></div>
+    <div class="box"><span class="label">What the panels were configured with</span>
+      <p><code>lab/harness/scenarios.mjs:37–40</code>: the three sizes, <code>cols: 100</code> so that columns are virtualized too. Overscan is 1 row for the TanStack panels (<code>config.ts</code>, <code>overscan</code>), which is why their DOM holds two rows more than regular-table's.</p>
+    </div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the keyed pool's script per frame does not depend on viewport size at a fixed speed; regular-table's is proportional to visible cells; React's grows with rendered rows × columns even though its DOM writes do not.</p>
+    <p><b>No:</b> the slopes to two digits (three points, one run each), or anything about widths and heights beyond these three.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-M-regular summary | grep scriptMs</code> prints the script total of one bar, <code>"scriptMs": 97.97</code> in this recording; the same command with <code>j-cells-M-tanstack</code> gives the keyed pool's, about half of it.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Script per scroll event from S to L: keyed 0.34 → 0.39 ms (flat), regular-table 0.51 → 1.27 ms (about 1.6 µs per visible cell), React 0.71 → 1.21 ms (about 1 µs per rendered cell).</li>
+    <li data-kind="measured">Ten identical runs move a script total by a factor of 1.26 (f-variance): single-run differences under a quarter are not findings.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> regular-table pays about 1.6 µs of script per visible cell. Which function is that, and what does it do to a cell?</p>
+</section>
+
+<section class="step" data-part="B · Scaling with cells" data-title="The cell loop under the profile: what one regular-table cell costs" data-node="js dom sampler">
+  <p class="holding"><span class="label">Question I hold</span><span>regular-table redraws about 584 cells per frame. Where in its code is the per-cell time, and how much of a frame's JavaScript is the cell loop?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The profile of <code>j-cells-L-regular</code>, then the function it points at, read in regular-table's source.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-cells-L-regular"></div>
+  <div class="prof" data-prof="j-cells-L-regular" data-top="7" data-by="self"></div>
+<pre>j-cells-L-regular, 0–2100 ms, samples in time order
+     self ms  function                                     total ms  function
+     1226.8   (idle)                                         115.9   (anonymous) regular-table.js:950   <span class="c">_on_scroll, resumed</span>
+      729.7   (program)                                      115.3   draw_sync
+<span class="cp">1</span>     70.5   <mark>_draw_td regular-table.js:1401</mark>                  101.9   _render_pass
+       12.9   measure                                         93.8   _drawDataColumn
+       11.8   mark                                            89.5   draw regular-table.js:1428        <span class="c">tbody: one column</span>
+        6.6   draw regular-table.js:1428                 <span class="cp">2</span>   81.3   _draw_td
+        4.8   (garbage collector)                             17.7   style_callback                    <span class="c">runs our style listener</span>
+        4.4   _get_cell                                  <span class="cp">3</span>   15.0   (anonymous) regular.js:13         <span class="c">our data listener</span>
+        4.1   toggle                                           2.0   formatCell</pre>
+  <ol class="pins">
+    <li><i>1</i><code>_draw_td</code>: 70.5 ms of self time, about half of all JavaScript self time in the scroll. It is called once per cell.</li>
+    <li><i>2</i>Its total, 81.3 ms, over <b data-m="j-cells-L-regular/state.counters.cellsFormatted"></b> cells: about 1.1 µs per cell.</li>
+    <li><i>3</i>Our data listener, which produces and formats the same cells: 15 ms, of which <code>formatCell</code> has 2 ms.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The cell loop is two thirds of this panel's JavaScript: 81 ms of the 116 ms that run in the animation-frame step (line 950 is <code>_on_scroll</code> continuing after <code>await new Promise(requestAnimationFrame)</code>). Step 2's rule applies to its self time: <code>_draw_td</code> contains a property write, <code>td.textContent = …</code>, and setters have no row of their own, so the 70.5 ms is mostly Blink replacing a text node, not regular-table's instructions. <code>toggle</code> (4.1 ms) is the <code>classList.toggle</code> call on line 51, which is a method and does get a row.</p>
+    <p>The frame's script is therefore: cells × about 1.1 µs in <code>_draw_td</code>, plus about 0.3 µs per cell around it (<code>_get_cell</code>, the column loop, the data listener), plus a fixed part per draw. Step 4's slope of 1.6 µs per visible cell is the sum of the first two.</p>
+    <p>The run without marks, <code>j-nomarks-regular</code>, has <b data-m="j-nomarks-regular/main.scriptMs" data-unit="ms"></b> of script against <b data-m="j-cells-L-regular/main.scriptMs" data-unit="ms"></b> here. Two measures and a mark per draw are not visible in this panel's total: the difference between the two runs is inside the noise floor, in either direction.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/tbody.ts#L30-L69">regular-table src/ts/tbody.ts:39–67</a>
+      <p>What happens to one cell on every draw.</p>
+<pre><span class="n">39</span>        const td = this._get_cell(tagName, ridx, cidx);      <span class="c">// the element at this screen position</span>
+<span class="n">40</span>        const metadata = this._get_or_create_metadata(td);
+<span class="n">51</span>        td.classList.toggle("rt-cell-clip", clip);
+<span class="n">58</span>        <mark>if (metadata.value !== val) {</mark>
+<span class="n">63</span>                <mark>td.textContent = String(val ?? "");</mark>
+<span class="n">67</span>        metadata.value = val;</pre>
+      <p>Cells are reused by screen position. Line 58 skips the write when the cell already shows this value, which is rare while rows move (step 8 shows the case where it is not).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Positional reuse</dt><dd>The element at row 3, column 5 of the screen stays there and is given new text each draw. No elements are created or removed while scrolling; every visible cell's text is replaced whenever the rows shift.</dd>
+      <dt>Budget of the unit</dt><dd>At 1.6 µs of script per visible cell, 1,000 cells cost 1.6 ms of a 16.7 ms frame in JavaScript alone, on this machine. The same cells cost several times that in style and layout.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> regular-table's per-frame JavaScript is dominated by one function that runs once per visible cell, and most of that function's time is the DOM text write.</p>
+    <p><b>No:</b> that regular-table's own logic is slow, or that a faster loop would help much: the unit is "a visible cell's text replaced", and the price is mostly Blink's.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: state the DOM painter's cost model as cells written per frame, and make the view core able to say which cells changed, so a painter can choose between "rewrite the window" (simple, proportional to visible cells) and "write what entered" (proportional to speed). The Rust side already knows the previous window.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-L-regular stack 501.5</code> lands inside the animation-frame callback of step 1. Expect <code>_draw_td</code> on top, under <code>draw</code> ← <code>_drawDataColumn</code> ← <code>_render_pass</code> ← <code>draw_sync</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">regular-table at L: _draw_td has 81 ms of the 116 ms of JavaScript in the animation-frame step, about 1.1 µs per cell; formatting the same cells with toFixed is 2 ms.</li>
+    <li data-kind="read">_draw_td writes td.textContent only when the cell's value changed (tbody.ts:58–63); cells are reused by screen position.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The keyed pool's unit is entering rows, and entering rows depend on speed. What happens when the scroll gets faster?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · Scaling with speed, and the reuse policy" data-title="Four speeds, three reuse policies" data-node="js dom counters">
+  <p class="holding"><span class="label">Question I hold</span><span>From 600 to 38,400 px/s on the large viewport: which policies' work follows the speed, and do the keyed pool and the positional pool ever meet?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>At 38,400 px/s the table moves 26 rows per frame, so the keyed pool creates 26 of its 35 rows anew in every frame. The positional pool (same library, same file, <code>pool=positional</code>) keeps its 35 row elements and rewrites every cell's text. Whose script total is lower?</p>
+    <div class="opts"><button data-k="a">Keyed, clearly: it still touches fewer cells</button><button data-k="b">Neither: they are within noise of each other</button><button data-k="c">Positional, clearly: reuse beats creation</button></div>
+    <div class="reveal"><p>Neither, in this recording. The keyed pool touches three quarters as many cells and pays about 40% more for each.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Twelve recordings: four speeds × three policies. <b>Keyed</b> and <b>positional</b> are the same TanStack panel with a different <code>pool</code> setting (<code>tanstack.ts:117–151</code>): keyed keeps one row element per row index and creates and removes rows as they enter and leave; positional keeps one row element per screen slot and rewrites its cells. <b>regular-table</b> is positional by design. Every scroll lasts the same two seconds, so the fast ones travel further.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-speed-38400-keyed">All twelve are <code>j-speed-{600,2400,9600,38400}-{keyed,positional,regular}</code>.</div>
+  <div class="bars" data-bars='{"ids":["j-speed-600-keyed","j-speed-2400-keyed","j-speed-9600-keyed","j-speed-38400-keyed","j-speed-600-positional","j-speed-2400-positional","j-speed-9600-positional","j-speed-38400-positional","j-speed-600-regular","j-speed-2400-regular","j-speed-9600-regular","j-speed-38400-regular"],"labels":["keyed 600 px/s","keyed 2400","keyed 9600","keyed 38400","positional 600","positional 2400","positional 9600","positional 38400","regular-table 600","regular-table 2400","regular-table 9600","regular-table 38400"],"series":[{"path":"main.scriptMs","label":"script","color":"#d9a800"},{"path":"main.styleMs","label":"style","color":"#c9a6ea"},{"path":"main.layoutMs","label":"layout","color":"#9b59d0"}],"stack":true,"unit":"ms","title":"Main-thread time over the scroll, by category"}'></div>
+  <table class="mtable" data-rows="j-speed-600-keyed,j-speed-2400-keyed,j-speed-9600-keyed,j-speed-38400-keyed,j-speed-600-positional,j-speed-2400-positional,j-speed-9600-positional,j-speed-38400-positional" data-names="keyed 600,keyed 2400,keyed 9600,keyed 38400,positional 600,positional 2400,positional 9600,positional 38400" data-head="TanStack panel" data-cols="content.pxPerSec|measured px/s,state.counters.renders|renders,state.counters.rowsCreated|rows created,state.counters.cellsWritten|cells written,app.draw.p50|draw p50|ms,main.scriptMs|script|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+<pre>per render                       600        2400       9600       38400 px/s
+rows entering per frame          0.4        1.6        6.5        26         <span class="c">(rows created − 35) ÷ scroll events</span>
+keyed: cells written               9         27        106        428        <span class="c">without the mount's 595</span>
+keyed: script                  0.39 ms    0.43 ms    0.57 ms    1.08 ms
+positional: cells written        305        567        577        577
+positional: script             0.70       0.99       0.97       1.12
+regular-table: script per draw 1.13       1.37       1.21       1.29</pre>
+    <p>At 600 px/s a render happens in about three scroll events of four (<b data-m="j-speed-600-keyed/state.counters.renders"></b> renders, <b data-m="j-speed-600-keyed/main.scrollEvents"></b> scroll events); at the other speeds in every one.</p>
+    <p><b>Keyed:</b> rows created per frame equal measured speed ÷ 60 ÷ 24 to within 2% at every speed, and script follows: about 1.6 µs per extra cell written, on a fixed 0.4 ms. <b>Positional and regular-table:</b> flat from 2400 px/s up, because once the first row changes in every frame, every frame rewrites the whole viewport; going faster cannot add cells.</p>
+    <p>At 600 px/s the positional pool writes only half a viewport per render. Its range changes when a row crosses either edge; when only the bottom edge moved, no slot changes its row and it writes one new row (<code>tanstack.ts:142–148</code>).</p>
+    <p>At 38,400 px/s the two TanStack bars meet: script <b data-m="j-speed-38400-keyed/main.scriptMs"></b> against <b data-m="j-speed-38400-positional/main.scriptMs"></b> ms, and the whole main thread <b data-m="j-speed-38400-keyed/threads.mainBusyMs"></b> against <b data-m="j-speed-38400-positional/threads.mainBusyMs"></b> ms. The keyed pool wrote <b data-m="j-speed-38400-keyed/state.counters.cellsWritten"></b> cells, the positional pool <b data-m="j-speed-38400-positional/state.counters.cellsWritten"></b>.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/tanstack.ts:138–148</span>
+      <p>The positional branch, to see what "reuse" writes.</p>
+<pre><span class="n">138</span>      while (slots.length &lt; rows.length) slots.push(newRow());
+<span class="n">140</span>      rows.forEach((item, i) =&gt; {
+<span class="n">141</span>        const el = slots[i];
+<span class="n">142</span>        <mark>const moved = el._index !== item.index;</mark>     <span class="c">// this slot now shows another row</span>
+<span class="n">148</span>        if (moved || …) fill(el, item.index, x0, x1, row);   <span class="c">// rewrite all its cells</span></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Reuse policy</dt><dd>What happens to an element when its row leaves. <em>Keyed</em>: it is removed, and a new one is created for the entering row; rows that stay are untouched. <em>Positional</em>: it stays and shows another row; every element is touched whenever rows shift.</dd>
+      <dt>Saturation</dt><dd>A cost that stops growing because its unit has a ceiling. Visible cells are a ceiling; entering rows reach the same ceiling when a frame moves a whole viewport.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> keyed work is proportional to speed, positional work is constant once a row changes per frame; they converge when most of the viewport is replaced per frame.</p>
+    <p><b>No:</b> that one policy wins at 38,400 px/s. The two totals differ by less than the noise floor. The earlier recording of this pair had keyed higher; this one has it marginally lower.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-speed-9600-keyed marks draw 500 560</code> lists four renders with their details. Expect <code>"entered":7</code> (once 8) and <code>"cells":119</code> (once 136): between 6 and 8 rows of 17 cells per frame.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Keyed pool: rows created per frame = speed ÷ 60 ÷ 24 at all four speeds; script per scroll event 0.39 → 1.08 ms from 600 to 38,400 px/s.</li>
+    <li data-kind="measured">Positional pool and regular-table: script per render flat from 2400 px/s up (about 1.0 and 1.3 ms): every frame already rewrites the viewport.</li>
+    <li data-kind="rejected">"At 38,400 px/s the keyed pool is worse than the positional one" (first recording): in this recording the two are equal within noise, in script and in total main-thread time.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Equal totals from 55,000 cells and from 74,000: the keyed pool must pay more per cell. For which DOM operations?</p>
+</section>
+
+<section class="step" data-part="C · Scaling with speed, and the reuse policy" data-title="The crossover, in DOM operations" data-node="dom sampler js">
+  <p class="holding"><span class="label">Question I hold</span><span>At 38,400 px/s, what does the profile charge to creating and removing elements, and what to rewriting text?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The two profiles side by side, samples in time order, restricted to what runs under our <code>render()</code>. Both renders take the same total, so the listing shows how each spends it.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-speed-38400-keyed"></div>
+  <div class="tracelink" data-trace="j-speed-38400-positional"></div>
+<pre>under render(), 0–2100 ms           keyed (j-speed-38400-keyed)      positional (j-speed-38400-positional)
+render, total                            117.4 ms                         119.9 ms
+  fill, total                             45.8                             82.0
+<span class="cp">1</span>   writeCell (sets textContent)          15.2                        <mark>72.4</mark>
+    createElement                          7.0                              —
+    appendChild                           13.4                              —
+    fill, self (children, style)          12.8                              9.2
+<span class="cp">2</span> remove                             <mark>39.0</mark>                              —
+  measure + markComplete                  17.6                             21.4
+cells written (counter)                 54,961                           73,848
+rows created (counter)                   3,233                               61</pre>
+  <ol class="pins">
+    <li><i>1</i>Setting the text of a cell: 15.2 ms for 54,961 new, empty cells (0.28 µs each) against 72.4 ms for 73,848 cells that already showed text (0.98 µs each).</li>
+    <li><i>2</i><code>Element.remove()</code> on a row that left: 39 ms for about 3,200 rows, 12 µs per row of 17 cells. The largest single item on the keyed side.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Per cell touched, summing what scales with cells: keyed (<code>fill</code> + <code>remove</code>) 84.8 ms ÷ 54,961 ≈ 1.5 µs; positional (<code>fill</code>) 82.0 ms ÷ 73,848 ≈ 1.1 µs. The keyed pool's cell is dearer by about 40%, and almost half of its price is paid when the row <em>leaves</em>.</p>
+    <p>That gives the crossover without another recording. Keyed costs 1.5 µs × entering cells, positional 1.1 µs × visible cells; they are equal when about 72% of the viewport is replaced per frame. At 38,400 px/s the fraction is 26 of 35 rows, 74%.</p>
+    <p>JavaScript is one of several places where the two policies differ. The keyed pool's new elements need their style computed (<b data-m="j-speed-38400-keyed/main.styleMs" data-unit="ms"></b> of style against <b data-m="j-speed-38400-positional/main.styleMs" data-unit="ms"></b>), while the positional pool's rewritten text needs more layout (<b data-m="j-speed-38400-positional/main.layoutMs" data-unit="ms"></b> against <b data-m="j-speed-38400-keyed/main.layoutMs" data-unit="ms"></b>). <a href="rendering.html">Module 5</a> takes that apart.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/tanstack.ts:61–62, 70, 132–135</span>
+      <p>The DOM calls behind the rows of the listing.</p>
+<pre><span class="n"> 62</span>    el.textContent = v === undefined ? "…" : formatCell(v, col);        <span class="c">// writeCell</span>
+<span class="n"> 70</span>    while (el.children.length &lt; want) el.appendChild(document.createElement("div"));
+<span class="n">132</span>      for (const [index, el] of pool)
+<span class="n">133</span>        if (!seen.has(index)) {
+<span class="n">134</span>          <mark>el.remove();</mark></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>The price of a touched cell</dt><dd>Create + insert + set text + later remove, against replace text. Replacing is cheaper in total here, though setting text on an element that already has some costs more than on an empty one (inferred: the old text node and its layout object must be detached first).</dd>
+      <dt>Why keyed usually wins anyway</dt><dd>It multiplies its higher price by a much smaller number. At 2400 px/s it touches 27 cells per frame, the positional pool 567.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in JavaScript time, a created-and-removed cell cost about 40% more than a rewritten one here; the policies cross near three quarters of a viewport per frame.</p>
+    <p><b>No:</b> that these per-cell prices hold for other cell contents (classes, nested elements, a real <code>&lt;table&gt;</code>), or that the leaf numbers are better than ±30%: they are sums of 0.15 ms samples near forced <code>measure</code> samples (step 3).</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed a keyed pool is the cheaper policy, full stop, because it leaves most rows alone. The fast scroll showed its price per touched cell is higher and that removal, which I had not counted as work at all, is its largest DOM cost. Rule: compare reuse policies as (price per touched cell) × (cells touched per frame), and find the speed at which the products cross before choosing one for a workload.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: a painter that keys rows should recycle a leaving row's element for an entering row when both happen in one frame, which a jump or a fast drag makes the common case. That keeps the keyed pool's small unit at low speed and removes the create-and-remove price at high speed. It needs a trace of its own before it is believed.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-speed-38400-keyed prof 0 2100 | grep -E " (remove|appendChild|createElement|writeCell)"</code>: expect <code>remove</code> well above <code>appendChild</code> and <code>createElement</code> (file-order sums: about 23, 13 and 7 ms of self time; time order gives <code>remove</code> 39 ms).</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">At 38,400 px/s, per cell touched: keyed about 1.5 µs (create, append, set text, remove), positional about 1.1 µs (replace text); Element.remove is the keyed pool's largest DOM cost (39 ms for 3,200 rows).</li>
+    <li data-kind="inferred">The policies cross when about 72% of the viewport is replaced per frame; below that keyed touches so few cells that its higher price does not matter.</li>
+    <li data-kind="rejected">"Keyed reuse is always the cheaper policy": it is cheaper per frame only while few rows enter.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The slow end of the sweep has a different oddity: at 600 px/s a third to a half of the frames are marked "without main update". The main thread is nearly idle there. What is it missing?</p>
+</section>
+
+<section class="step" data-part="C · Scaling with speed, and the reuse policy" data-title="A slow scroll: frames with nothing new, and draws that change nothing" data-node="event js frame method">
+  <p class="holding"><span class="label">Question I hold</span><span>At 600 px/s the table moves 10 px per frame and no frame is expensive. Why do amber frames appear, and why most of all for regular-table?</span></p>
+
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>regular-table at 600 px/s: <b data-m="j-speed-600-regular/frames.partial"></b> of its frames are presented "without the pending main update", against <b data-m="j-speed-2400-regular/frames.partial"></b> at 2400 px/s. In those frames the main thread was:</p>
+    <div class="opts"><button data-k="a">Too slow: the draw missed the frame's deadline</button><button data-k="b">Idle: no scroll event reached it</button><button data-k="c">On time, and in most of them it ran a complete draw, which changed nothing on screen</button></div>
+    <div class="reveal"><p>On time, with nothing to show for it. The amber frame is the one <em>after</em> a main frame that ended without an update.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I list frames and main frames for 160 ms of the slow scroll in two panels (<code>q.mjs … frames 395 560</code>) and look inside the main frames that ended with no update.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-speed-600-regular">Search <code>MainFrameAborted</code> on <code>CrRendererMain</code>.</div>
+  <div class="tracelink" data-trace="j-speed-600-keyed"></div>
+  <div class="lanes" data-lanes='{"traces":["j-speed-600-regular","j-speed-600-keyed"],"titles":["regular-table at 600 px/s (j-speed-600-regular)","Keyed pool at 600 px/s (j-speed-600-keyed)"],"from":396,"to":560,"rows":["frames","mainFrames","main","app"],"pins":[[1,433.74,"mainFrames",0],[2,434.61,"main.layout",0],[3,449.86,"frames",0],[4,450.51,"main.js",0],[5,466.96,"mainFrames",1],[6,483.17,"frames",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>regular-table, main frame for vsync 95: 3.2 ms long, grey: it ended with <code>MainFrameAborted</code>, reason <code>NO_UPDATE</code>.</li>
+    <li><i>2</i>Inside it, a full draw: data listener (594 cells), animation-frame callback (0.33 ms), style recalculated for 616 elements (1.1 ms), layout with 38 dirty objects, paint. Nothing reached the compositor.</li>
+    <li><i>3</i>The next vsync, 96, is amber: presented without a main-thread update.</li>
+    <li><i>4</i>Vsync 96's own draw: the first row changed (10 → 11), the animation-frame callback takes 0.88 ms, every cell is rewritten, and this one commits.</li>
+    <li><i>5</i>Keyed pool, a grey main frame of 0.39 ms: the scroll event changed no row range, so <code>render()</code> was not called.</li>
+    <li><i>6</i>The vsync after it is amber, as with regular-table.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <table class="mtable" data-rows="j-speed-600-keyed,j-speed-600-positional,j-speed-600-regular,j-speed-2400-regular" data-names="keyed 600 px/s,positional 600,regular-table 600,regular-table 2400" data-head="Scenario" data-cols="frames.all|frames with main update,frames.partial|without,frames.dropped|dropped,main.scrollEvents|scroll events,main.mainFramesAborted|main frames with no update,main.layouts|layouts"></table>
+    <p>Checked over the whole scroll, with the frame and main-frame lists of each trace:</p>
+<pre>                          amber     …after a no-update     no-update       …that contained
+                          frames    main frame             main frames     a draw
+keyed, 600 px/s             30          30                     34               1
+regular-table, 600 px/s     50          49                     72              41   <span class="c">mean 3.6 ms each</span></pre>
+    <p>Every amber frame follows a main frame that had nothing to commit. In the keyed panel that is the natural case of a slow scroll: a row edge is crossed in about three frames of four, and in the fourth the scroll event finds the same range. In regular-table more than half of the no-update main frames did a whole draw first. The pattern is exact: of 91 draws in the scroll, the 41 that kept the same first row as the draw before all ended in <code>NO_UPDATE</code>, and the 49 that changed the first row all committed.</p>
+    <p>Those 41 draws are triggered when the <em>last</em> row index changes. regular-table calls our data listener, walks all 594 cells, finds almost all of them unchanged (<code>tbody.ts:58</code>), and still pays a style pass over every cell; the row it added lies outside what is visible, so painting produces nothing new.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>"Without main update" does not mean the main thread was late here. Throughout these scrolls the compositor draws each vsync at once (deadline mode <code>IMMEDIATE</code> in 117 of 119 frames, at 600 and at 2400 px/s alike) with whatever the main thread committed during the vsync before. When that earlier main frame ended in <code>NO_UPDATE</code>, the frame drawn now has no new main-thread content with it while this vsync's main frame is still running, and its reporter is closed as partial. How reporters fork and what each state promises is <a href="frames.html">Module 2</a>'s subject; what this module adds is the cause on the JavaScript side.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L1017-L1029">virtual-core src/index.ts:1017–1029</a>
+      <p>Why the keyed panel does nothing in a frame with no row crossing: <code>onChange</code> is reached only when one of three values changed.</p>
+<pre><span class="n">1017</span>  private maybeNotify = memo(
+<span class="n">1021</span>      return [
+<span class="n">1022</span>        this.isScrolling,
+<span class="n">1023</span>        <mark>this.range ? this.range.startIndex : null,</mark>
+<span class="n">1024</span>        <mark>this.range ? this.range.endIndex : null,</mark>
+<span class="n">1027</span>    (isScrolling) =&gt; {
+<span class="n">1028</span>      this.notify(isScrolling)</pre>
+      <p>Either index changing is a notify, so a row crossing the bottom edge renders too; in the keyed pool that render creates the one row that entered.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>No-update main frame</dt><dd>A <code>BeginMainFrame</code> whose work left nothing for the compositor: trace instant <code>MainFrameAborted</code> with <code>aborted_on_main_reason: NO_UPDATE</code>. It can be 0.3 ms of bookkeeping or, as here, 3.6 ms of draw.</dd>
+      <dt>No-op draw</dt><dd>A draw that runs the whole pipeline and changes no pixel. Counters such as "draws" count it as work done; the frame record shows it was not needed.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> at 600 px/s amber frames mark vsyncs after a main frame with nothing to commit; regular-table spends about 3.6 ms of main thread in each of 41 draws that changed nothing visible.</p>
+    <p><b>No:</b> that the scroll looked worse. Nothing was dropped (<b data-m="j-speed-600-regular/frames.dropped"></b> dropped frames) and the compositor moved the content in every frame. And not that regular-table could simply skip these draws: the row it adds may be needed by the next frame; whether it could be added more cheaply is a question for its source (<a href="anatomy.html">Module 3</a>).</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read a rising share of amber frames as "the main thread is falling behind", and expected it at high speed. It rose at the <em>lowest</em> speed, where the main thread was most idle. Rule: before blaming load for partial frames, look at the main frame of the vsync before; if it says <code>NO_UPDATE</code>, the question is not "why so slow" but "why was there nothing to commit, and was work done for it".</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: let the view core tell the painter when a new window differs from the last only outside the visible rows, and count "draws with no visible change" as its own counter. In Tablelab's three-pace design the rendering pace should not be spent on frames that publish nothing.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-speed-600-regular frames 395 560</code>: expect <code>partial</code> and <code>all</code> to alternate in the first list, and in the second list main frames marked <code>none</code> that are 1.5 to 3.5 ms long. Then <code>… slices MainFrameAborted main 430 440</code> prints the instant at 436.92 ms with <code>"aborted_on_main_reason":"NO_UPDATE"</code>, at the end of the draw of pin 2.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">At 600 px/s every frame presented without a main update follows a main frame aborted with NO_UPDATE (30 of 30 keyed, 49 of 50 regular-table).</li>
+    <li data-kind="measured">regular-table at 600 px/s: 41 of 91 draws kept the first row, cost about 3.6 ms of main thread each, and committed nothing.</li>
+    <li data-kind="inferred">Here "without main update" marks vsyncs for which the main thread had nothing new, not a late main thread; the compositor's deadline is IMMEDIATE throughout.</li>
+    <li data-kind="rejected">"More partial frames means a busier main thread": the share is highest at the slowest scroll.</li>
+  </ul>
+  <p class="next" data-answer="unit"><b>Next question →</b> The units are settled: entering rows, visible cells, rendered rows. Until now a cell's text cost almost nothing. What if formatting it is not free?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · What a cell costs" data-title="Four ways to format a number" data-node="js sampler counters">
+  <p class="holding"><span class="label">Question I hold</span><span>A cell's text has to be made from a number. How much does the choice of formatting call add per cell, and where does it show in the trace?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>Two ways to get <code>"1,234.50"</code> per cell: <code>v.toLocaleString("en-US", OPTS)</code>, and <code>new Intl.NumberFormat("en-US", OPTS).format(v)</code>, which builds a formatter object for every cell. How do they compare?</p>
+    <div class="opts"><button data-k="a"><code>toLocaleString</code> is far cheaper: the engine caches its formatter</button><button data-k="b">About the same</button><button data-k="c"><code>toLocaleString</code> is slower</button></div>
+    <div class="reveal"><p>About the same. With an options argument, <code>toLocaleString</code> builds a new formatter on every call too; V8 only caches when options are absent (source below).</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Four recordings of regular-table at the large viewport, differing only in <code>fmt</code>: <code>plain</code> (<code>toFixed(2)</code>), <code>intl</code> (one shared <code>Intl.NumberFormat</code>), <code>locale</code> and <code>newintl</code> (the two calls of the prediction). The formatting runs in our data listener, which we measure (<code>app: data listener</code>), so the median of about 120 draws is a much steadier number than a script total. Of the 18 visible columns, 7 are prices and go through the formatter: about 227 of the 584 cells per draw.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-fmt-locale">The others are <code>j-fmt-plain</code>, <code>j-fmt-intl</code>, <code>j-fmt-newintl</code>.</div>
+  <table class="mtable" data-rows="j-fmt-plain,j-fmt-intl,j-fmt-locale,j-fmt-newintl" data-names="plain: toFixed(2),intl: shared Intl.NumberFormat,locale: toLocaleString with options,newintl: new Intl.NumberFormat per cell" data-head="fmt" data-hi="j-fmt-locale:app.data listener.p50,j-fmt-newintl:app.data listener.p50" data-cols="state.formatted|formatCell calls,app.data listener.p50|listener p50|ms,app.data listener.p95|listener p95|ms,app.data listener.max|listener max|ms,main.scriptMs|script|ms,frames.mainFrameMs.p50|main frame p50|ms,frames.dropped|dropped frames"></table>
+  <div class="bars" data-bars='{"ids":["j-fmt-plain","j-fmt-intl","j-fmt-locale","j-fmt-newintl"],"labels":["plain","intl (shared)","locale","newintl"],"series":[{"path":"main.scriptMs","label":"script","color":"#d9a800"},{"path":"main.styleMs","label":"style","color":"#c9a6ea"},{"path":"main.layoutMs","label":"layout","color":"#9b59d0"}],"stack":true,"unit":"ms","title":"Main-thread time over the scroll, by category"}'></div>
+  <div class="prof" data-prof="j-fmt-locale" data-top="4" data-by="self"></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>From the listener medians, per formatted price cell (about 227 per draw):</p>
+<pre>fmt        listener p50     minus plain     per price cell
+plain        0.055 ms           —            below what this can resolve
+intl         0.129            0.074 ms        about 0.3 µs
+locale       2.574            2.519           about 11 µs
+newintl      2.331            2.276           about 10 µs</pre>
+    <p>A shared formatter costs a third of a microsecond per cell. Building one per cell costs thirty times that, and <code>toLocaleString</code> with options is the same thing in disguise. With 227 such cells per draw it adds 2.5 ms to every frame, and the script total of the scroll triples.</p>
+    <p>In the profile the whole cost appears as <b>self time of <code>formatCell</code></b>. There is no row for <code>toLocaleString</code>, <code>NumberFormat</code> or <code>format</code>: they are V8 builtins, and no row carries their names in this profile. Step 2's rule again: the innermost named frame owns the native work done for it.</p>
+    <p>Is the price constant per cell? The median is steady, the tail is not: the 95th-percentile listener call is about 1.3 times the median for <code>locale</code> and more than twice for <code>newintl</code>, and single calls reach the table's last column. No frame was dropped in any of the four.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/format.ts:29–36</span>
+<pre><span class="n">29</span>    case "intl":
+<span class="n">30</span>      return shared.format(v);
+<span class="n">32</span>      return v.toLocaleString("en-US", OPTS);
+<span class="n">34</span>      return new Intl.NumberFormat("en-US", OPTS).format(v);
+<span class="n">36</span>      return v.toFixed(2);</pre>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/objects/intl-objects.cc#L1574-L1608">v8 src/objects/intl-objects.cc:1574–1578, 1606–1608 (Intl::NumberToLocaleString)</a>
+      <p>Why <code>toLocaleString</code> with options is as dear as a new formatter: it is one.</p>
+<pre><span class="n">1574</span>  // We only cache the instance when locales is a string/undefined and
+<span class="n">1575</span>  // options is undefined, as that is the only case when the specified
+<span class="n">1576</span>  // side-effects of examining those arguments are unobservable.
+<span class="n">1577</span>  bool can_cache =
+<span class="n">1578</span>      <mark>(IsString(*locales) || IsUndefined(*locales)) &amp;&amp; IsUndefined(*options);</mark>
+<span class="n">1606</span>  ASSIGN_RETURN_ON_EXCEPTION(
+<span class="n">1608</span>      <mark>New&lt;JSNumberFormat&gt;(isolate, constructor, locales, options, method_name));</mark></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Budget per cell</dt><dd>One frame is 16.7 ms. At 11 µs per formatted cell, 1,500 cells use all of it; at 0.3 µs, 50,000 would. The unit cost decides how many cells a design can afford to touch.</dd>
+      <dt>Median of a measured span</dt><dd><code>app.data listener.p50</code> is the middle of about 120 measured calls. The page is cross-origin isolated, so <code>performance.now()</code> resolves 5 µs (<code>time_clamper.h:24</code>), fine enough for a 0.05 ms span.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the per-cell price of each idiom on this machine, to within tens of percent; that per-call formatter construction is the cost, in both spellings; that the profile shows it as self time of the caller.</p>
+    <p><b>No:</b> the small difference in script total between <code>plain</code> and <code>intl</code> (25%, at the noise floor; the listener medians are what separate them). Nor prices for other locales or options, which change what ICU must build.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: formatting is a per-cell unit cost that multiplies whatever the painter's unit is, so it belongs where the unit is smallest. If the engine formats on its side (worker or server) with formatters built once per column, the renderer receives strings and its per-cell cost stays at the DOM write. Whether that pays depends on what crossing the boundary costs per cell, which Modules 6 and 9 measure.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-fmt-locale stack 502</code> prints a sample from inside the data listener: <code>formatCell</code> ← <code>(anonymous) assets/regular-….js:13</code> ← <code>(root)</code>, with nothing above <code>formatCell</code>. Then <code>… marks listener 495 540</code> shows the <code>data listener</code> spans of three frames (2.21, 2.18 and 3.06 ms), each with <code>formatMs</code> in its detail.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Per formatted cell: shared Intl.NumberFormat about 0.3 µs; toLocaleString with options about 11 µs; a new Intl.NumberFormat per cell about 10 µs (data-listener medians, j-fmt-*).</li>
+    <li data-kind="read">Number.prototype.toLocaleString reuses a cached formatter only when options is undefined; otherwise it constructs a JSNumberFormat per call (intl-objects.cc:1577–1578, 1608).</li>
+    <li data-kind="measured">The formatting cost appears in the profile as self time of formatCell; the builtins it calls have no row of their own.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> So far every panel was hand-written or a library with its own DOM code. React puts a general-purpose layer between the range math and the DOM. What does that layer do in a scroll event?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · React on the same range math" data-title="What the adapter does in a scroll event" data-node="event js dom sampler"
+  data-ask="react|What does React add per frame on top of the same range math, and what would memoization or overscan change?">
+  <p class="holding"><span class="label">Question I hold</span><span>The React panel uses the same virtual-core and shows the same rows as the keyed pool. Between the library's <code>onChange</code> and the DOM, what runs, and how is its time divided?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the adapter's <code>onChange</code>, then follow the profile of <code>j-cells-L-react</code> down from it. The table is the stored profile by total time, with pass-through frames left out; the listing is the time-ordered version with the same run without marks beside it.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-cells-L-react">In DevTools, select one <code>Event: scroll</code> and read the flame chart under it: <code>flushSync</code> → <code>performWorkOnRoot</code> → <code>renderRootSync</code>, then <code>commitRoot</code>.</div>
+  <div class="prof" data-prof="j-cells-L-react" data-top="8" data-by="total" data-skip="(program),memoizedFunction,Virtualizer.notify,Virtualizer.maybeNotify.memo.key,flushSyncWorkAcrossRoots_impl,flushSyncWork$1,flushSyncWork,performSyncWorkOnRoot,commitRootWhenReady,workLoopSync,performUnitOfWork,commitLayoutEffectOnFiber,recursivelyTraverseLayoutEffects,onChange"></div>
+<pre>total ms under the scroll listener, 0–2100 ms       j-cells-L-react    j-nomarks-react
+scroll listener (index.js:365), both virtualizers        145.8             109.3
+<span class="cp">1</span> flushSync (react-dom)                                  91.5              64.8
+<span class="cp">2</span>   renderRootSync: Grid, 35 × Row, reconcile            40.8              31.2
+        RowImpl (our row function)                         4.8               5.0
+<span class="cp">3</span>   commitRoot                                           49.6              32.7
+        mutation effects (DOM changes)                    16.4              12.5
+<span class="cp">4</span>     layout effects (ours: measure, onCommit)           26.7              10.8
+  offset reader (index.js:384): forced layout             49.0              40.3</pre>
+  <ol class="pins">
+    <li><i>1</i><code>flushSync</code>: everything React does for a scroll event, synchronously inside the listener. 91.5 ms over <b data-m="j-cells-L-react/state.counters.renders"></b> renders, 0.73 ms each.</li>
+    <li><i>2</i>The <b>render phase</b>: React calls <code>Grid</code>, then <code>Row</code> for each of 35 rows, and compares the 35 × 18 elements they return with the previous ones. Our row function itself is an eighth of it.</li>
+    <li><i>3</i>The <b>commit phase</b>: apply the differences to the DOM (two rows removed, two inserted), then run effects.</li>
+    <li><i>4</i>Half of the commit is our own layout effect: the <code>measure</code> call and a completeness check that runs <code>querySelector</code> per visible row (<code>react.tsx:103–113</code>). Without marks it shrinks to the check alone.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The counters fix the amounts: <b data-m="j-cells-L-react/state.counters.rowRenders"></b> row renders in <b data-m="j-cells-L-react/state.counters.renders"></b> renders, 35 per scroll event, <b data-m="j-cells-L-react/state.counters.commits"></b> commits, one per render. In step 1's frame the keyed pool's <code>render()</code> took 0.17 ms and React's render-to-effect span 0.49 ms; over the scroll the medians are <b data-m="j-cells-L-tanstack/app.draw.p50" data-unit="ms"></b> and <b data-m="j-cells-L-react/app.draw.p50" data-unit="ms"></b>.</p>
+    <p>React's time is not in our components. <code>RowImpl</code>, with the <code>formatCell</code> calls inside it, has about 5 ms of the 41 ms render phase; the rest is React creating and comparing fibers for 35 rows × 18 children to conclude that 33 rows are unchanged. The DOM work it then does is the keyed pool's: the same two rows in, two rows out.</p>
+    <p>In the stored table the <code>flushLayoutEffects</code> figure is higher than in the listing. It is the file-order artifact of step 3: the forced <code>measure</code> sample inside the effect collects time that belongs before it.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/react-virtual%403.14.26/packages/react-virtual/src/index.tsx#L177-L220">react-virtual src/index.tsx:177–219</a>
+      <p>The adapter's whole reaction to a range change.</p>
+<pre><span class="n">177</span>    onChange: (instance, sync) =&gt; {
+<span class="n">179</span>      let shouldRerender = true
+<span class="n">203</span>      if (shouldRerender) {
+<span class="n">212</span>        if (useFlushSync &amp;&amp; sync &amp;&amp; !measuringFromRef.current) {
+<span class="n">213</span>          <mark>flushSync(rerender)</mark>
+<span class="n">214</span>        } else {
+<span class="n">215</span>          rerender()
+<span class="n">219</span>      options.onChange?.(instance, sync)</pre>
+      <p><code>rerender</code> is a <code>useReducer</code> dispatch (line 88); <code>sync</code> is virtual-core's <code>isScrolling</code> (<code>index.ts:1027–1028</code>). So during a scroll every range change renders and commits React before the scroll listener returns, which is why the DOM is ready in the same frame. <a href="anatomy.html">Module 3</a> reads the adapter in full.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Render phase, commit phase</dt><dd>Render: call component functions and diff their output against the last (no DOM access). Commit: write the differences to the DOM and run effects. A profile separates them as <code>renderRootSync</code> and <code>commitRoot</code>.</dd>
+      <dt><code>flushSync</code></dt><dd>Runs a state update's render and commit immediately instead of leaving them to React's scheduler. Here it trades scheduling freedom for a DOM that matches the scroll position in the same frame.</dd>
+      <dt>Which build</dt><dd>React 19.2.7, production build (the profile names <code>reactDom_production.flushSync</code>), bundled without minification so names are readable. A development build does more work per render.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on a scroll event the adapter renders and commits synchronously; every visible row's function runs; the render phase and the commit phase are of similar size here; our own effect is a large part of the commit when marks are on.</p>
+    <p><b>No:</b> that this is "React's cost" in general. It is one component structure (35 rows, 17 plain children each, no context, no state below <code>Grid</code>) under one adapter.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-L-react stack 501.0</code> lands in the scroll event of step 1's frame. Read the 17 lines from the bottom: <code>(anonymous) …:365</code> (the listener), <code>Virtualizer.notify</code>, <code>onChange</code>, <code>reactDom_production.flushSync</code>, <code>performWorkOnRoot</code>, <code>renderRootSync</code>, and <code>beginWork</code> on top: this sample fell in the render phase.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">During a scroll, react-virtual's onChange calls flushSync(rerender): React renders and commits inside the scroll listener (react-virtual index.tsx:203–216; sync = isScrolling, virtual-core index.ts:1027–1028).</li>
+    <li data-kind="measured">j-cells-L-react: 35 Row renders per scroll event; flushSync 0.73 ms per render, split about evenly between render phase and commit; RowImpl with its formatCell calls is about 5 ms of a 41 ms render phase.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> 33 of the 35 row renders per event produce nothing new. <code>React.memo</code> skips them. How much of the time goes with them, and does overscan help?</p>
+</section>
+
+<section class="step" data-part="E · React on the same range math" data-title="memo, overscan, and what the layer costs per frame" data-node="js counters method">
+  <p class="holding"><span class="label">Question I hold</span><span>If rows are memoized, or if more rows are kept beyond the edges, how do the counts and the times change? And stated plainly: what does the React layer add to a frame?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>With <code>memo=1</code> a row re-renders only when its props change, so about 2 rows render per scroll event instead of 35. The script total of the scroll will:</p>
+    <div class="opts"><button data-k="a">Fall to a fraction: almost twenty times fewer row renders</button><button data-k="b">Fall by a quarter at most, and not in every run</button><button data-k="c">Rise: comparing props costs more than rendering</button></div>
+    <div class="reveal"><p>The second. The count falls 19-fold and is certain. The time it buys is small and, in single runs, inside the noise.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three variants with marks, <code>j-cells-L-react</code>, <code>j-react-memo</code>, <code>j-react-overscan</code> (overscan 10 instead of 1), and three controls recorded for this module with every mark and measure switched off: <code>j-nomarks-keyed</code>, <code>j-nomarks-react</code>, <code>j-nomarks-memo</code>. The controls let the layer's cost be stated without our instrumentation in it.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-react-memo"></div>
+  <div class="tracelink" data-trace="j-nomarks-react">Controls: <code>j-nomarks-keyed</code>, <code>j-nomarks-react</code>, <code>j-nomarks-memo</code> (<code>lab/harness/extra/javascript.mjs</code>).</div>
+  <div class="lanes" data-lanes='{"traces":["j-cells-L-react","j-react-memo"],"titles":["React rows, no memo (j-cells-L-react)","React rows with memo (j-react-memo)"],"from":499.8,"to":503.8,"rows":["main","app"],"pins":[[1,500.72,"main.js",0],[2,500.82,"app",0],[3,500.8,"main.js",1],[4,500.93,"app",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>No memo: <code>Event: scroll</code>, 1.29 ms.</li>
+    <li><i>2</i>Its <code>draw</code> span, 0.49 ms, <code>rowRenders: 36</code>.</li>
+    <li><i>3</i>With memo: <code>Event: scroll</code>, 1.08 ms.</li>
+    <li><i>4</i>Its <code>draw</code> span, 0.29 ms, <code>rowRenders: 2</code>. The frame around it is otherwise the same: same forced layout, same paint.</li>
+  </ol>
+  <table class="mtable" data-rows="j-cells-L-react,j-react-memo,j-react-overscan" data-names="React rows,with memo,overscan 10" data-head="With marks" data-cols="state.counters.renders|Grid renders,state.counters.rowRenders|Row renders,state.counters.cellsFormatted|cells formatted,state.cellsInDom|cells in DOM,app.draw.p50|draw p50|ms,main.scriptMs|script|ms"></table>
+  <table class="mtable" data-rows="j-nomarks-keyed,j-nomarks-react,j-nomarks-memo" data-names="keyed pool,React rows,React rows with memo" data-head="Without marks" data-cols="main.scrollEvents|scroll events,state.formatted|formatCell calls,main.scriptMs|script|ms,frames.mainFrameMs.p50|main frame p50|ms,threads.mainBusyMs|main thread busy|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>memo.</b> Row renders fall from 35 to about 2 per scroll event, and <code>formatCell</code> calls to exactly the keyed pool's number. The median <code>draw</code> span falls from <b data-m="j-cells-L-react/app.draw.p50"></b> to <b data-m="j-react-memo/app.draw.p50" data-unit="ms"></b>. The sampled time under <code>flushSync</code> falls from 91.5 to 64.1 ms with marks and from 64.8 to 51.0 ms without: a fifth to a third. The script totals do not agree with each other: with marks memo is lower (<b data-m="j-react-memo/main.scriptMs"></b> against <b data-m="j-cells-L-react/main.scriptMs"></b> ms), without marks it is higher (<b data-m="j-nomarks-memo/main.scriptMs"></b> against <b data-m="j-nomarks-react/main.scriptMs"></b> ms). Step 4's noise floor is a quarter; the saving is smaller than that.</p>
+    <p><b>overscan 10.</b> The number of <code>Grid</code> renders does not change (<b data-m="j-react-overscan/state.counters.renders"></b> against <b data-m="j-cells-L-react/state.counters.renders"></b>). Each render now covers 52 rows instead of 35, so there are more row renders, more cells formatted and a larger DOM, for no fewer scroll events that do work.</p>
+    <p><b>The layer.</b> From the controls: (<b data-m="j-nomarks-react/main.scriptMs"></b> − <b data-m="j-nomarks-keyed/main.scriptMs"></b>) ms ÷ <b data-m="j-nomarks-react/main.scrollEvents"></b> scroll events ≈ 0.65 ms per frame for React without memo, and 0.71 ms with it. From the marked runs: 0.81 and 0.54 ms. So React adds 0.5 to 0.8 ms of script to each frame here, 3 to 5% of a 16.7 ms frame, on top of a keyed pool that needs about 0.3 ms. It triples the JavaScript and leaves the frame's style, layout and paint as they were.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L98-L105">virtual-core src/index.ts:103–105, 1021–1024</a>
+      <p>Why overscan cannot reduce renders: the notification is keyed on the visible range; overscan is added afterwards, when the indexes to render are listed.</p>
+<pre><span class="n"> 103</span>  const overscan = range.overscan * Math.max(range.lanes ?? 1, 1)
+<span class="n"> 104</span>  const start = Math.max(<mark>range.startIndex - overscan</mark>, 0)
+<span class="n"> 105</span>  const end = Math.min(<mark>range.endIndex + overscan</mark>, range.count - 1)
+<span class="n">1021</span>      return [
+<span class="n">1022</span>        this.isScrolling,
+<span class="n">1023</span>        this.range ? <mark>this.range.startIndex</mark> : null,      <span class="c">// the visible range, without overscan</span>
+<span class="n">1024</span>        this.range ? this.range.endIndex : null,</pre>
+      <span class="path">lab/pages/src/react.tsx:48–49</span>
+<pre><span class="n">48</span>const MemoRow = memo(RowImpl, (a, b) =&gt; a.index === b.index &amp;&amp; a.start === b.start &amp;&amp; … &amp;&amp; !a.data === !b.data);
+<span class="n">49</span>const Row = config.memo ? MemoRow : RowImpl;</pre>
+      <p>The comparison is ours: <code>data</code> is a fresh array on every <code>Grid</code> render, so the default shallow comparison would never skip.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>What memo removes</dt><dd>The call of the row function and the diff of its children. What stays per row: creating the element for <code>&lt;Row&gt;</code> in <code>Grid</code>, and comparing its props. What stays per render: entering React, <code>Grid</code> with two <code>useVirtualizer</code> hooks, the keyed diff of 35 children, the commit, the effects.</dd>
+      <dt>Overscan</dt><dd>Extra rows rendered beyond the visible ones. It widens what is in the DOM while the main thread is late; it is not a way to render less often.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> memo makes React's unit the entering rows (a counter); most of the layer's per-frame cost is per render, not per row, at this row size; overscan leaves the render count alone; the layer costs well under a millisecond per frame on this machine.</p>
+    <p><b>No:</b> a percentage saving for memo from these runs: two pairs give −23% and +6% on the total. Nor that the layer stays cheap under a CPU several times slower, with heavier row components, or in a development build; and nothing here says what React costs when values update (<a href="streaming.html">Module 7</a>).</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected memoization to remove most of React's scroll cost, because nine tenths of the row renders are wasted. The counter confirmed the waste was removed, and the clock barely moved: the wasted renders were cheap, and the fixed part of a render was not. Rule: a counter proves work was avoided; what the avoided work was worth needs timed runs, repeated until the difference clears the noise floor. Optimize the unit a profile shows to be expensive, not the unit that is easiest to count.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: judge a UI layer on top of the painter by two numbers, its fixed cost per frame and what its per-frame work scales with, both measured with the painter's own instrumentation off. Under 1 ms fixed is affordable at 60 Hz on this hardware; a layer whose work scales with visible cells is the regular-table cost model again, whatever it is written in.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-react-overscan marks draw 500 540</code>: expect three <code>draw</code> spans, one per frame as without overscan, each with <code>"rowRenders":53</code> or <code>54</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">memo: Row renders per scroll event 35 → about 2 and formatCell calls equal to the keyed pool's; sampled time under flushSync down by a fifth to a third; script total down 23% in one pair of runs and up 6% in the other.</li>
+    <li data-kind="measured">overscan 10: the same number of Grid renders, 52 rows per render instead of 35.</li>
+    <li data-kind="measured">React adds 0.5 to 0.8 ms of script per frame over the keyed pool at 33 × 17 cells (3 to 5% of a frame), with or without memo, production build.</li>
+    <li data-kind="read">Renders are notified on the visible range; overscan is applied when indexes are extracted (virtual-core index.ts:103–105, 1021–1024).</li>
+    <li data-kind="rejected">"memo removes most of React's cost during a scroll": it removes most of the row renders, which were a small part of the time.</li>
+  </ul>
+  <p class="next" data-answer="react"><b>Next question →</b> React's render allocates: 600 element objects per scroll event that are garbage a frame later. Does garbage ever cost a frame?</p>
+</section>
+
+<!-- ═════════════════════════ PART F ═════════════════════════ -->
+
+<section class="step" data-part="F · Memory: allocation and collection" data-title="Garbage on purpose: when does the scavenger run, and what does it cost?" data-node="js gc counters"
+  data-ask="gc|Does garbage collection ever cost a frame here, and which costs more: making garbage or collecting it?">
+  <p class="holding"><span class="label">Question I hold</span><span>Each draw is told to allocate short-lived objects, nominally 0, 512 or 4096 KB. How often does a collection run, how long is each, and where does the added time go?</span></p>
+
+  <div class="predict" data-right="a"><span class="label">Predict first</span>
+    <p>With <code>alloc=0</code> the scroll has 5 scavenges. With <code>alloc=512</code> every draw runs a loop that creates 8,192 small objects and strings, about 75 MB over the scroll if each really takes 64 bytes. How many scavenges?</p>
+    <div class="opts"><button data-k="a">Still 5</button><button data-k="b">About 15</button><button data-k="c">50 or more</button></div>
+    <div class="reveal"><p>Still 5. The loop ran; the objects were never allocated. The optimizing compiler proved they could not be seen outside the loop and removed them.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three recordings of regular-table at the large viewport, <code>j-gc-0</code>, <code>j-gc-512</code>, <code>j-gc-4096</code>. The garbage loop (<code>allocateGarbage</code>, <code>format.ts:50–58</code>) runs at the start of our data listener, so the listener's measured span contains it. I list the <code>MinorGC</code> and <code>MajorGC</code> spans (<code>q.mjs … slices 'MinorGC|MajorGC'</code>); each carries the heap size before and after, so the amount collected can be added up.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-gc-4096">Search <code>MinorGC</code>: 47 hits on <code>CrRendererMain</code>. The memory counter track shows the sawtooth.</div>
+  <div class="tracelink" data-trace="j-gc-0"></div>
+  <div class="lanes" data-lanes='{"traces":["j-gc-0","j-gc-4096"],"titles":["alloc=0 (j-gc-0)","alloc=4096 (j-gc-4096)"],"from":0,"to":2500,"rows":["frames","gc"],"pins":[[1,207.06,"gc",0],[2,757.7,"gc",0],[3,134.9,"gc",1],[4,624.62,"gc",1],[5,760.92,"gc",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><code>alloc=0</code>: the first scavenge, 0.51 ms, heap 4.4 → 3.1 MB. One follows every 300 to 600 ms: regular-table and our listener make about 59 KB of garbage per draw on their own.</li>
+    <li><i>2</i>A <code>MajorGC</code>, 1.08 ms. Step 13.</li>
+    <li><i>3</i><code>alloc=4096</code>: a scavenge every one or two frames at first, each about 0.2 ms, heap 7.3 → 3.4 MB.</li>
+    <li><i>4</i>After 600 ms they thin out to one every five frames, each collecting about 7 MB: V8 has enlarged the young generation.</li>
+    <li><i>5</i>The major collections are where they were without the garbage.</li>
+  </ol>
+  <div class="lanes" data-lanes='{"traces":["j-gc-4096"],"titles":["alloc=4096, two frames (j-gc-4096)"],"from":66,"to":92,"rows":["mainFrames","main","gc","app"],"pins":[[6,67.56,"app"],[7,68.42,"gc"],[8,85.04,"gc"]]}'></div>
+  <ol class="pins" start="6">
+    <li><i>6</i>The data listener, 1.82 ms here (0.07 ms without the garbage loop).</li>
+    <li><i>7</i>A scavenge of 0.23 ms <em>inside</em> it: the loop filled the young generation and had to wait for it to be emptied.</li>
+    <li><i>8</i>The next one, 0.20 ms, again inside the listener of the next frame.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <table class="mtable" data-rows="j-gc-0,j-gc-512,j-gc-4096" data-names="alloc=0,alloc=512 KB,alloc=4096 KB" data-head="Per draw, nominal" data-hi="j-gc-4096:gc.minor,j-gc-4096:app.data listener.p50" data-cols="gc.minor|scavenges,gc.minorMs|scavenge time|ms,gc.major|major GCs,gc.majorMs|major GC time|ms,heap.minMb|heap min|MB,heap.maxMb|heap max|MB,app.data listener.p50|listener p50|ms,frames.dropped|dropped frames"></table>
+<pre>             collected by scavenges        per draw     scavenges inside JavaScript
+             (sum of before − after)                    / in a task of their own
+alloc=0            8.5 MB                    59 KB             0 / 5
+alloc=512          8.2 MB                    56 KB             0 / 5
+alloc=4096       237.5 MB                   1.6 MB            23 / 24</pre>
+    <p><b>512 KB that never existed.</b> <code>alloc=512</code> is indistinguishable from <code>alloc=0</code> in every column. <b>4096 KB that was 1.6 MB.</b> The large setting does allocate, at well under half its nominal size.</p>
+    <p><b>Allocating costs more than collecting.</b> At 4096 the listener's median grows from <b data-m="j-gc-0/app.data listener.p50"></b> to <b data-m="j-gc-4096/app.data listener.p50" data-unit="ms"></b>: about 0.6 ms per draw to create the strings. All 47 scavenges together took <b data-m="j-gc-4096/gc.minorMs" data-unit="ms"></b>, 0.08 ms per draw, none longer than 0.51 ms. Making the garbage cost seven times what collecting it did.</p>
+    <p><b>The price changed mid-scroll.</b> The listener took 0.75 to 1.8 ms per draw until about 830 ms and 0.55 ms from then on, while the amount collected per draw halved. Something made the loop cheaper while it ran; step 15 names the candidates.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/format.ts:54–56</span>
+<pre><span class="n">54</span>  for (let i = 0, n = config.allocKb * 16; i &lt; n; i++) {
+<span class="n">55</span>    <mark>const o = { a: i, b: i * 0.5, s: "r" + i };</mark>
+<span class="n">56</span>    keep += o.s.length;</pre>
+      <p><code>o</code> never leaves the loop body. An optimizing compiler may replace it by its fields (escape analysis; V8 flags <code>turbo_escape</code> and <code>maglev_escape_analysis</code>, both on by default, <code>flag-definitions.h:1593, 1533</code>). What it cannot remove is what remains at 4096: inferred to be the number-to-string conversions for 65,536 different values of <code>i</code>.</p>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/heap/heap.cc#L1406-L1408">v8 src/heap/heap.cc:1406–1408, 1530</a>
+      <p>Where the two span names and their arguments come from.</p>
+<pre><span class="n">1406</span>  TRACE_EVENT_BEGIN("devtools.timeline,v8", perfetto::StaticString(event_name_),
+<span class="n">1407</span>                    "usedHeapSizeBefore", heap_-&gt;SizeOfObjects(), "type",
+<span class="n">1530</span>        this, IsYoungGenerationCollector(collector) ? <mark>"MinorGC" : "MajorGC"</mark>,</pre>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/heap/minor-gc-job.cc#L137-L151">v8 src/heap/minor-gc-job.cc:21–31, 141–149 · flag-definitions.h:2583</a>
+      <p>Why most scavenges run between frames: V8 posts a task when the young generation is 80% full, at user-visible priority.</p>
+<pre><span class="n">  30</span>  return young_capacity * v8_flags.minor_gc_task_trigger / 100;
+<span class="n"> 141</span>  const auto priority = v8_flags.minor_gc_task_with_lower_priority
+<span class="n"> 142</span>                            ? <mark>TaskPriority::kUserVisible</mark>
+<span class="n"> 149</span>    taskrunner-&gt;PostNonNestableTask(std::move(task));
+<span class="n">2583</span>DEFINE_UINT(minor_gc_task_trigger, 80,</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Young generation, scavenge</dt><dd>New objects go into a small area of a few megabytes. When it fills, a scavenge (<code>MinorGC</code>) copies the survivors out and reuses the area. Its cost follows what <em>survives</em>, not what died, which is why 7 MB of dead strings are cleared in 0.2 ms.</dd>
+      <dt>Where the pause lands</dt><dd>Normally in a task of its own on the main thread's <code>V8_USER_VISIBLE_TQ</code> queue, between frames. Only when code allocates faster than that task gets to run does the scavenge happen in the middle of JavaScript, as at pins 7 and 8.</dd>
+      <dt>Nominal and real allocation</dt><dd>Source code says what objects are written down. The heap counters say what was allocated. Read the second.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> here a scavenge is 0.2 to 0.8 ms and never cost a frame; a megabyte and a half of short-lived strings per draw costs about 0.6 ms to make and 0.08 ms to collect; whether written-down allocations happen at all is the optimizer's decision.</p>
+    <p><b>No:</b> that escape analysis is what removed the 512 KB in Chrome: the trace shows that the allocation is absent, not why. The mechanism is checked outside the browser (Try it), on another V8 version. And none of this covers garbage that survives a scavenge, which is copied and later marked.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I wrote a knob called "512 KB of garbage per draw" and was ready to report what 512 KB of garbage costs. It costs nothing, because it was not there. Rule: verify a synthetic load in the trace before reading its effect: for allocation, add up <code>usedHeapSizeBefore − usedHeapSizeAfter</code> over the scavenges and compare with what the code claims.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: for anything that crosses to the renderer per frame (decoded rows, strings), count bytes that reach the heap, not objects in the source, and budget the creation time first. A window of row objects that dies within the frame is cheap to collect; building it is the cost. Reusing buffers or transferring typed arrays attacks the right side.</p></div>
+  <div class="try"><span class="label">Try it</span>Save the loop as a file and run it under Node, with and without escape analysis:
+<pre>// garbage.mjs
+import { PerformanceObserver, constants } from "node:perf_hooks";
+const kb = Number(process.argv[2] ?? 512);
+function allocateGarbage() {
+  let keep = 0;
+  for (let i = 0, n = kb * 16; i &lt; n; i++) { const o = { a: i, b: i * 0.5, s: "r" + i }; keep += o.s.length; }
+  return keep;
+}
+let scavenges = 0;
+new PerformanceObserver((l) =&gt; {
+  for (const e of l.getEntries()) if (e.detail.kind === constants.NODE_PERFORMANCE_GC_MINOR) scavenges++;
+}).observe({ entryTypes: ["gc"] });
+const t0 = performance.now();
+for (let call = 0; call &lt; 400; call++) allocateGarbage();
+const ms = performance.now() - t0;
+setTimeout(() =&gt; console.log(`${kb} KB x 400 calls: ${scavenges} scavenges, ${(ms / 400).toFixed(3)} ms per call`), 50);</pre>
+  On Node 26.13 (V8 14.6): <code>node garbage.mjs 512</code> → 12 to 15 scavenges; <code>node --no-turbo-escape garbage.mjs 512</code> → 279. With 4096: 101 against 198, half removed, as in the trace.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">alloc=512 adds no scavenge and no heap growth over alloc=0 (5 scavenges, 8 MB collected in both); alloc=4096 allocates about 1.6 MB per draw, not 4.</li>
+    <li data-kind="measured">alloc=4096: 47 scavenges of at most 0.51 ms, 0.08 ms per draw in total; creating the garbage costs about 0.6 ms per draw. No dropped frame.</li>
+    <li data-kind="read">V8 posts a scavenge task when the young generation is 80% full, at user-visible priority (minor-gc-job.cc:21–31, 141–149; flag-definitions.h:2583); MinorGC and MajorGC spans carry the heap size before and after (heap.cc:1406–1408, 1530).</li>
+    <li data-kind="inferred">The missing allocation is the optimizer's escape analysis: under Node the same loop makes 279 scavenges with --no-turbo-escape and about 13 without.</li>
+    <li data-kind="rejected">"alloc=512 allocates 512 KB per draw": the heap counters show nothing of it.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Every one of these runs, even <code>alloc=0</code>, has five major collections, on a heap that never exceeds 5 MB. What fills up?</p>
+</section>
+
+<section class="step" data-part="F · Memory: allocation and collection" data-title="Major collections on a 3 MB heap: the DOM is garbage too" data-node="dom gc frame">
+  <p class="holding"><span class="label">Question I hold</span><span>A <code>MajorGC</code> every half second, with 3 MB of JavaScript objects alive. What limit is being reached, which panels reach it, and does the pause ever cost a frame?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>A major collection starts with a marking phase that runs in small steps. Its start event, <code>V8.GCIncrementalMarkingStart</code>, records why it started (<code>q.mjs j-gc-0 slices V8.GCIncrementalMarkingStart</code>). Then I compare panels that write different amounts of DOM.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-gc-0">Search <code>V8.GCIncrementalMarkingStart</code> and open its arguments.</div>
+<pre>j-gc-0, 751.46 ms: V8.GCIncrementalMarkingStart
+  gc_reason               "global allocation limit"
+<span class="cp">1</span> global_consumed_bytes   <mark>100,666,066</mark>     global_allocation_limit   67,108,864
+<span class="cp">2</span> old_gen_consumed_bytes    <mark>3,164,184</mark>     old_gen_allocation_limit  33,554,432
+then 12 marking steps (V8.GCIncrementalMarking) of 0.01 to 0.13 ms over 6 ms, and at
+<span class="cp">3</span> 757.70 ms: MajorGC 1.08 ms, type "finalize incremental marking via task", heap 4.86 → 2.92 MB</pre>
+  <ol class="pins">
+    <li><i>1</i>The limit that was reached is the <b>global</b> one: 100 MB counted against a limit of 67 MB.</li>
+    <li><i>2</i>The JavaScript old generation holds 3 MB of its 33 MB limit. It is not the reason.</li>
+    <li><i>3</i>The pause the trace calls <code>MajorGC</code> is only the final step.</li>
+  </ol>
+  <div class="lanes" data-lanes='{"traces":["j-gc-0"],"titles":["One major collection between two frames (j-gc-0)"],"from":742,"to":772,"rows":["frames","mainFrames","main","gc"],"pins":[[4,757.7,"gc"],[5,750.23,"mainFrames"],[6,767.06,"mainFrames"]]}'></div>
+  <ol class="pins" start="4">
+    <li><i>4</i>The <code>MajorGC</code> pause, in a task of its own.</li>
+    <li><i>5</i>The main frame before it had finished at 757.6 ms.</li>
+    <li><i>6</i>The next main frame starts on time.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <table class="mtable" data-rows="j-speed-2400-keyed,j-cells-L-react,j-speed-2400-positional,j-speed-2400-regular,j-speed-38400-keyed" data-names="keyed pool 2400 px/s,React rows 2400,positional pool 2400,regular-table 2400,keyed pool 38400" data-head="Large viewport" data-hi="j-speed-2400-positional:heap.nodesMax,j-speed-2400-regular:heap.nodesMax,j-speed-38400-keyed:heap.nodesMax" data-cols="state.cellsInDom|cells in DOM,heap.nodesMax|DOM nodes max,heap.maxMb|JS heap max|MB,gc.minor|scavenges,gc.major|major GCs,gc.majorMs|major GC time|ms,frames.dropped|dropped frames"></table>
+    <p>The panels with major collections are the ones that churn DOM, whatever their JavaScript heap does. The positional pool makes almost no JavaScript garbage (one scavenge in the scroll) and has four major collections; the keyed pool at the same speed has none. React, which makes the most JavaScript garbage, has one. The <b>DOM nodes</b> column says what accumulates: with about 600 cells on screen, the document's node counter reaches 30,000 in the positional pool. Every <code>textContent</code> write makes a new text node, and the old one stays counted until a collection frees it. At 38,400 px/s the keyed pool churns whole rows and joins them.</p>
+    <p>None of these pauses cost a frame. The longest in the module's traces is 3.3 ms (<code>j-gc-0</code>, 1710 ms); like the others it ran as its own task between two main frames, and the frame after it was presented with its update.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/heap/heap.cc#L5357-L5364">v8 src/heap/heap.cc:5357–5364</a>
+      <p>What "global" counts.</p>
+<pre><span class="n">5357</span>size_t Heap::EmbedderSizeOfObjects() const {
+<span class="n">5358</span>  return cpp_heap_ ? <mark>CppHeap::From(cpp_heap_)-&gt;used_size()</mark> : 0;
+<span class="n">5361</span>uint64_t Heap::GlobalSizeOfObjects() const {
+<span class="n">5362</span>  return OldGenerationSizeOfObjects() + <mark>EmbedderSizeOfObjects()</mark> +
+<span class="n">5363</span>         external_memory();</pre>
+      <p>The embedder's heap is Blink's garbage-collected C++ heap, where DOM nodes live. V8 and Blink are collected together, so Blink-side garbage can start a V8 major collection (<code>heap.cc:5743</code>, "global allocation limit reached").</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>MajorGC in a trace</dt><dd>The final pause of a mark-and-compact collection. Marking before it is incremental (<code>V8.GCIncrementalMarking</code> steps on the main thread) and concurrent (pool threads), so the pause is short when the live heap is small.</dd>
+      <dt>Pause follows live size</dt><dd>What must be marked and moved is what is alive. Here that is 3 MB of JavaScript and a small document. A page holding a 500 MB row cache on the main thread has a different pause.</dd>
+      <dt>DOM writes allocate</dt><dd>A text node, its string and its layout object per cell written, on Blink's side. They do not show in <code>jsHeapSizeUsed</code>; they show in the node counter and in the collector's "global" numbers.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these traces major collections are started by the combined V8-and-Blink limit, track DOM churn rather than JavaScript garbage, pause for 1 to 3 ms, and cost no frame.</p>
+    <p><b>No:</b> that GC cannot cost a frame in a table. The live heap here is tiny by design; nothing in this module holds data on the main thread. And the split of the 100 MB between Blink's heap and external memory was not read.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I looked for the cause of the major collections in the JavaScript heap graph, which is flat at 3 to 5 MB, and found nothing. The start event's arguments named a limit I had not known to look at. Rule: read a collection's reason and limits from its start event before theorizing; and count DOM writes as allocation, even when the JavaScript that makes them allocates nothing.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: keep the row store off the renderer's main thread (engine process or worker), so the main thread's live heap stays the size of the visible window and collector pauses stay in the low milliseconds; and treat cells rewritten per frame as the DOM-side allocation rate when comparing painters.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-speed-2400-positional slices 'MinorGC|MajorGC'</code>: expect one <code>MinorGC</code> and four <code>MajorGC</code> lines, each <code>MajorGC</code> with <code>"type":"finalize incremental marking via task"</code>. The same command on <code>j-speed-2400-keyed</code> prints two <code>MinorGC</code> lines and no <code>MajorGC</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Major collections start for "global allocation limit": 100 MB global against 3 MB of JavaScript old generation (j-gc-0, 751 ms).</li>
+    <li data-kind="measured">They follow DOM churn: positional pool 4 (with one scavenge), keyed pool 0 at the same speed; the DOM node counter reaches 30,000 with 600 cells on screen.</li>
+    <li data-kind="read">The global size is V8's old generation plus the embedder's C++ heap plus external memory (heap.cc:5357–5364).</li>
+    <li data-kind="measured">No GC pause cost a frame in any trace of this module; the longest was 3.3 ms, between two main frames.</li>
+  </ul>
+  <p class="next" data-answer="gc"><b>Next question →</b> In step 12 a loop became twice as fast in the middle of a scroll. Code changes speed while it runs. How big is that effect right after the page loads?</p>
+</section>
+
+<!-- ═════════════════════════ PART G ═════════════════════════ -->
+
+<section class="step" data-part="G · Cold and warm" data-title="The first frames after load" data-node="event js jit"
+  data-ask="warm|Is the first scroll after load slower than later ones, by how much, and for how long?">
+  <p class="holding"><span class="label">Question I hold</span><span>The page has just loaded; its scroll path has never run. How much longer is JavaScript in the first frames of the first scroll than in the same frames of a second, identical scroll?</span></p>
+
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>React panel, first scroll event 150 ms after load, against the first scroll event of a second scroll 1.8 s later. Its JavaScript time (without the forced layout) is:</p>
+    <div class="opts"><button data-k="a">Within 20%</button><button data-k="b">About one and a half times</button><button data-k="c">Several times longer</button></div>
+    <div class="reveal"><p>About five times: 3.15 ms against 0.63 ms. It is back within reach of steady state after four or five frames.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>j-warmup-react</code> and <code>j-warmup-regular</code> start their input 150 ms after the page is ready instead of the usual 600 ms, scroll for 1.2 s, wait half a second and scroll again. The two charts are the same trace at the start of each scroll, on the same scale.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-warmup-react">Recorded with the extra category <code>disabled-by-default-v8.compile</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["j-warmup-react"],"titles":["First scroll after load, first six frames (j-warmup-react)"],"from":14,"to":112,"rows":["mainFrames","main","app"],"pins":[[1,17.3,"main.js"],[2,34.45,"main.js"],[3,50.86,"main.js"],[4,67.59,"main.js"]]}'></div>
+  <div class="lanes" data-lanes='{"traces":["j-warmup-react"],"titles":["Second scroll, first six frames (j-warmup-react)"],"from":1837,"to":1935,"rows":["mainFrames","main","app"],"pins":[[5,1840.28,"main.js"],[6,1867.4,"main.js"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>First scroll event ever: 3.44 ms, of which 0.29 ms is the forced layout. Two renders happen in it (the first also flips <code>isScrolling</code>).</li>
+    <li><i>2</i>Second frame: 3.00 ms.</li>
+    <li><i>3</i>Third: 1.91 ms.</li>
+    <li><i>4</i>Fourth: 1.45 ms. From here the bars look like the rest of the scroll.</li>
+    <li><i>5</i>First scroll event of the second scroll: 1.28 ms, of which 0.66 ms is forced layout.</li>
+    <li><i>6</i>Its third frame: 1.32 ms.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+<pre>JavaScript per frame, forced layout excluded      React (j-warmup-react)       regular-table (-regular)
+first scroll: frames 1, 2, 3, 4                    3.15, 2.57, 1.46, 1.15 ms    2.94, 1.39, 1.42, 1.43 ms
+first scroll: median of 0–300 ms / 900–1200 ms     1.0 / 0.8 ms                 1.4 / 1.2 ms
+second scroll: frame 1 / median                    0.63 / 0.75 ms               1.34 / 1.2 ms</pre>
+    <p><b>React</b> has a real cold start: the first two frames run two to five times longer than warm ones, and a slower drift continues for most of a second (1.0 → 0.8 ms). The second scroll starts warm.</p>
+    <p><b>regular-table</b>'s first frame is slower too, and for a different reason. Its first scroll event of a gesture draws inside the event instead of in the animation frame, with a 4.7 ms layout forced in it (<a href="anatomy.html">Module 3</a> has the two draw paths). From the second frame on its JavaScript is within a fifth of warm. Its per-frame code is one loop over cells calling the DOM, and most of that time is Blink's, which was compiled long ago.</p>
+    <p>Even cold, no frame is at risk here: the longest task of the React run is <b data-m="j-warmup-react/main.maxTaskMs" data-unit="ms"></b>.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Tiers</dt><dd>V8 starts a function in an interpreter (Ignition), which also records what types it sees. Functions that keep running are recompiled, each tier faster to run and slower to produce: baseline code (Sparkplug), then Maglev, then TurboFan. Step 15 finds each in the trace.</dd>
+      <dt>What "cold" covers</dt><dd>Lazy parsing and bytecode compilation of functions never called before, interpretation, empty inline caches, and first-use work inside the library (React builds its fibers and hook state once). A trace separates these only partly.</dd>
+      <dt>Same input, different time</dt><dd>The second scroll is the control: same code, same data, same speed. What differs is the state of the engine.</dd>
+    </dl></div>
+    <div class="box"><span class="label">How the scenario differs from the others</span>
+      <p><code>lab/harness/scenarios.mjs:50–51</code>: <code>warmMs: 150</code> and two gestures. Every other scenario waits 600 ms after the page is ready, and the mount has already drawn the table once, so their first frames are warmer than these but not fully warm.</p>
+    </div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the first interaction after load runs slower JavaScript, several-fold for a code-heavy path like a React render, for a handful of frames; a path that mostly calls the DOM barely shows it.</p>
+    <p><b>No:</b> how much of the first frames is compilation, how much interpretation and how much React's first-time work: the per-frame numbers do not split it. Nor that the first frame is safe on a slow device, where 3 ms becomes 12 or more and comes on top of everything else a page does at load.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: measure the first interaction after load as its own case, with its own budget, next to steady-state scrolling. If it matters, the cheap remedy is to run the scroll path once at mount (a draw at a second position) before the user can.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-warmup-react marks draw 0 110</code> lists the first seven <code>draw</code> spans: 1.53, 0.49, 1.70, 0.91, 0.52, 0.52, 0.59 ms. The same with <code>1835 1930</code> gives 0.35 to 0.46 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">React, 150 ms after load: JavaScript in the first four scroll frames 3.15, 2.57, 1.46, 1.15 ms; first frame of the second scroll 0.63 ms.</li>
+    <li data-kind="measured">regular-table: only the first frame is slower (2.9 against 1.4 ms of JavaScript), because its first scroll event draws inline with a forced layout; later frames are within a fifth of warm.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> What is the engine doing during that second, where does it do it, and can the trace show the moment code gets faster?</p>
+</section>
+
+<section class="step" data-part="G · Cold and warm" data-title="Who compiles, on which thread, and when the new code arrives" data-node="js jit">
+  <p class="holding"><span class="label">Question I hold</span><span>Which trace events mark a function moving to a faster tier, how many are there in a first scroll, and does compiling take main-thread time from frames?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I list every event of the <code>v8.compile</code> category in the two warm-up traces by name and thread, and then follow one optimization from request to installation.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-warmup-regular">Search <code>V8.OptimizeBackground</code> (on <code>ThreadPoolForegroundWorker</code>) and <code>V8.InstallOptimizedFunctions</code> (on <code>CrRendererMain</code>).</div>
+<pre>whole trace                                       thread     j-warmup-regular     j-warmup-react
+V8.FinalizeBaselineConcurrentCompilation           main         8 × (0.3 ms)       26 × (0.9 ms)
+V8.MaglevBackground                                pool        28 × (11.6 ms)     122 × (25.7 ms)
+V8.FinalizeMaglevConcurrentCompilation             main        28 × (1.2 ms)      105 × (2.8 ms)
+V8.OptimizeBackground (TurboFan)                   pool        13 × (27.2 ms)      33 × (53.9 ms)
+V8.InstallOptimizedFunctions                       main        13 × (1.2 ms)       27 × (2.8 ms)
+V8.DeoptimizeCode                                  main         1 × (0.02 ms)       8 × (0.05 ms)
+tier events on main per 300 ms, first scroll                   18, 11, 5, 4        85, 27, 15, 8
+
+One TurboFan compilation in j-warmup-regular:
+<span class="cp">1</span>  285.35 ms  main   V8.OptimizeCode                0.07 ms     <span class="c">a hot function is handed to the compiler</span>
+<span class="cp">2</span>  285.43     pool   V8.OptimizeBackground          0.30 ms     <span class="c">compiled on another thread</span>
+<span class="cp">3</span>  300.47     main   V8.InstallOptimizedFunctions   0.08 ms     <span class="c">in _on_mousewheel → V8.StackGuard → V8.HandleInterrupts</span></pre>
+  <ol class="pins">
+    <li><i>1</i>The request is made on the main thread, in the frame that began at 284 ms, and costs 0.07 ms.</li>
+    <li><i>2</i>The compilation runs on a pool thread while the main thread finishes its frame.</li>
+    <li><i>3</i>The code is installed 15 ms later, at the first JavaScript of the <em>next</em> frame, through an interrupt check.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Compilation is real work: 39 ms of pool-thread time for regular-table's path and 80 ms for React's. Almost none of it is on the main thread: all finalizations together are 2.7 ms (regular-table) and 6.5 ms (React) over three seconds, in pieces of about 0.05 ms. React's path triggers three to four times as many compilations as regular-table's, and most of the activity is in the first 300 ms, where step 14's frames were slow.</p>
+    <p>Optimized code arrives a frame late and without ceremony. A frame does not get faster while it runs; the next frame starts with the new code. In a trace without the compile category the installation is still visible as a short <code>V8.StackGuard</code> → <code>V8.HandleInterrupts</code> span at the start of a function call, for example in the <code>_on_mousewheel</code> call at 500.47 ms of <code>j-cells-L-regular</code>.</p>
+    <p><b>Deoptimization</b> appears where the theory says: React has 8 <code>V8.DeoptimizeCode</code> events, all in its first two scroll frames (18 to 36 ms), when code optimized during mount meets the scroll's different inputs. Together they take 0.05 ms. regular-table has one, at 2434 ms, with <code>_clean_rows</code> on the stack. Deoptimization is not what makes the first frames slow; running in lower tiers is.</p>
+    <p>The events carry no function name. The step in step 12 (the garbage loop becoming twice as fast at 830 ms) is consistent with an optimized version being installed then, and that trace was recorded without the compile category, so it stays an inference.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/execution/stack-guard.cc#L359-L378">v8 src/execution/stack-guard.cc:359–363, 375–378</a>
+      <p>Why new code appears inside an interrupt check, on the main thread, at a moment JavaScript is running anyway.</p>
+<pre><span class="n">359</span>  if (TestAndClear(&amp;interrupt_flags, <mark>INSTALL_CODE</mark>)) {
+<span class="n">361</span>                "V8.InstallOptimizedFunctions");
+<span class="n">363</span>    isolate_-&gt;optimizing_compile_dispatcher()-&gt;InstallOptimizedFunctions();
+<span class="n">375</span>  if (TestAndClear(&amp;interrupt_flags, INSTALL_MAGLEV_CODE)) {
+<span class="n">377</span>                "V8.FinalizeMaglevConcurrentCompilation");</pre>
+      <a class="path" href="https://github.com/v8/v8/blob/671f7c27ac0403ceb8074a8dfbcc02cdd7369c3f/src/compiler-dispatcher/optimizing-compile-dispatcher.cc#L150">v8 src/compiler-dispatcher/optimizing-compile-dispatcher.cc:150 · maglev/maglev-concurrent-dispatcher.cc:300–301 · deoptimizer/deoptimizer.cc:502</a>
+<pre><span class="n">150</span>  TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"), "V8.OptimizeBackground",
+<span class="n">300</span>        TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+<span class="n">301</span>                    "V8.MaglevBackground",
+<span class="n">502</span>  TRACE_EVENT("v8", "V8.DeoptimizeCode");</pre>
+      <p>The thresholds are flags: <code>invocation_count_for_maglev</code> 400 and <code>invocation_count_for_turbofan</code> 3000 on desktop (<code>flag-definitions.h:1048, 1065</code>). A function called once per frame needs seconds to reach them; one called once per cell reaches them within the first frames.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Concurrent compilation</dt><dd>The optimizing compilers work on a copy of what they need, off the main thread. The main thread pays for the request and the installation only.</dd>
+      <dt>Deoptimization</dt><dd>Optimized code assumes what the interpreter observed (this property is always a small integer, this call always goes to that function). When an assumption fails, execution falls back to a lower tier and the function may be optimized again later.</dd>
+      <dt><code>V8.DeoptimizeCode</code> is in category <code>v8</code></dt><dd>It is in every trace of this course, not only the two with the compile category. Its absence in a scroll is information.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> tier-up costs the main thread milliseconds in total and compiles on pool threads; its benefit lands at frame boundaries; deoptimizations here are few, early and cheap.</p>
+    <p><b>No:</b> which functions were compiled when (no names in these events), or that pool-thread compilation is free on a device with few cores, where those threads compete with raster and the compositor.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-warmup-regular tree 300.3 300.7 main 5</code>: expect <code>FunctionCall … "functionName":"_on_mousewheel"</code> containing <code>V8.StackGuard</code> → <code>V8.HandleInterrupts</code> → <code>V8.InstallOptimizedFunctions</code> (0.08 ms) → <code>V8.OptimizeConcurrentFinalize</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">First scroll after load: 28 Maglev and 13 TurboFan compilations for regular-table's path, 122 and 33 for React's; 39 and 80 ms on pool threads, 2.7 and 6.5 ms of finalization on the main thread.</li>
+    <li data-kind="read">Optimized code is installed on the main thread from an interrupt check (stack-guard.cc:359–363, 375–378); the compilation itself is traced on the pool thread (optimizing-compile-dispatcher.cc:150).</li>
+    <li data-kind="measured">Deoptimizations: 8 in React's first two scroll frames (0.05 ms together), 1 in regular-table's whole trace.</li>
+    <li data-kind="inferred">The mid-scroll speed-up of the garbage loop in step 12 is a tier change; that trace has no compile events to confirm it.</li>
+  </ul>
+  <p class="next" data-answer="warm"><b>Next question →</b> Can you now answer the module's questions without scrolling back?</p>
+</section>
+
+<!-- ═════════════════════════ PART H ═════════════════════════ -->
+
+<section class="step" data-part="H · Self-check" data-title="Seven questions to answer from memory" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>Given a table design, or a profile of one, can I say what its JavaScript scales with, what the evidence can carry, and what to change first?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Answer each question before opening it. The numbers that matter are orders of magnitude; the reasoning is what should come back.</p>
+  </div></div>
+  <table class="mtable" data-rows="j-nomarks-keyed,j-nomarks-regular,j-nomarks-react" data-names="keyed pool,regular-table,React rows" data-head="Large viewport, 2400 px/s, no marks" data-cols="main.scrollEvents|scroll events,state.formatted|formatCell calls,main.scriptMs|script|ms,main.styleMs|style|ms,main.layoutMs|layout|ms,frames.mainFrameMs.p50|main frame p50|ms"></table>
+  <div class="beat"><span class="label">Questions</span><div>
+    <details><summary>1. A table keeps one element per visible row and creates and removes rows as they scroll in and out. What does its per-frame JavaScript scale with? What about one that rewrites the text of fixed cells? One that renders React rows without memo?</summary>
+      <p>Keyed: entering rows per frame (speed ÷ frame rate ÷ row height) × visible columns; independent of viewport height. Positional, such as regular-table: visible cells, independent of speed once a row changes per frame. React without memo: every visible row is rendered again (visible cells in the render phase), while the DOM writes are the keyed pool's. Steps 1, 4, 6.</p></details>
+    <details><summary>2. A profile's top JavaScript self time is a one-line function that reads <code>el.scrollLeft</code>. What do you do next, and what do you not conclude?</summary>
+      <p>Print the spans under a call of it (<code>tree</code>, or the DevTools flame chart): a <code>Layout</code> forced by the read is there. Self time includes native work with no name in the profile. Do not conclude the function is slow code, nor that removing the read saves its whole self time. Step 2.</p></details>
+    <details><summary>3. <code>measure</code> has 153 samples for 126 calls, <code>formatCell</code> 15 samples for 71,869 calls. Explain both, and say which numbers you would trust for each.</summary>
+      <p><code>performance.measure</code> asks the profiler for a sample on every call, and requested samples are written out of time order; summing deltas in file order roughly doubles its apparent cost. Trust a marks-off control run. <code>formatCell</code> is too short to be caught by a 0.15 ms timer; trust the counter for the count and a measured span around the loop for the time. Step 3.</p></details>
+    <details><summary>4. At what scroll speed does a keyed pool stop being cheaper than a positional one, and why is there a crossover at all?</summary>
+      <p>When about three quarters of the viewport is replaced per frame (38,400 px/s here). A created-and-removed cell cost about 40% more JavaScript than a rewritten one, and <code>remove()</code> was the largest part; keyed wins below the crossover only because it touches far fewer cells. Steps 6 and 7.</p></details>
+    <details><summary>5. A slow scroll shows many frames "without main update" while the main thread is 90% idle. What happened, and what is worth checking in the table's draw?</summary>
+      <p>Each such frame follows a main frame that ended with <code>NO_UPDATE</code>: nothing changed between row crossings. Check whether those main frames did work anyway. regular-table ran a full draw of 3.6 ms in 41 of them, when only its last row index changed. Step 8.</p></details>
+    <details><summary>6. You must format 500 numeric cells per frame. What is the cost with a shared <code>Intl.NumberFormat</code>, and with <code>toLocaleString("en-US", options)</code>? Why are the second and <code>new Intl.NumberFormat</code> per cell the same?</summary>
+      <p>About 0.15 ms against about 5.5 ms per frame (0.3 and 11 µs per cell on this machine). V8 caches the formatter behind <code>toLocaleString</code> only when no options are passed; with options it constructs one per call. Step 9.</p></details>
+    <details><summary>7. Someone proposes <code>React.memo</code> on rows, and someone else a larger overscan, to make scrolling cheaper. What do the counters say, what do the clocks say, and what do you tell them about GC and the first scroll?</summary>
+      <p>memo: row renders fall about 19-fold (certain), time under <code>flushSync</code> by a fifth to a third, script total within noise; most of the layer's 0.5 to 0.8 ms per frame is fixed per render. Overscan does not reduce renders (notification is on the visible range) and makes each larger. GC: scavenges of 0.2 to 0.8 ms and major pauses of 1 to 3 ms cost no frame here because the live heap is tiny; creating garbage costs more than collecting it, and DOM writes are garbage too. First scroll: several times slower for a few frames in React; compilation runs on pool threads and new code arrives at frame boundaries. Steps 11 to 15.</p></details>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes, from this module:</b> each design's cost model in cells per frame; how to read a sampled profile against counters and spans; what GC and tier-up look like in a trace and what they cost at this scale.</p>
+    <p><b>No:</b> a ranking of libraries, or numbers for another machine. One run per scenario, headless, tracing on, a table of plain text cells. The method transfers; the microseconds do not.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Carried to Tablelab as proposals: (1) choose the painter's unit deliberately (cells that changed, not cells that are visible) and let the view core supply the difference; (2) keep counters in the painter and report them with every timing; (3) format on the engine side or with per-column shared formatters; (4) keep data off the renderer's main thread so collector pauses stay small; (5) give the first interaction after load its own measurement.</p></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">A design's per-frame JavaScript = fixed part + unit cost × units; the designs here differ mainly in the unit (entering rows, visible cells, rendered rows), less in the unit cost (about 1 to 2 µs per cell).</li>
+  </ul>
+  <p class="next"><b>Next →</b> The larger share of regular-table's frame was purple, not yellow: <a href="rendering.html">Module 5</a> takes style, layout and paint apart. What the same panels do when values change instead of positions is <a href="streaming.html">Module 7</a>.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>

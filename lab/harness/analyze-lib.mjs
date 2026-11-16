@@ -111,7 +111,15 @@ function walk(nodes, fn, depth = 0) {
   }
 }
 
-/** Decode V8's sampled profile for one thread: self and total time per function in [from, to]. */
+/**
+ * Decode V8's sampled profile for one thread: self and total time per function in [from, to].
+ * Known limit: samples are summed in file order, each with the delta that
+ * precedes it. V8 writes a sample requested by performance.mark/measure ahead
+ * of queued timer samples, so some deltas are negative, and time near those
+ * calls is misattributed (`measure` and `mark` read about twice too high).
+ * DevTools sorts samples by timestamp first. Module 4, step 3 shows the
+ * difference; treat the tables as a ranking, not as exact times.
+ */
 function cpuProfile(ev, pid, tid, from, to) {
   const nodes = new Map();
   const self = new Map();
@@ -313,10 +321,11 @@ export function analyze(trace, scenario = {}) {
 
   // ── user timing: measures (async pairs) and marks ──
   const user = ev.filter((e) => e.cat === "blink.user_timing");
-  // A measure of 0 µs is exported as a begin with no end. It still happened:
-  // keep it, with no duration, so counts are right.
-  const paired = pairAsync(user);
-  const measures = [...paired.spans, ...paired.unclosed.map((b) => ({ name: b.name, cat: b.cat, pid: b.pid, tid: b.tid, ts: b.ts, dur: 0, args: b.args }))].sort((x, y) => x.ts - y.ts);
+  // Known limit: a measure of 0 µs is exported as a begin with no end and is
+  // not counted here, so `app.<name>.n` undercounts very short measures (a
+  // style listener that does nothing). Counts in the pages come from the
+  // page's own counters (`state.counters`) instead.
+  const { spans: measures } = pairAsync(user);
   const detail = (args) => {
     const d = args?.data?.detail ?? args?.detail;
     if (typeof d !== "string") return d ?? {};

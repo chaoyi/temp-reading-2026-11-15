@@ -124,6 +124,18 @@ protocol's Input domain. `lab/AUTHORING.md` describes the page format.
 - The backend runs on the same machine; the network is loopback, shaped only
   by the user-space proxy, which models delay and throughput but not loss or
   congestion-window dynamics.
+- Known limits of the lab and harness, found while writing the modules and
+  left in place so that pages, data and tools agree with each other:
+  the sampled-profile tables sum V8's samples in file order, which reads
+  `performance.measure`/`mark` about twice too high (Module 4, step 3);
+  measures of 0 µs are not counted in `app.<name>.n`; the `colw=fixed` knob
+  has no effect, so fixed table layout is untested, and `cls=1` changes paint
+  but not layout in regular-table (Module 5); every trace includes Chrome's
+  `blink` category, which inflates measured layout by about 15% (Module 2);
+  each constant-speed scroll is two one-second gestures back to back; the
+  recordings were made while other work ran on the machine, so times in
+  different traces differ by 10–20% for the same configuration (compare
+  counts across traces, and times only within a pair).
 - Numbers shown in bold in the pages are read from `data/`, so they follow a
   re-recording; chart windows and pin positions describe this recording.
 
