@@ -1,0 +1,996 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnose these traces · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+<style>
+  table.guide { border-collapse: collapse; width: 100%; font-size: 0.86rem; margin: 8px 0 16px; }
+  table.guide th, table.guide td { border-bottom: 1px solid var(--rule, #d9dee4); padding: 6px 8px; text-align: left; vertical-align: top; }
+  table.guide th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  table.guide td:first-child { width: 27%; }
+  ol.tree, ol.tree ol, ol.tree ul { margin: 4px 0 8px; }
+  ol.tree > li { margin-bottom: 8px; }
+  .complaint { border-left: 4px solid #d42a5b; padding: 8px 14px; margin: 10px 0 14px; font-size: 1.05rem; background: #fbf5f6; }
+  .complaint .label { display: block; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; margin-bottom: 2px; }
+  details.hint, details.dx { border: 1px solid var(--rule, #d9dee4); border-radius: 4px; padding: 8px 12px; margin: 8px 0; }
+  details.dx { border-width: 2px; }
+  details.dx > summary { font-weight: 700; }
+  details.dx .boxes { display: block; }
+  details.dx .boxes .box { margin-bottom: 12px; }
+  .box pre { overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">11 · Diagnose these traces</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="input">input</span><span class="sep">→</span><span data-node="compositor">compositor</span><span class="sep">→</span>
+    <span data-node="frame">main frame</span><span class="sep">→</span><span data-node="js">JavaScript</span><span class="sep">→</span>
+    <span data-node="layout">style + layout</span><span class="sep">→</span><span data-node="paint">paint</span><span class="sep">→</span>
+    <span data-node="raster">raster</span><span class="sep">→</span><span data-node="present">screen</span>
+    <span class="sep">·</span><span data-node="network">network</span><span class="sep">·</span><span data-node="backend">backend</span>
+    <span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 11 · recorded 2026-11-16</p>
+  <h1>Eight traces arrive with a complaint and no label. What is wrong in each?</h1>
+  <p class="lede">Every earlier module handed you a trace together with its configuration. This one hands you eight traces whose page address is <code>grid.html?case=N</code> and whose only metadata is what a user complained about. You diagnose each one alone, with a routine distilled from Modules 1 to 10, and compare your answer with mine.</p>
+  <p>After the cases come three things to keep: a field guide from trace pattern to cause, the reasoning behind the design of the course's two hundred scenarios (including where my own cases first failed to show their problem), and a separation of what you learned about Chrome from what holds for any renderer.</p>
+  <p><b>Why this matters for Tablelab.</b> The engine will be slow in ways nobody labelled. The skill worth having is to get from "it feels sticky" to a number, a mechanism and the smallest change, in a trace you did not design, and to know which of those habits still work when the painter is Blitz or a GPU renderer with no DevTools.</p>
+  <p><b>What you need.</b> Ideally Modules 1 to 10. At least <a href="walkthrough.html">Module 1</a> for the trace vocabulary and <a href="frames.html">Module 2</a> for the four frame states. A terminal in <code>lab/</code> with <code>node harness/q.mjs</code>, or <a href="https://ui.perfetto.dev">ui.perfetto.dev</a>, or DevTools' Performance panel. The traces have no screenshots (headless Chrome wrote none), so there is no filmstrip: everything is read from events.</p>
+  <p><b>How to use the cases.</b> For each: read the complaint, open the trace, write your answer on paper (what the user means as a number, the mechanism, the smallest fix). Only then open the hints, one at a time, and the diagnosis last. Use the step-by-step view; the <b>All</b> view shows later steps that talk about the answers.</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57 (software raster, a synthetic 60 Hz vsync), device scale factor 1.75, one traced run per scenario. Good for explaining mechanisms, not for benchmarking. Three of the eight cases were re-recorded with adjusted settings after their first recording did not show the intended problem; step 15 says which and why.</p>
+  <div class="foot"><button class="primary" data-start>Start: 20 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · A routine for an unknown trace" data-title="First minute: what was recorded, and which number am I looking for?" data-node="method"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>A trace file and one sentence from a user. Before I look at any lane: what is in the file, and what would I have to measure for the sentence to be true?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Two moves, in this order, on any trace. I show them on a trace you already know from <a href="backend.html">Module 6</a>, so that the cases stay untouched.</p>
+    <p><b>Move 1: inventory.</b> Which processes and threads wrote events, how long is the recording, is there a process that is not Chrome?</p>
+  </div></div>
+<pre>$ node harness/q.mjs b-drag-every-tanstack threads
+   18557 …   Renderer / Compositor
+   17791 …   Renderer / CrRendererMain                <span class="c">← the page's main thread</span>
+    5350 …   GPU Process / VizCompositorThread
+    2299 …   Browser / CrBrowserMain                  <span class="c">← input arrives here first</span>
+     761 …   Renderer / ThreadPoolForegroundWorker    <span class="c">← raster runs on these</span>
+    …
+      90 …   <mark>Backend (node) / query service</mark>          <span class="c">← not Chrome: the lab's server, on the same clock</span>
+      60 …   Backend (node) / ws io (recv/send)
+$ node harness/q.mjs b-drag-every-tanstack summary     <span class="c"># first lines: "window": [start ms, end ms]; last line: lab: {…}</span></pre>
+  <div class="tracelink" data-trace="b-drag-every-tanstack">In Perfetto the same inventory is the list of process groups on the left; expand <code>Backend (node)</code>.</div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The order of the list is by event count, which is not the order of importance. What I take from it is a yes or no for four questions: is there a <b>backend process</b> (then requests or pushed updates are in play and both ends are on one clock); is there a <b>worker</b> thread (<code>DedicatedWorker</code>); is there a <b>netem</b> lane in the backend (the lab's bad network was in the path); and how long is the window (<code>summary</code> prints it in milliseconds on the charts' axis).</p>
+    <p><b>Move 2: restate the complaint as a number.</b> Users describe an experience. A trace contains times. The translation decides which lane I open first, so I write it down before looking:</p>
+  </div></div>
+  <table class="guide">
+    <tr><th>The user says</th><th>The number that would make it true</th><th>Where it is</th></tr>
+    <tr><td>"lags behind my input", "sticky"</td><td>input event → first presented frame that shows its effect</td><td><code>EventLatency</code> spans (<code>eventLatency.*</code> in <code>summary</code>); follow one event by hand</td></tr>
+    <tr><td>"janky", "stutters"</td><td>how often the <em>content</em> changes on screen, and how evenly: main-frame duration and the wait before it</td><td><code>frames.mainFrameMs</code>, <code>frames.mainQueueMs</code>, <code>frames.presentGap</code></td></tr>
+    <tr><td>"blank", "fills in late"</td><td>scroll position on screen versus rows that exist for it; request → rows right</td><td>our <code>content complete</code> marks, <code>content.settleMs</code>, <code>ws.roundTrip</code></td></tr>
+    <tr><td>"out of date", "frozen", "jumps"</td><td>age of a value when it reaches the screen; gaps between arrivals</td><td><code>ticks.ageWhenHandled</code>, <code>ticks.ageOnScreen</code>, the <code>tick message</code> marks</td></tr>
+    <tr><td>"uses a lot of CPU", "fan spins"</td><td>milliseconds of main-thread work per second, by category</td><td><code>threads.mainUtilPct</code>, <code>main.scriptMs / styleMs / layoutMs / paintMs</code></td></tr>
+    <tr><td>"this input is slow, that one is not"</td><td>the same number for both inputs, side by side, in one trace</td><td><code>q.mjs ID frames</code> around each input</td></tr>
+  </table>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/harness/record.mjs:159</span>
+      <p>To know what a case's file can tell me about itself. For a hidden scenario the recorder keeps the complaint and drops the knobs:</p>
+<pre><span class="n">159</span>  lab: s.hidden
+       ? <mark>{ scenario: s.id, asks: s.asks, note: "a clinic case: …" }</mark>
+       : { scenario: s.id, asks: s.asks, query: s.query ?? null, … },</pre>
+      <p>The page is opened as <code>grid.html?case=N</code> and reads its settings from <code>sessionStorage</code> (<code>pages/src/config.ts:4–7</code>), so no URL in the trace contains them either.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>A symptom is not yet a question</dt><dd>"Sticky" could be late scroll position, late rows, or uneven frames. Each is a different number in a different lane. Choosing one makes the claim testable; if it turns out not to be large, choose the next.</dd>
+      <dt>The trace gives away more than the metadata</dt><dd>Function names, our own <code>app: …</code> measures and their <code>detail</code>, and the backend's lanes are all in the file. Reading them is not cheating; it is what you would do with a colleague's trace.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> which actors exist and which number to go for first.</p>
+    <p><b>No:</b> anything about the cause. An inventory that shows a backend does not mean the backend is the problem.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Run <code>node harness/q.mjs c-2 threads | grep -c Backend</code> and the same for <code>c-1</code>. Expected: 3 lines for c-2 (two labelled threads and the counter track of one process) and 0 for c-1. You now know something about both cases without having looked at a single frame.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">A clinic trace's metadata holds the complaint and no configuration (record.mjs:159); its page URL is grid.html?case=N (config.ts:4–7).</li>
+    <li data-kind="inferred">First minute of any trace: inventory (backend process? worker? netem? window length), then the complaint rewritten as one number with a lane to read it from.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> With a number chosen: where do I look first, and how do I tell a thread that is too busy from one that is waiting?</p>
+</section>
+
+<section class="step" data-part="A · A routine for an unknown trace" data-title="Frames first, then: is the main thread busy or idle?" data-node="frame method"
+  data-ask="busy|When frames go wrong, how do I tell in one minute whether the main thread has too much work, is held by something else, or is waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>Five known traces, five different illnesses. Which three or four numbers separate them without opening a single slice?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>A main thread is busy for 99 % of a recording. How many tasks of 50 ms or longer ("long tasks") must it contain?</p>
+    <div class="opts"><button data-k="a">Many: that is what busy means</button><button data-k="b">At least one</button><button data-k="c">Possibly none</button></div>
+    <div class="reveal"><p>Possibly none. The last row of the table below is 99 % busy with a longest task of a few milliseconds: thousands of short tasks, each fine on its own. A long-task count finds one kind of busy thread and misses the other.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Move 3 is the frames, over time, one line per vsync: <code>node harness/q.mjs ID frames</code>. Move 4 is the main thread's state while the frames are wrong. For a first reading both fit in one table of six numbers, all from <code>q.mjs ID summary</code>.</p>
+  </div></div>
+  <table class="mtable" data-rows="f-scroll-regular,f-budget-250,f-longtask-tanstack,b-drag-every-tanstack,s-msg-8000-regular" data-names="healthy scroll,slow cells (Module 2),one 250 ms task (Module 2),queue at the backend (Module 6),8000 messages a second (Module 7)" data-head="Known trace" data-cols="frames.mainFrameMs.p50|main frame p50|ms,frames.mainQueueMs.p95|queue wait p95|ms,threads.mainUtilPct|main busy|%,main.longTasks|tasks ≥ 50 ms,main.maxTaskMs|longest task|ms,frames.presentGap.p95|gap between presents p95|ms"></table>
+  <div class="lanes" data-lanes='{"traces":["f-budget-250","s-msg-8000-regular"],"titles":["slow cells: each main frame is long (f-budget-250)","message flood: each task is short, the frame waits (s-msg-8000-regular)"],"from":400,"to":640,"rows":["frames","mainFrames","tasks"],"pins":[[1,427,"mainFrames",0],[2,480,"mainFrames",1],[3,500,"frames",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Slow cells: main frames are long because of their own work; they start as soon as they are asked for.</li>
+    <li><i>2</i>Flood: a main frame's bar is 100 ms long, and hovering it shows that almost all of it is "waited for the main thread".</li>
+    <li><i>3</i>Flood: the vsyncs in between have nothing new at all.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Three patterns, read from the two frame columns before anything else:</p>
+    <p><b>Long frame, no wait</b> (slow cells): the frame's own work is too big. Go inside one frame. <b>Short frame, long wait</b> (the 250 ms task, the flood): the frame is fine and something else has the thread. Go to the task list. <b>Short frame, no wait, thread nearly idle</b> (the backend queue): the page is waiting for something that is not on the main thread. Leave the main thread.</p>
+    <p>I do not start from the colours of the frame boxes. Module 2 established what they mean: "presented without the main update" says only that the BeginMainFrame was sent after the compositor's draw for that vsync, which also happens with 1 ms main frames; rows are one vsync behind the scroll position in any compositor-driven scroll; and DevTools marks dropped or partial frames only for tracked smooth effects. Colours tell me <em>where in time</em> to look; duration and queue wait tell me whether anything is late.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/harness/analyze-lib.mjs:184–189, 372–373</span>
+      <p>To know what the two columns are made of before trusting them:</p>
+<pre><span class="n">184</span>  const main = stage("SendBeginMainFrameToCommit");
+<span class="n">189</span>  mainQueueUs: … breakdown.<mark>begin_main_sent_to_started_us</mark> …,
+<span class="n">372</span>  mainQueueMs: quantiles(… f.mainQueueUs / 1000),
+<span class="n">373</span>  mainFrameMs: quantiles(… (f.main[1] - f.main[0]) / 1000),</pre>
+      <p>"Main frame" is the compositor's own stage from sending BeginMainFrame to commit, so it <em>includes</em> the queue wait. A 100 ms main frame with a 99.9 ms wait is a short frame that started late.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Busy, held, idle</dt><dd><b>Busy</b>: the unit of work itself is too large. <b>Held</b>: the unit is small but queued behind other tasks. <b>Idle</b>: nothing to do, because what it needs has not arrived.</dd>
+      <dt>Utilisation alone does not say which</dt><dd>The slow-cell trace is busy less than half of the time and still late: once a frame misses its vsync the thread sits idle until the next one (Module 2).</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> which of three branches to take, from <code>frames.mainFrameMs</code>, <code>frames.mainQueueMs</code>, <code>threads.mainUtilPct</code> and the longest task.</p>
+    <p><b>No:</b> that frames are healthy because these numbers are. A page can present every frame on time and show blank or stale content (the backend row). That needs the complaint's own number from step 1.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I used to open the Frames track, count red and amber boxes and call that the diagnosis. Two of the eight cases in this module have clean frame numbers and a real problem, and one has many amber frames that are not the problem. The rule I keep: frames tell me when; the complaint's number tells me whether; the main thread's state tells me where to go next.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node harness/q.mjs s-msg-8000-regular tasks 500 720 0.5</code> prints the main-thread tasks of at least 0.5 ms with their queue and priority. Expected: a handful of lines, among them <code>COMPOSITOR_TQ … VERY_HIGH_PRIORITY</code> about every 100 ms. Lower the threshold to 0.1 and the screen fills with <code>FRAME_LOADING_TQ</code> tasks: that is the flood.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Three first-look patterns: long main frame with no queue wait (work too big), short frame with long wait (thread held), short frame with idle thread (waiting elsewhere).</li>
+    <li data-kind="measured">A main thread can be 99 % busy with no task of 50 ms: s-msg-8000-regular.</li>
+    <li data-kind="read">frames.mainFrameMs includes the queue wait (analyze-lib.mjs:184–189, 373); read it together with frames.mainQueueMs.</li>
+  </ul>
+  <p class="next" data-answer="busy"><b>Next question →</b> Each branch needs its own next moves. What is the whole routine, on one page?</p>
+</section>
+
+<section class="step" data-part="A · A routine for an unknown trace" data-title="The routine, as a decision tree" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>What do I do, in order, in the first ten minutes with a trace I did not record?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I compress the method spine of the earlier lessons (ask, orient, find the unit, budget it, check the population, name the gap, working or waiting, change one input, cross-check, conclude with limits) into six moves with the terminal command for each. In Perfetto or DevTools the same move is in brackets.</p>
+  </div></div>
+  <ol class="tree">
+    <li><b>Inventory.</b> <code>q.mjs ID threads</code> [the process list]. Backend process? Worker? Netem lane? Window length?</li>
+    <li><b>The complaint as a number</b> (the table in step 1). Write it down with its lane.</li>
+    <li><b>Frames over time.</b> <code>q.mjs ID frames</code> [Perfetto: the <code>PipelineReporter</code> track of the Renderer; DevTools shows only part of it]. Find <em>when</em> things differ from a steady state. Read <code>frames.mainFrameMs</code> and <code>frames.mainQueueMs</code>; do not judge by colour.</li>
+    <li><b>The main thread at that time.</b> <code>threads.mainUtilPct</code>, <code>main.longTasks</code>, <code>q.mjs ID tasks FROM TO 1</code> [the <code>CrRendererMain</code> track].
+      <ul>
+        <li><b>Long frame, no wait → busy.</b> Go to 5a.</li>
+        <li><b>Short frame, long wait → held.</b> Find what holds it: one long task (name it with <code>q.mjs ID tree FROM TO</code>), or a flood of short ones (count tasks per queue: <code>taskQueues</code> in <code>summary</code>). Then 5a for the holder.</li>
+        <li><b>Thread mostly idle → waiting.</b> Go to 5b.</li>
+      </ul>
+    </li>
+    <li><b>Name the unit and its cost.</b>
+      <ol type="a">
+        <li><b>If working:</b> by category (<code>main.scriptMs</code>, <code>styleMs</code>, <code>layoutMs</code>, <code>paintMs</code>, <code>gcMs</code>; counts of layouts and forced layouts), then by function (<code>q.mjs ID prof FROM TO</code> [the flame chart; Bottom-Up]), then by <b>unit</b>: is this cost paid per frame, per scroll event, per message, per request, per cell? Count the units (<code>marks</code>, <code>main.scrollEvents</code>, <code>ticks.messages</code>, <code>ws.requests</code>) and divide. If units arrive faster than they are served, the problem is the rate and not the cost.</li>
+        <li><b>If waiting:</b> for what? A <b>reply</b> (<code>ws.roundTrip</code> split into <code>upMs</code>, <code>serverWait</code>, <code>serverService</code>, <code>downMs</code>; the backend's <code>query #n</code> spans and <code>rows queue</code> counter). <b>Raster</b> (<code>raster.ms</code>; commit → <code>ActivateSyncTree</code> on the compositor thread; the "presented-after" column of <code>frames</code>). <b>The next vsync</b> (a few to 17 ms, normal). <b>A timer</b> or an animation frame. <b>The network</b> (gaps between <code>tick message</code> marks while the backend's <code>produce + send</code> spans continue; netem counters; <code>ticks.ageWhenHandled</code>).</li>
+      </ol>
+    </li>
+    <li><b>Change one input, in thought.</b> Which recording, differing in one knob, would look healthy if I am right? Find it among the course's scenarios (<code>node harness/record.mjs --list</code>) and compare the same number. If my mechanism also predicts the control's number, I keep it; if the control shows the same symptom, I was wrong.</li>
+  </ol>
+  <table class="guide">
+    <tr><th>If I suspect</th><th>The control that should be healthy</th><th>Compare</th></tr>
+    <tr><td>a wheel listener that blocks scrolling</td><td><code>r-wheel-passive</code> against <code>r-wheel-blocking</code></td><td>wheel sent → acknowledged, per event</td></tr>
+    <tr><td>a line at the backend</td><td><code>b-drag-inflight-tanstack</code> against <code>b-drag-every-tanstack</code></td><td><code>ws.serverWait</code>, <code>backend.queueMax</code></td></tr>
+    <tr><td>more messages than the thread can serve</td><td><code>s-raf-8000-regular</code> against <code>s-msg-8000-regular</code></td><td><code>ticks.ageFirstHalf</code> and <code>ageSecondHalf</code></td></tr>
+    <tr><td>a costly formatter</td><td><code>j-fmt-intl</code> against <code>j-fmt-newintl</code></td><td><code>app.data listener</code> per draw</td></tr>
+    <tr><td>layout forced in a loop</td><td><code>j-cells-L-regular</code> against <code>r-autosize-reset</code></td><td><code>main.layouts</code>, <code>main.forcedLayouts</code></td></tr>
+    <tr><td>expensive pixels</td><td><code>r-paint-plain-fast</code> against <code>r-paint-heavy-tanstack</code></td><td><code>raster.ms</code>, presented-after</td></tr>
+    <tr><td>a network stall</td><td><code>n-stall-raf-tanstack</code> against <code>n-stall-msg-regular</code></td><td>work done in the burst</td></tr>
+  </table>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> this order avoids the two expensive mistakes: profiling JavaScript on a thread that is waiting, and staring at the network when the thread is saturated.</p>
+    <p><b>No:</b> that six moves always suffice. They get you to a mechanism you can name and a control to test it against; the proof is the control.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: make moves 1 to 4 a single command of Tablelab's own tooling, whatever the painter: thread inventory, frame outcomes over time, per-frame duration and queue wait, utilisation. The cases below show that those four readings route seven of eight complaints to the right lane within a minute.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node harness/record.mjs --list | wc -l</code> prints the number of scenarios available as controls (200 on the day this page was written). <code>node harness/record.mjs --list | grep '^r-wheel'</code> shows how a control and its treatments are named.</div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">The routine: inventory → complaint as a number → frames over time → main thread busy, held or idle → unit and cost (working) or what it waits for (waiting) → a control that differs in one knob.</li>
+    <li data-kind="inferred">If units arrive faster than they are served, the rate is the problem and optimizing the unit's cost only moves the knee.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Does the routine work on traces nobody labelled? Eight complaints follow.</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · Eight cases" data-title="Case 1 · The wheel feels sticky" data-node="input compositor"
+  data-ask="cases|Eight complaints with no labels: does the routine name the mechanism behind each?">
+  <p class="holding"><span class="label">Question I hold</span><span>What does this user mean, measured? Which mechanism produces it, and what is the smallest change that removes it?</span></p>
+  <div class="complaint"><span class="label">Complaint as filed</span>"Wheel scrolling feels sticky: the table lags behind the wheel and then jumps."</div>
+  <div class="tracelink" data-trace="c-1">Pin <code>CrBrowserMain</code>, and the Renderer's <code>Compositor</code> and <code>CrRendererMain</code>.</div>
+  <div class="beat"><span class="label">What I do</span><div><p>Your turn. Run the routine of step 3 on <code>c-1</code>. Write down three things before opening anything below: the number the user is describing, the mechanism, the smallest fix.</p></div></div>
+  <details class="hint"><summary>Hint 1 · where to look</summary><p>"Lags behind the wheel" is about one wheel event, not about frames in general. Follow one. On the browser's main thread: <code>RenderWidgetHostImpl::ForwardWheelEvent</code> (the wheel leaves for the renderer) and <code>InputRouterImpl::MouseWheelEventHandled</code> (the renderer's answer, with an <code>ack</code> argument). On the renderer's compositor thread: <code>InputHandlerProxy::HandleGestureScrollUpdate</code> (the scroll position actually moves). <code>node harness/q.mjs c-1 slices 'ForwardWheelEvent|MouseWheelEventHandled|HandleGestureScrollUpdate$' 250 480</code></p></details>
+  <details class="hint"><summary>Hint 2 · what you should see there</summary><p>A wheel forwarded at 294.6 ms is answered at 399.65 ms, 105 ms later, with <code>ack: NOT_CONSUMED</code>. The compositor scrolls 0.1 ms after that answer. Between the two, the main thread runs one task of 110 ms (<code>q.mjs c-1 tasks 250 480 20</code>). The vsyncs in the gap carry the scroll state <code>main_thread</code> in <code>q.mjs c-1 frames</code>.</p></details>
+  <details class="hint"><summary>Hint 3 · the mechanism's name</summary><p>The compositor thread could scroll by itself, but it is not allowed to until the main thread has run a listener that might cancel the scroll. Which kind of listener has that right?</p></details>
+  <div class="predict" data-right="b"><span class="label">Commit to an answer</span>
+    <p>Which sentence is your diagnosis?</p>
+    <div class="opts"><button data-k="a">A long task delays the rows; the scroll position itself is on time</button><button data-k="b">Each wheel event has to wait for the main thread before the scroll position may move</button><button data-k="c">Raster of the newly exposed rows is slow</button></div>
+    <div class="reveal"><p>The second. Open the diagnosis for the evidence, and for why the first sentence describes the <em>control</em>, not this trace.</p></div>
+  </div>
+  <details class="dx"><summary>Diagnosis</summary>
+    <div class="lanes" data-lanes='{"traces":["c-1"],"titles":["c-1"],"from":250,"to":480,"rows":["inputs","compositor","frames","tasks","marks"],"pins":[[1,331.5,"inputs"],[2,294.6,"compositor"],[3,345,"tasks"],[4,399.56,"marks"],[5,399.8,"compositor"],[6,344,"frames"],[7,428.4,"compositor"]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>The hand keeps turning the wheel: input events stamped every 33 ms.</li>
+      <li><i>2</i>294.6 ms: a wheel event reaches the compositor thread, which hands it to the main thread and waits.</li>
+      <li><i>3</i>The main thread is inside a 110 ms task (289.2 to 399.3 ms).</li>
+      <li><i>4</i>399.56 ms: our <code>wheel listener</code> mark. The listener has finally run.</li>
+      <li><i>5</i>399.75 ms: the compositor applies the scroll, 105 ms after pin 2.</li>
+      <li><i>6</i>Five vsyncs in between with no scroll movement; their frame records attribute the scroll to the main thread.</li>
+      <li><i>7</i>428 ms: the wheel events that piled up are delivered within a few milliseconds of each other. That is the "jump".</li>
+    </ol>
+    <p><b>The number.</b> Wheel sent → scroll position moved: 105 ms for this event (294.60 → 399.75), against 0.4 ms at most with a passive listener (Module 5). Over the recording the median <code>EventLatency</code> of a wheel event is <b data-m="c-1/eventLatency.MOUSE_WHEEL.p50"></b> ms and of the first scroll update <b data-m="c-1/eventLatency.FIRST_GESTURE_SCROLL_UPDATE.p50"></b> ms.</p>
+    <p><b>Configuration</b> (<code>lab/harness/extra/clinic.mjs</code>): <code>lib=tanstack&amp;wheel=blocking</code>, with <code>window.__lab.jank(180, 110)</code>: a 110 ms task every 180 ms. Thirty wheel notches, one every 33 ms.</p>
+    <p><b>Mechanism.</b> A wheel listener registered without <code>{passive: true}</code> may call <code>preventDefault()</code>. The compositor thread therefore answers "not handled" and the browser starts the scroll only when the main thread's acknowledgement arrives. Any task on the main thread becomes input latency for scrolling, which the compositor otherwise exists to prevent. Taught in <a href="rendering.html">Module 5</a> (wheel listeners) on the trio <code>r-wheel-none / passive / blocking</code>.</p>
+    <div class="boxes">
+      <div class="box file"><span class="label">File I am reading, and why</span>
+        <span class="path">lab/pages/src/main.ts:31–32</span>
+<pre><span class="n">31</span>  if (config.wheelListener !== "none")
+<span class="n">32</span>    panel.scroller.addEventListener("wheel", function onWheel() { mark("app: wheel listener"); }, <mark>{ passive: config.wheelListener === "passive" }</mark>);</pre>
+        <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/input/input_handler.cc;l=703">cc/input/input_handler.cc:703–719</a>
+        <p>Why the frames say <code>main_thread</code> although the compositor applies every scroll: Chromium counts a compositor scroll that had to wait as the main thread's.</p>
+<pre><span class="n">703</span>  // The main-thread is the 'scrolling thread' if:
+<span class="n">704</span>  //   (1) the scroll is driven by the main thread, or
+<span class="n">705</span>  //   <mark>(2) the scroll is driven by the compositor, but blocked on the main</mark>
+<span class="n">706</span>  //       thread.
+<span class="n">717</span>    case ScrollBeginThreadState::kScrollingOnCompositorBlockedOnMain:
+<span class="n">719</span>      scrolling_thread = FrameInfo::SmoothEffectDrivingThread::kMain;</pre>
+      </div>
+      <div class="box"><span class="label">Fix, and how to verify it</span>
+        <p>Make the listener passive (or remove it). The control is <code>r-wheel-passive</code>: the same kind of task, the same listener body. There a wheel that arrives 7 ms into a 100 ms task is acknowledged with <code>ack: SET_NON_BLOCKING</code> within 0.1 ms and the compositor scrolls at once (<code>q.mjs r-wheel-passive slices 'MouseWheelEventHandled|HandleGestureScrollUpdate$' 250 360</code>: 256.93 and 257.07 ms, inside the task that runs from 249.3 to 349.4).</p>
+      </div>
+    </div>
+    <table class="mtable" data-rows="c-1,r-wheel-blocking,r-wheel-passive,r-wheel-none" data-names="c-1,non-passive listener (Module 5),passive listener,no listener" data-head="Trace" data-cols="eventLatency.GESTURE_SCROLL_BEGIN.p50|scroll begin p50|ms,eventLatency.FIRST_GESTURE_SCROLL_UPDATE.p50|first scroll update p50|ms,main.longTasks|tasks ≥ 50 ms,main.maxTaskMs|longest task|ms"></table>
+    <p><b>The distractor I ruled out.</b> "The 110 ms task is the cause; remove it and the listener does no harm." The task is what makes the wait long, but the control has the same kind of task and its scroll position does not wait for it; only its rows do, because rows are drawn on the main thread. And without any long task a non-passive listener still costs 14 to 23 ms per wheel event in Module 5's idle measurement. The task decides how bad it is; the listener decides that it happens at all.</p>
+    <p><b>Limits.</b> The three control traces use a task of 100 ms every 150 ms, this case 110 every 180, so the medians in the table are not a clean one-knob comparison; the single event followed above is. And in this lab the wheel is injected through DevTools, which holds each event until the renderer has answered a request (Module 5, <code>input_handler.cc:1426–1431</code>): how many wheels piled up, and the counts of dropped vsyncs, would differ with a real mouse. The <code>NOT_CONSUMED</code> answer arriving 105 ms late would not.</p>
+  </details>
+  <ul class="add" hidden>
+    <li data-kind="measured">c-1: a wheel forwarded at 294.60 ms is acknowledged NOT_CONSUMED at 399.65 ms, after a 110 ms main-thread task; the compositor scrolls at 399.75 ms. With a passive listener the acknowledgement takes 0.1 ms inside the same kind of task.</li>
+    <li data-kind="read">A compositor scroll that had to wait for the main thread is reported with scroll state main_thread (cc/input/input_handler.cc:703–719).</li>
+    <li data-kind="rejected">"The long task is the cause": it sets the length of the wait; the non-passive listener creates the dependency.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Case 2: a complaint that arrives with somebody else's measurement attached.</p>
+</section>
+
+<section class="step" data-part="B · Eight cases" data-title="Case 2 · Rows that fill in later and later" data-node="backend network">
+  <p class="holding"><span class="label">Question I hold</span><span>The backend team has a number. The user has an experience that contradicts it. Can both be right?</span></p>
+  <div class="complaint"><span class="label">Complaint as filed</span>"Dragging the scrollbar shows rows of '…' that fill in late, and later and later the longer the drag. The backend team says every query takes 25 ms."</div>
+  <div class="tracelink" data-trace="c-2">Expand the <code>Backend (node)</code> process as well as the Renderer.</div>
+  <div class="beat"><span class="label">What I do</span><div><p>Run the routine. Write down the number, the mechanism and the smallest fix. Decide also: is the backend team's statement true?</p></div></div>
+  <details class="hint"><summary>Hint 1 · where to look</summary><p><code>threads.mainUtilPct</code> is about 7 %: the page is waiting, so leave the main thread (branch 5b). The trace has a second process. Its counter track <code>rows queue</code>, its <code>query #n</code> spans on the thread <code>query service</code>, and the page's own <code>app: ws round trip #n</code> measures are the three things to line up. <code>q.mjs c-2 summary</code> has them as <code>ws.*</code> and <code>backend.*</code>.</p></details>
+  <details class="hint"><summary>Hint 2 · what you should see there</summary><p>Requests leave about 60 times a second (one per frame). The <code>query</code> spans are each 25 ms and back to back: 40 a second. The <code>rows queue</code> counter climbs in a straight line. Round trips grow from 26 ms to over 700 ms. The last reply lands about three quarters of a second after the mouse is released.</p></details>
+  <details class="hint"><summary>Hint 3 · the mechanism's name</summary><p>Arrivals per second divided by completions per second has a Greek letter. What happens to a line when it is above 1, and what decides the length of the wait: the service time, or something else?</p></details>
+  <div class="predict" data-right="b"><span class="label">Commit to an answer</span>
+    <p>Which sentence is your diagnosis?</p>
+    <div class="opts"><button data-k="a">Queries get slower as the drag goes on</button><button data-k="b">More requests are sent per second than the backend completes, so a line forms and every wait is longer than the last</button><button data-k="c">Replies arrive on time but the main thread is too busy to draw them</button></div>
+    <div class="reveal"><p>The second. The backend team is right about 25 ms, and it does not help the user.</p></div>
+  </div>
+  <details class="dx"><summary>Diagnosis</summary>
+    <div class="lanes" data-lanes='{"traces":["c-2"],"titles":["c-2"],"from":-50,"to":2350,"rows":["inputs","frames","app","backendQuery"],"counters":["rows queue"],"pins":[[1,60,"app"],[2,700,"backendQuery"],[3,1050,"app"],[4,1450,"inputs"],[5,2218,"app"]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>The first round trips are as long as one query. Each ┃ is a request leaving.</li>
+      <li><i>2</i>The backend is never idle and never slow: one 25 ms query after another.</li>
+      <li><i>3</i>Round-trip bars overlap more and more: a request sent here waits behind some twenty others.</li>
+      <li><i>4</i>1450 ms: the mouse is released. The line (bottom chart) is at its longest.</li>
+      <li><i>5</i>2218 ms: ◆ the rows on screen are finally the rows for the scroll position.</li>
+    </ol>
+    <p><b>The number.</b> Mouse released → rows right: <b data-m="c-2/content.settleMs"></b> ms. From the first mouse move to that moment the viewport never held the rows for its position: the recording has <b data-m="c-2/content.completeMarks"></b> <code>content complete</code> mark, at the very end.</p>
+    <p><b>Is the backend team right?</b> Yes. Service time per query: p50 <b data-m="c-2/ws.serverService.p50"></b> ms, p95 <b data-m="c-2/ws.serverService.p95"></b> ms. What grows is the time a request spends waiting to be started: p50 <b data-m="c-2/ws.serverWait.p50"></b> ms, at most <b data-m="c-2/ws.serverWait.max"></b> ms, with up to <b data-m="c-2/backend.queueMax"></b> requests in line.</p>
+    <p><b>The arithmetic.</b> <b data-m="c-2/ws.requests"></b> requests in 1.45 s is 60 a second. One server at 25.1 ms completes 39.8 a second. ρ = 60 ÷ 39.8 ≈ 1.5. Under overload the last wait is about (time under overload) × (ρ − 1) = 1.45 s × 0.5 ≈ 0.73 s. Measured: 0.73 s. The service time enters only through ρ.</p>
+    <p><b>Configuration:</b> <code>lib=tanstack&amp;source=ws&amp;serverMs=25&amp;conc=1&amp;policy=every</code>; a thumb drag of 220 px over 1.5 s in 90 mouse moves.</p>
+    <p><b>Mechanism.</b> An open-loop client against a single server: the page asks for every range the viewport passes (<code>policy=every</code>), at the rate of scroll events, whatever the backend's pace. Taught in <a href="backend.html">Module 6</a> on <code>b-drag-every-tanstack</code>, where the same policy meets a 40 ms server.</p>
+    <div class="boxes">
+      <div class="box file"><span class="label">File I am reading, and why</span>
+        <span class="path">lab/pages/src/source.ts:108–118</span>
+<pre><span class="n">108</span>  const request = (y0, y1, x0, x1) =&gt; {
+<span class="n">109</span>    if (config.policy === "inflight") {
+<span class="n">110</span>      if (inFlight.size) return void (pending = { y0, y1, x0, x1 });
+<span class="n">118</span>    <mark>if (lo &lt; hi) send(lo, hi, x0, x1);</mark>   <span class="c">// "every": send at once whatever is not cached or in flight</span></pre>
+        <span class="path">lab/server/backend.mjs:46</span>
+<pre><span class="n">46</span>    while (busy &lt; conc &amp;&amp; queue.length) start(queue.shift());</pre>
+      </div>
+      <div class="box"><span class="label">Fix, and how to verify it</span>
+        <p>One request in flight; while it is out, remember only the newest range wanted (line 110). That lowers the arrival rate to the service rate by construction. Control: <code>b-drag-inflight-tanstack</code> against <code>b-drag-every-tanstack</code>.</p>
+        <table class="mtable" data-rows="c-2,b-drag-every-tanstack,b-drag-inflight-tanstack" data-names="c-2,every range · 40 ms server,one in flight · 40 ms server" data-head="Trace" data-cols="ws.requests|requests,backend.queueMax|longest line,ws.serverWait.max|longest wait|ms,ws.roundTrip.p95|round trip p95|ms,content.settleMs|release → rows right|ms"></table>
+      </div>
+    </div>
+    <p><b>The distractors I ruled out.</b> "The backend is slow": service time is flat (above). "The network": request mark → server receive is <b data-m="c-2/ws.upMs.p50"></b> ms and server done → reply handled <b data-m="c-2/ws.downMs.p50"></b> ms at the median. "The main thread cannot keep up with replies": it is busy <b data-m="c-2/threads.mainUtilPct"></b> % of the time, longest task <b data-m="c-2/main.maxTaskMs"></b> ms.</p>
+    <p><b>Limits.</b> The fix removes the line, not the staleness: Module 6 found that during a fast drag no reply is drawn before the release under any policy, because a 25 to 40 ms answer is for a position the thumb has left. What one request in flight guarantees is that the answer after release is one service time away.</p>
+  </details>
+  <div class="insight"><span class="label">For a table engine</span><p>This is the case for Tablelab's "one pull in flight" as a rule of the transport rather than of each view: an engine-side statement of service time says nothing about what a viewer waits. Proposal: report the wait before service and the queue length next to every service-time figure.</p></div>
+  <ul class="add" hidden>
+    <li data-kind="measured">c-2: 60 requests a second against one 25 ms server (ρ ≈ 1.5); line up to 29, last wait 0.73 s, rows right 0.77 s after release; service time flat at 25 ms.</li>
+    <li data-kind="inferred">Under overload the wait is (time under overload) × (ρ − 1); a correct service-time figure and a bad experience are compatible.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Case 3: no input at all, and a complaint about time.</p>
+</section>
+
+<section class="step" data-part="B · Eight cases" data-title="Case 3 · Prices that fall behind" data-node="js frame network">
+  <p class="holding"><span class="label">Question I hold</span><span>"More and more out of date" is a slope, not a level. Where is a slope in a trace?</span></p>
+  <div class="complaint"><span class="label">Complaint as filed</span>"Prices on screen are more and more out of date the longer the page is open, although the server sends on time."</div>
+  <div class="tracelink" data-trace="c-3">A large trace. In Perfetto, start with the <code>Backend (node)</code> process and the frame track before expanding <code>CrRendererMain</code>.</div>
+  <div class="beat"><span class="label">What I do</span><div><p>Run the routine. There is no input in this recording, so time zero is the start mark. Check the user's second claim too: does the server send on time?</p></div></div>
+  <details class="hint"><summary>Hint 1 · where to look</summary><p>The number is the age of a value when the page handles it. Every <code>app: tick message</code> mark carries the server's send time (<code>sentUs</code>, on the trace clock) in its detail; <code>summary</code> aggregates it as <code>ticks.ageWhenHandled</code>, and splits the run in two halves as <code>ticks.ageFirstHalf</code> and <code>ticks.ageSecondHalf</code>. For the server: the <code>produce + send</code> spans on the backend's <code>tick producer</code> thread. Then <code>threads.mainUtilPct</code>.</p></details>
+  <details class="hint"><summary>Hint 2 · what you should see there</summary><p>The server's spans are evenly spaced for the whole recording. The page handles clearly fewer messages per second than the server sends. Age at handling rises in a straight line from about a quarter of a second to about a second. The main thread is busy 99 % of the time with no long task: one task per message, each about 0.17 ms and each containing a forced layout. Main frames come exactly every 100 ms.</p></details>
+  <details class="hint"><summary>Hint 3 · the mechanism's name</summary><p>Case 2's Greek letter again, on a different server: this time the single server is the main thread and the customers are messages. What does the page do per message that it could do per frame?</p></details>
+  <div class="predict" data-right="c"><span class="label">Commit to an answer</span>
+    <p>Which sentence is your diagnosis?</p>
+    <div class="opts"><button data-k="a">The server falls behind its own schedule</button><button data-k="b">The network delivers late</button><button data-k="c">The main thread needs longer per message than the interval between messages, so a backlog grows</button></div>
+    <div class="reveal"><p>The third. The server is on time; the backlog is inside the browser.</p></div>
+  </div>
+  <details class="dx"><summary>Diagnosis</summary>
+    <table class="guide">
+      <tr><th>Window (ms after start)</th><th>Messages the server sent</th><th>Messages the page handled</th><th>Median age when handled</th></tr>
+      <tr><td>0 – 200</td><td>1801</td><td>1099</td><td>254 ms</td></tr>
+      <tr><td>400 – 600</td><td>1803</td><td>1052</td><td>422 ms</td></tr>
+      <tr><td>800 – 1000</td><td>1794</td><td>1012</td><td>593 ms</td></tr>
+      <tr><td>1200 – 1400</td><td>1803</td><td>1017</td><td>748 ms</td></tr>
+      <tr><td>1600 – 1800</td><td>1798</td><td>895</td><td>968 ms</td></tr>
+    </table>
+    <p>Read once from this recording by pairing each <code>app: tick message</code> mark with its <code>sentUs</code> and summing the <code>messages</code> argument of the backend's <code>produce + send</code> spans. The bound summary: age <b data-m="c-3/ticks.ageFirstHalf"></b> ms in the first half of the run, <b data-m="c-3/ticks.ageSecondHalf"></b> ms in the second; <b data-m="c-3/ticks.perSecondHandled"></b> messages handled per second.</p>
+    <div class="lanes" data-lanes='{"traces":["c-3"],"titles":["c-3"],"from":540,"to":770,"rows":["frames","mainFrames","tasks","main","backendTicks"],"pins":[[1,600,"backendTicks"],[2,600,"main"],[3,601,"mainFrames"],[4,651,"mainFrames"],[5,700,"frames"]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>The server produces and sends about every 1.1 ms, without a gap.</li>
+      <li><i>2</i>The main thread: a solid band of script with a forced layout in every task. Too short to show in the "tasks ≥ 1 ms" row.</li>
+      <li><i>3</i>A main frame "lasts" 100 ms; hover: 99.9 ms of it waiting for the thread.</li>
+      <li><i>4</i>Its actual work, at the end of the bar, is under a millisecond.</li>
+      <li><i>5</i>Between two main frames: vsyncs with nothing to show.</li>
+    </ol>
+    <p><b>The number.</b> Age of the data on screen: <b data-m="c-3/ticks.ageOnScreen.p50"></b> ms at the median, <b data-m="c-3/ticks.ageOnScreen.max"></b> ms at the end, and growing by about 0.4 s per second. The slope is 1 − (served ÷ arriving) = 1 − 5,150 ÷ 9,000 ≈ 0.43.</p>
+    <p><b>Configuration:</b> <code>lib=regular&amp;hz=9000&amp;apply=msg&amp;span=12</code>: 9,000 messages a second, one changed cell each, and for each message a <code>table.draw()</code>.</p>
+    <p><b>Mechanism.</b> ρ &gt; 1 with the main thread as the server. The unit of work is the message (<code>ticks.ts:81</code> applies on every message; <code>regular.ts:116</code> asks regular-table for a whole draw). Each draw rewrites the visible cells and reads layout, so each message costs a forced layout: <b data-m="c-3/main.forcedLayouts"></b> of them. The thread is <b data-m="c-3/threads.mainUtilPct"></b> % busy with a longest task of <b data-m="c-3/main.maxTaskMs"></b> ms. Frames survive only through the scheduler's starvation rule, which lets a BeginMainFrame jump the line once 100 ms have passed since the last one. Taught in <a href="streaming.html">Module 7</a> (three paces, the knee) on <code>s-msg-8000-regular</code>.</p>
+    <div class="boxes">
+      <div class="box file"><span class="label">File I am reading, and why</span>
+        <span class="path">third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.h:118–119 · .cc:2900–2903</span>
+        <p>Why exactly 100 ms between main frames:</p>
+<pre><span class="n"> 118</span>  static constexpr base::TimeDelta <mark>kDefaultRenderingStarvationThreshold</mark> =
+<span class="n"> 119</span>      base::Milliseconds(100);
+<span class="n">2900</span>      if (task_timing.end_time() - main_thread_only().last_frame_time &gt;=
+<span class="n">2901</span>          kDefaultRenderingStarvationThreshold) {
+<span class="n">2902</span>        main_thread_only().main_frame_prioritization_state =
+<span class="n">2903</span>            RenderingPrioritizationState::kRenderingStarved;</pre>
+      </div>
+      <div class="box"><span class="label">Fix, and how to verify it</span>
+        <p>Do the per-message part cheaply (parse, keep the latest value per cell) and ask for one draw per animation frame. Control: <code>s-raf-8000-regular</code> against <code>s-msg-8000-regular</code>.</p>
+        <table class="mtable" data-rows="c-3,s-msg-8000-regular,s-raf-8000-regular" data-names="c-3,a draw per message · 8000/s,one draw per frame · 8000/s" data-head="Trace" data-cols="threads.mainUtilPct|main busy|%,ticks.perSecondHandled|handled per second,ticks.ageFirstHalf|age in 1st half|ms,ticks.ageSecondHalf|age in 2nd half|ms,frames.mainQueueMs.p50|frame's queue wait p50|ms,main.forcedLayouts|forced layouts"></table>
+      </div>
+    </div>
+    <p><b>The distractors I ruled out.</b> "The server is late": its spans are evenly spaced and its socket never backs up (the counter <code>ticks socket buffered bytes</code> stays at 0), so the backlog is downstream of the server process. "Garbage collection": <b data-m="c-3/main.gcMs"></b> ms in the whole run. "One slow function to optimize": the profile below is led by our own <code>performance.measure</code> calls, three or more per message.</p>
+    <div class="prof" data-prof="c-3" data-top="5" data-by="self"></div>
+    <p><b>Limits.</b> Where the backlog sits between the kernel's socket buffer and the main thread's task queue is not split by this trace (<a href="network.html">Module 8</a> follows the bytes). The rate at which this panel saturates moved between my recordings of the same page from about 5,100 to 6,700 messages a second, and it includes the cost of our instrumentation (the profile): the knee is a property of the recording, the mechanism is not. Making the unit cheaper raises the knee; changing the unit to the frame removes it.</p>
+  </details>
+  <div class="insight"><span class="label">For a table engine</span><p>The three paces of Tablelab's design (ingestion, publication, rendering) exist to prevent exactly this coupling. Proposal for the measurement plan: report the <em>slope</em> of data age under a fixed load, not its mean; a mean age from a run of arbitrary length under ρ &gt; 1 is a number about the run's length.</p></div>
+  <ul class="add" hidden>
+    <li data-kind="measured">c-3: server sends 9,000 messages a second on time; the page handles about 5,150; age when handled grows from 0.25 s to 1.0 s in 1.8 s; main thread 99 % busy, no long task, one forced layout per message, a main frame every 100 ms.</li>
+    <li data-kind="read">The 100 ms cadence is kDefaultRenderingStarvationThreshold (main_thread_scheduler_impl.h:118–119, .cc:2900–2903).</li>
+    <li data-kind="inferred">Under ρ > 1 the age's slope is 1 − served ÷ arriving; a mean age describes the length of the run.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Case 4: the same page is fine on one machine and not on another.</p>
+</section>
+
+<section class="step" data-part="B · Eight cases" data-title="Case 4 · Smooth on the laptop, janky on the wall" data-node="frame js layout paint">
+  <p class="holding"><span class="label">Question I hold</span><span>The complaint names two differences between the machines. Which of them does the trace show, which can it not show, and what can the page change?</span></p>
+  <div class="complaint"><span class="label">Complaint as filed</span>"Scrolling is smooth on a laptop and janky on the large wall display driven by a small PC."</div>
+  <div class="tracelink" data-trace="c-4">This is the wall display's trace. Pin <code>CrRendererMain</code>; select one <code>ProxyMain::BeginMainFrame</code> slice.</div>
+  <div class="beat"><span class="label">What I do</span><div><p>Run the routine on the scroll (about two seconds of wheel input). Write down the number, the mechanism and the smallest fix. Note what you cannot know from this file alone.</p></div></div>
+  <details class="hint"><summary>Hint 1 · where to look</summary><p>Step 2's table: <code>frames.mainFrameMs</code> against <code>frames.mainQueueMs</code> tells you which branch. Then go inside one main frame: <code>node harness/q.mjs c-4 tree 316 351 main 600</code> prints the nested slices of at least 0.6 ms, and <code>q.mjs c-4 marks 'data listener' 300 420</code> our own measure with the number of cells per draw.</p></details>
+  <details class="hint"><summary>Hint 2 · what you should see there</summary><p>A main frame takes about 36 ms and starts without waiting. The rows change on every third vsync. Inside one: 8 ms in the scroll event (almost all in one function, called once per cell, about 590 cells), 4 ms writing cells in the animation-frame step, 4.6 ms style for 599 elements, 7.9 ms layout of 1,059 objects, about 6.5 ms pre-paint and paint.</p></details>
+  <details class="hint"><summary>Hint 3 · the mechanism's name</summary><p>A slow frame, not a busy thread: work per frame = visible cells × cost per cell, on this CPU. Two of those three factors are properties of the wall display. One line in the per-cell path is a classic mistake with number formatting.</p></details>
+  <div class="predict" data-right="b"><span class="label">Commit to an answer</span>
+    <p>Which sentence is your diagnosis?</p>
+    <div class="opts"><button data-k="a">Other tasks hold the main thread, so frames start late</button><button data-k="b">Each frame's own work is more than two vsync intervals: many cells, each costly, on a slow CPU</button><button data-k="c">Raster cannot keep up with the larger screen</button></div>
+    <div class="reveal"><p>The second. And only part of it is in the page's hands.</p></div>
+  </div>
+  <details class="dx"><summary>Diagnosis</summary>
+    <div class="lanes" data-lanes='{"traces":["c-4"],"titles":["c-4"],"from":300,"to":520,"rows":["frames","mainFrames","main","raster"],"pins":[[1,317.5,"mainFrames"],[2,322,"main.js"],[3,339,"main.layout"],[4,346,"main.paint"],[5,333.5,"frames"],[6,366.8,"frames"]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>A main frame: 34 ms from BeginMainFrame to commit, queue wait under 1 ms.</li>
+      <li><i>2</i>The scroll event: 8 ms, of which 7.7 ms sampled in <code>formatCell</code>.</li>
+      <li><i>3</i>Style 4.6 ms, then layout 7.9 ms: 1,059 of 1,193 layout objects dirty.</li>
+      <li><i>4</i>Pre-paint, paint, layerize: 6.5 ms.</li>
+      <li><i>5</i>Meanwhile the compositor presents frames of its own each vsync: the scrollbar moves, the table (which regular-table keeps in place until it redraws) does not.</li>
+      <li><i>6</i>The rows of pin 1 reach the screen 51 ms after their vsync began.</li>
+    </ol>
+    <p><b>The number.</b> Main frame p50 <b data-m="c-4/frames.mainFrameMs.p50"></b> ms with a queue wait of <b data-m="c-4/frames.mainQueueMs.p95"></b> ms at p95: <b data-m="c-4/frames.mainFrames"></b> content updates in about two seconds of scrolling where a healthy scroll has about 120. Rows change roughly 20 times a second.</p>
+    <p><b>Configuration:</b> <code>lib=regular&amp;cols=100&amp;fmt=newintl&amp;cls=1&amp;w=1560&amp;h=792</code>, viewport 1640 × 860, and <code>cpu: 4</code> (DevTools' CPU throttling: the main thread four times slower).</p>
+    <p><b>Mechanism.</b> The frame budget, taught in <a href="frames.html">Module 2</a> (the staircase: over one interval the rows come every second vsync, over two every third), with the per-cell costs of <a href="javascript.html">Module 4</a>. <code>fmt=newintl</code> constructs an <code>Intl.NumberFormat</code> for every price cell (<code>format.ts:33–34</code>); regular-table rewrites every visible cell on every scroll step, so style, layout and paint also scale with the number of cells.</p>
+    <table class="mtable" data-rows="c-4,j-fmt-newintl,j-fmt-intl,j-cells-L-regular" data-names="c-4,same table · full-speed CPU · new formatter per cell,… one shared formatter,… plain text" data-head="Trace" data-cols="frames.mainFrameMs.p50|main frame p50|ms,app.data listener.p50|data listener p50|ms,frames.mainQueueMs.p95|queue wait p95|ms,frames.mainFrames|main frames,raster.ms|raster|ms,raster.tasks|raster tasks"></table>
+    <p><b>What the trace can and cannot establish.</b> It <em>can</em> show that the frame is slow from its own work and how that work divides. It <em>cannot</em> show that the CPU is slow: a trace has no reference speed, and DevTools' throttling leaves no event (I searched the file for "throttl": only a compositor scheduler function matches). I get there by comparison with the same unit of work in a known trace: against <code>j-fmt-newintl</code>, which draws the same cells at full speed, the data listener is 3.5 times longer and the whole main frame 4 times, uniformly over script, style, layout and paint, while a raster task (other threads, not throttled) costs the same 0.055 ms in both (raster ms ÷ raster tasks in the table). Uniform slowdown of one thread across every category is the signature of the machine, not of a code path.</p>
+    <p><b>Fix, and how far it goes.</b> The smallest change is the formatter: one shared <code>Intl.NumberFormat</code> (<code>j-fmt-intl</code>) removes nearly all of the data listener's 8 ms. That brings a 36 ms frame to about 28 ms: rows every second vsync instead of every third, not every vsync. The rest is style, layout and paint for about 590 rewritten cells, which at full speed is <code>j-cells-L-regular</code>'s frame and at a quarter of the speed still exceeds one interval (arithmetic from the table, not a recording). To get under 16.7 ms on this machine the page must change fewer cells per frame: a keyed design touches only entering rows (<code>j-cells-L-tanstack</code>: main frame p50 <b data-m="j-cells-L-tanstack/frames.mainFrameMs.p50"></b> ms at full speed for the same viewport). That is a design decision, not a patch.</p>
+    <p><b>The distractors I ruled out.</b> "The thread is busy with something else": queue wait is under a millisecond. "The conditional classes" (<code>cls=1</code>): the style listener that sets them takes 0.8 to 0.9 ms of each 36 ms frame. "Raster on the big screen": <b data-m="c-4/raster.ms"></b> ms in total on worker threads.</p>
+  </details>
+  <ul class="add" hidden>
+    <li data-kind="measured">c-4: main frames of 36 ms with no queue wait; 8 ms of each in a per-cell formatter, about 19 ms in style, layout and paint of ~590 rewritten cells; rows change every third vsync.</li>
+    <li data-kind="inferred">A slow CPU is not recorded in a trace; it shows as a uniform slowdown of every main-thread category against a control of the same unit, with other threads' unit costs unchanged.</li>
+    <li data-kind="inferred">Removing the per-cell formatter moves this case from every third vsync to every second; reaching every vsync needs fewer changed cells per frame.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Case 5: a complaint with no visible symptom at all.</p>
+</section>
+
+<section class="step" data-part="B · Eight cases" data-title="Case 5 · Nothing looks wrong, the fan disagrees" data-node="js layout">
+  <p class="holding"><span class="label">Question I hold</span><span>Every frame is on time. What is the number for a complaint about cost, and against what do I compare it?</span></p>
+  <div class="complaint"><span class="label">Complaint as filed</span>"The table scrolls without visible problems, but the tab uses far more CPU than its sibling built on the same library."</div>
+  <div class="tracelink" data-trace="c-5">Pin <code>CrRendererMain</code> and zoom into one <code>EventDispatch</code> (scroll) slice until its children separate.</div>
+  <div class="beat"><span class="label">What I do</span><div><p>Run the routine. The frames will not help; say why, then find the number that does. The complaint offers you a control for free: a sibling built on the same library. Module 4's scenario <code>j-cells-L-regular</code> is that sibling (same table size, same scroll, about two seconds of wheel input).</p></div></div>
+  <details class="hint"><summary>Hint 1 · where to look</summary><p>The number is main-thread milliseconds by category over the same scroll: <code>main.scriptMs</code>, <code>styleMs</code>, <code>layoutMs</code>, <code>paintMs</code>, and the counts <code>main.layouts</code> and <code>main.forcedLayouts</code>, for both traces. Then one scroll event: <code>node harness/q.mjs c-5 tree 316 334 main 250</code>.</p></details>
+  <details class="hint"><summary>Hint 2 · what you should see there</summary><p>Script is the same in both traces. Layout time is more than double. This trace has about eighteen <code>Layout</code> slices <em>inside</em> each scroll event, underneath JavaScript, each with 99 dirty objects and about half a millisecond; the sibling has one layout per frame, after the JavaScript. This trace runs no animation-frame callbacks at all.</p></details>
+  <details class="hint"><summary>Hint 3 · the mechanism's name</summary><p>Write a column, read its width, write the next column, read its width. What does the browser have to do before it can answer each read? And what would make a table library measure every column again on every scroll?</p></details>
+  <div class="predict" data-right="b"><span class="label">Commit to an answer</span>
+    <p>Which sentence is your diagnosis?</p>
+    <div class="opts"><button data-k="a">It draws more cells or runs more JavaScript per frame</button><button data-k="b">Layout is forced many times per scroll event by reads placed between writes</button><button data-k="c">The garbage collector runs during the scroll</button></div>
+    <div class="reveal"><p>The second: one layout per frame has become eighteen small ones.</p></div>
+  </div>
+  <details class="dx"><summary>Diagnosis</summary>
+    <div class="lanes" data-lanes='{"traces":["c-5","j-cells-L-regular"],"titles":["c-5","the sibling (j-cells-L-regular)"],"from":310,"to":356,"rows":["frames","mainFrames","main"],"pins":[[1,317.6,"main.js",0],[2,321.6,"main.layout",0],[3,326,"mainFrames",0],[4,321.4,"main.layout",1]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>c-5: the scroll event lasts 12 ms. In the sibling it is short and the cells are written later, in the animation-frame step.</li>
+      <li><i>2</i>c-5: a comb of red bars. Each is a layout forced from inside JavaScript: "Layout (99 of 1158 objects dirty)", about 0.5 ms, about eighteen per event.</li>
+      <li><i>3</i>The main frame still ends before the next vsync: 14 ms here. Nothing is late.</li>
+      <li><i>4</i>The sibling: one layout per frame, not forced, after the script.</li>
+    </ol>
+    <table class="mtable" data-rows="c-5,j-cells-L-regular" data-names="c-5,the sibling" data-head="Trace" data-cols="threads.mainUtilPct|main busy|%,main.scriptMs|script|ms,main.layoutMs|layout|ms,main.layouts|layouts,main.forcedLayouts|forced layouts,main.scrollEvents|scroll events,main.rafCallbacks|rAF callbacks,frames.mainFrameMs.p50|main frame p50|ms,frames.all|vsyncs with main"></table>
+    <p><b>The number.</b> Main thread busy <b data-m="c-5/threads.mainUtilPct"></b> % against <b data-m="j-cells-L-regular/threads.mainUtilPct"></b> %; the difference is layout: <b data-m="c-5/main.layoutMs"></b> ms against <b data-m="j-cells-L-regular/main.layoutMs"></b> ms, in <b data-m="c-5/main.layouts"></b> layouts against <b data-m="j-cells-L-regular/main.layouts"></b>.</p>
+    <p><b>Configuration:</b> <code>lib=regular&amp;cols=100&amp;rtReset=1&amp;w=1560&amp;h=792</code>, viewport 1640 × 860. The page's own scroll listener calls <code>table.resetAutoSize()</code> on every scroll event (<code>regular.ts:67</code>), as regular-table's file_browser example does.</p>
+    <p><b>Mechanism.</b> regular-table remembers measured column widths. With widths known it plans a draw from the cache and commits it in an animation frame: one layout per frame (its warm path, read in <a href="anatomy.html">Module 3</a>). <code>resetAutoSize()</code> empties the cache, and with no width known the draw runs at once and reads <code>offsetWidth</code> after drawing each column. Each read forces the browser to lay out what was just written. Taught in <a href="rendering.html">Module 5</a> (forced layout) on <code>r-autosize-reset</code>, which is this configuration.</p>
+    <div class="boxes">
+      <div class="box file"><span class="label">File I am reading, and why</span>
+        <span class="path">regular-table 0.9.2 · src/ts/regular-table.ts:86–96</span>
+<pre><span class="n">86</span>    resetAutoSize(options?: ResetAutoSizeOptions) {
+<span class="n">95</span>        if (!options || options.indices) {
+<span class="n">96</span>            <mark>this._column_sizes.indices = [];</mark></pre>
+        <span class="path">src/ts/table.ts:900, 991–996</span>
+<pre><span class="n">900</span>            const warm = this._column_sizes.indices.some(Boolean);
+<span class="n">991</span>                let col_width =
+<span class="n">992</span>                    this._column_sizes.indices[_virtual_x + Math.floor(x0)] ||
+<span class="n">993</span>                    (warm ? unmeasured_col_width : 0);
+<span class="n">995</span>                if (!col_width) {
+<span class="n">996</span>                    <mark>col_width = cont_head?.th?.offsetWidth || 0;</mark></pre>
+        <p>With <code>indices</code> empty, <code>warm</code> is false, so every column's width is 0 and line 996 runs once per column, inside the loop that draws the columns.</p>
+      </div>
+      <div class="box"><span class="label">Fix, and how to verify it</span>
+        <p>Do not reset per scroll event; reset when the data's shape changes. The sibling is the verification: the same cells are written, the layouts fall from about eighteen per event to one per frame, and layout time more than halves (table above).</p>
+      </div>
+    </div>
+    <p><b>The distractors I ruled out.</b> "More JavaScript": script time is equal within a millisecond in the two traces. "Garbage collection": <b data-m="c-5/main.gcMs"></b> ms in the whole recording. And one from Module 5 itself: "a forced layout is only the frame's layout done early, so it is free". True when one read follows all writes; here each of eighteen reads is followed by more writes, so the work is genuinely extra. The count of layouts against the count of frames tells the two apart.</p>
+    <p><b>Limits.</b> "Far more CPU" is about 1.4 times the main thread here, and the frames still fit. On the machine of case 4 they would not: the same pattern at a quarter of the speed is a 40 ms frame (arithmetic, not a recording). A cost that is invisible on a fast machine is a jank on a slow one.</p>
+  </details>
+  <ul class="add" hidden>
+    <li data-kind="measured">c-5: about eighteen forced layouts per scroll event (99 dirty objects each), 2,166 layouts against 122 for the same scroll; script unchanged; every frame still on time.</li>
+    <li data-kind="read">resetAutoSize() empties the width cache (regular-table.ts:96); without it each drawn column is measured with offsetWidth inside the draw loop (table.ts:900, 991–996).</li>
+    <li data-kind="inferred">Layouts per frame, compared with a sibling, finds waste that no frame metric shows.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Case 6: the user sees blank space, and there are no screenshots to look at.</p>
+</section>
+
+<section class="step" data-part="B · Eight cases" data-title="Case 6 · Blank areas in a fast fling" data-node="raster compositor present">
+  <p class="holding"><span class="label">Question I hold</span><span>"Blank before the content appears": where do pixels wait when neither JavaScript nor layout is slow?</span></p>
+  <div class="complaint"><span class="label">Complaint as filed</span>"During a fast fling the list shows blank areas before the content appears."</div>
+  <div class="tracelink" data-trace="c-6">Besides the main thread, pin the Renderer's <code>Compositor</code> and its <code>ThreadPoolForegroundWorker</code> threads.</div>
+  <div class="beat"><span class="label">What I do</span><div><p>Run the routine on the fling (about two seconds at high speed). There are no screenshots in the trace, so "blank" has to be turned into something measurable from events. Write down how you would measure it, the mechanism and the smallest fix.</p></div></div>
+  <details class="hint"><summary>Hint 1 · where to look</summary><p>Main frames are about 5 ms and start at once, and the thread is busy an eighth of the time: branch 5b, waiting. Look <em>after</em> the commit: <code>RasterTask</code> slices on the worker threads (<code>raster.ms</code> in <code>summary</code>), <code>LayerTreeHostImpl::ActivateSyncTree</code> on the compositor thread, and the last column of <code>q.mjs c-6 frames 300 420</code>: how long after its vsync each frame was presented.</p></details>
+  <details class="hint"><summary>Hint 2 · what you should see there</summary><p>Vsyncs alternate: one frame with the main thread's rows, presented about 35 ms after its vsync, then one with only the compositor's scroll, presented after 1.5 ms. Between a commit (322.95 ms) and its activation (340.42 ms) there are 28 raster tasks that add up to 65 ms of worker time. Over the whole recording raster is more than four seconds of work. No frame is flagged as having missing content.</p></details>
+  <details class="hint"><summary>Hint 3 · the mechanism's name</summary><p>New rows cannot be shown before their tiles are turned into pixels, and the compositor does not stop scrolling to wait for them. What kind of CSS makes one tile cost milliseconds instead of microseconds?</p></details>
+  <div class="predict" data-right="c"><span class="label">Commit to an answer</span>
+    <p>Which sentence is your diagnosis?</p>
+    <div class="opts"><button data-k="a">The main thread renders the new rows too late</button><button data-k="b">Tiles are shown before they are rastered (checkerboarding)</button><button data-k="c">Rendered rows wait for raster before they can be shown, while the compositor keeps scrolling the old picture</button></div>
+    <div class="reveal"><p>The third. The second is the natural guess and the frame records contradict it.</p></div>
+  </div>
+  <details class="dx"><summary>Diagnosis</summary>
+    <div class="lanes" data-lanes='{"traces":["c-6","r-paint-plain-fast"],"titles":["c-6","control: plain cells, same speed (r-paint-plain-fast)"],"from":310,"to":392,"rows":["compositor","frames","mainFrames","raster"],"pins":[[1,318,"mainFrames",0],[2,330,"raster",0],[3,340.4,"compositor",0],[4,350.2,"compositor",0],[5,333.4,"frames",0],[6,320.7,"raster",1]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>The main thread's part: 6 ms, committed at 322.95 ms.</li>
+      <li><i>2</i>Raster workers: 28 tasks, 65 ms of work in total, until about 340 ms.</li>
+      <li><i>3</i>340.42 ms: only now is the new tree activated, 17.5 ms after the commit.</li>
+      <li><i>4</i>350.07 ms: drawn at the next vsync. The rows for the vsync of 316.5 ms are on screen at 351.5 ms.</li>
+      <li><i>5</i>The vsync in between: the compositor presents the old rows at a new scroll offset.</li>
+      <li><i>6</i>The control: the same number of new rows, raster too short to see.</li>
+    </ol>
+    <table class="mtable" data-rows="c-6,r-paint-plain-fast" data-names="c-6,control: plain cells" data-head="Trace" data-cols="raster.ms|raster work|ms,raster.tasks|raster tasks,frames.mainFrames|main frames,frames.mainFrameMs.p50|main frame p50|ms,threads.mainUtilPct|main busy|%,frames.missingContent|vsyncs flagged missing content,frames.checkerboarded|flagged checkerboarded"></table>
+    <p><b>The number.</b> Since no pixels were captured, I compute it: at each presented frame, the compositor's scroll offset (<code>HandleGestureScrollUpdate_Result</code>, <code>visual_offset_y</code>) against the last row in the tree that was on screen then (our <code>draw</code> measure's <code>last</code>, 24 px per row, from the main frame whose reporter had ended). In this trace the bottom 310 to 500 px of the 768 px body have no row at the median frame (median 331 px over 107 frames); in the control 135 to 160 px (median 139). That is an inference from positions, good to about one row; it is not an observation of blank pixels.</p>
+    <p><b>Configuration:</b> <code>lib=tanstack&amp;cols=100&amp;paint=heavy&amp;w=1560&amp;h=792</code>, viewport 1640 × 860, scrolled at 9,600 px/s. <code>paint=heavy</code> gives every cell blurred shadows.</p>
+    <p><b>Mechanism.</b> Rows that the main thread commits go into a pending tree, which is activated only when its visible tiles are rastered. Blurred shadows make each tile expensive (here in software, on the raster worker threads), so activation waits 17 ms and the next BeginMainFrame is not sent meanwhile: content arrives every second vsync and two vsyncs old, while the compositor scrolls on at 160 px per vsync. Taught in <a href="rendering.html">Module 5</a> (paint and raster) on <code>r-paint-heavy-tanstack</code>, which is this configuration.</p>
+    <p><b>Fix, and how to verify it.</b> Cheaper pixels: no blur on cells that scroll (a flat border or a pre-rendered image costs nothing per tile). The control <code>r-paint-plain-fast</code> is the verification: raster work falls from <b data-m="c-6/raster.ms"></b> to <b data-m="r-paint-plain-fast/raster.ms"></b> ms and every vsync carries new rows. More overscan would hide the gap and add raster work; it treats the symptom.</p>
+    <p><b>The distractors I ruled out.</b> "The main thread is late": 5 ms frames, no queue wait, <b data-m="c-6/threads.mainUtilPct"></b> % busy. "Checkerboarding": zero vsyncs flagged with missing content or unrastered tiles (table). Chromium did not show tiles before they were ready; it held the whole tree back. The blank is rows that are not yet in the visible tree, not tiles without pixels.</p>
+    <p><b>Limits.</b> The control also has a gap of about 140 px: at 9,600 px/s a virtualizer with one row of overscan is always a vsync behind (Module 2). The case roughly doubles to triples it. And this is headless Chrome with software raster: with GPU raster the cost of a blur is distributed differently, and this recording says nothing about it.</p>
+  </details>
+  <ul class="add" hidden>
+    <li data-kind="measured">c-6: raster 4.1 s of worker time in a two-second fling (control 0.2 s); commit → activation 17.5 ms in the frame examined; rows presented 35 ms after their vsync, every second vsync; no vsync flagged as missing content.</li>
+    <li data-kind="inferred">Scroll offset runs about 330 px (median) past the last presented row, against about 140 px with plain cells: computed from offsets and row ranges, not seen.</li>
+    <li data-kind="rejected">"Blank areas are unrastered tiles": the frame records flag none; the pending tree is held back whole.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Case 7: the network is named in the complaint. Is anything on the page at fault?</p>
+</section>
+
+<section class="step" data-part="B · Eight cases" data-title="Case 7 · After the Wi-Fi drops" data-node="network js frame">
+  <p class="holding"><span class="label">Question I hold</span><span>Three claims in one sentence: it freezes, values jump, the page stutters. Which of them can I find in the trace, and how large is each?</span></p>
+  <div class="complaint"><span class="label">Complaint as filed</span>"After the Wi-Fi drops for a second, the table freezes, then values jump and the page stutters."</div>
+  <div class="tracelink" data-trace="c-7">Expand <code>Backend (node)</code>: it has more than one lane in this trace.</div>
+  <div class="beat"><span class="label">What I do</span><div><p>Run the routine. Treat the three claims separately and put a number on each. Then decide what, if anything, the page should do differently.</p></div></div>
+  <details class="hint"><summary>Hint 1 · where to look</summary><p>The main thread is busy about a ninth of the time: waiting. Line up three things on one time axis: the backend's <code>produce + send</code> spans (thread <code>tick producer</code>), the backend's <code>netem</code> lane and its counter <code>netem queued bytes (to page)</code>, and the page's <code>app: tick message</code> marks. Then zoom into the first 60 ms after messages resume and count our <code>app: draw</code> measures there.</p></details>
+  <details class="hint"><summary>Hint 2 · what you should see there</summary><p>The server never pauses. No message reaches the page between 215.7 and 1514.7 ms while the queued-bytes counter climbs to about 65 KB. Then 1,066 messages are handled within 38 ms; the first is 1.3 s old. One vsync is dropped and one main frame waits 26 ms. In those 38 ms there are 6 <code>app: draw</code> measures.</p></details>
+  <details class="hint"><summary>Hint 3 · the mechanism's name</summary><p>An ordered, reliable stream does not lose what was sent during a stall; it delivers all of it, late and at once. How old is the oldest value then? And why did a thousand messages not cost a thousand renders here?</p></details>
+  <div class="predict" data-right="c"><span class="label">Commit to an answer</span>
+    <p>Which sentence is your diagnosis?</p>
+    <div class="opts"><button data-k="a">The main thread is blocked for the length of the freeze</button><button data-k="b">Nothing arrives for 1.3 s; then a thousand messages each cause a render, which is the stutter</button><button data-k="c">Nothing arrives for 1.3 s; the burst is absorbed in a few frames; the lasting harm is that the screen showed old values with no sign of it</button></div>
+    <div class="reveal"><p>The third. The second was my own expectation when I designed the case.</p></div>
+  </div>
+  <details class="dx"><summary>Diagnosis</summary>
+    <div class="lanes" data-lanes='{"traces":["c-7"],"titles":["c-7 · the whole recording"],"from":0,"to":3200,"rows":["frames","marks","backendTicks","netem"],"counters":["netem queued bytes (to page)"],"pins":[[1,215.7,"netem"],[2,800,"backendTicks"],[3,800,"marks"],[4,1515,"marks"]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>215.7 ms: the proxy's own instant, <code>stall down 1300 ms</code>. The trace says in words what happened to the link.</li>
+      <li><i>2</i>The server keeps producing and sending, 80 messages per 100 ms.</li>
+      <li><i>3</i>The page handles none. The counter below fills: bytes waiting in the proxy.</li>
+      <li><i>4</i>1514.7 ms: everything arrives.</li>
+    </ol>
+    <div class="lanes" data-lanes='{"traces":["c-7"],"titles":["c-7 · the burst"],"from":1495,"to":1585,"rows":["frames","mainFrames","tasks","main","app"],"pins":[[1,1516,"main.js"],[2,1530,"mainFrames"],[3,1526,"frames"],[4,1520.1,"app"]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>1514.7 to 1552.4 ms: 1,066 late messages, one main-thread task each, 30.5 ms of work in all.</li>
+      <li><i>2</i>A main frame waits 25.9 ms behind them.</li>
+      <li><i>3</i>One vsync without a frame.</li>
+      <li><i>4</i>Orange bars: React's <code>draw</code>. Six in the burst.</li>
+    </ol>
+    <p><b>The three claims, measured.</b> <em>Freezes:</em> yes. The longest gap between presented frames is <b data-m="c-7/frames.presentGap.max"></b> ms; nothing was wrong with the page, there was nothing new to show. <em>Values jump:</em> yes. The oldest value applied was <b data-m="c-7/ticks.ageWhenHandled.max"></b> ms old; a second's worth of changes landed within three frames. <em>Stutters:</em> barely, in this recording: <b data-m="c-7/frames.dropped"></b> dropped vsync, one main frame that waited <b data-m="c-7/frames.mainQueueMs.max"></b> ms, longest task <b data-m="c-7/main.maxTaskMs"></b> ms. If the user means more than one missed frame, this trace does not show it.</p>
+    <p><b>Configuration:</b> <code>lib=react&amp;hz=800&amp;apply=msg&amp;net=1&amp;span=12</code>; the netem proxy stalls delivery to the page for 1.3 s (<code>stallAtMs: 1300, stallMs: 1300</code>, counted from the proxy's setup, which is why it falls at 216 ms on the trace's axis).</p>
+    <p><b>Mechanism.</b> A stall on an ordered stream becomes a burst, and the age of the data at the end of the stall equals its length. Taught in <a href="network.html">Module 8</a> on <code>n-stall-msg-*</code>. What a burst costs depends on what the page does per message, <a href="streaming.html">Module 7</a>'s subject.</p>
+    <div class="hard"><span class="label">Hard learning</span><p>I designed this case as "one React render per message, so a thousand renders after the stall". Before the stall that is what the trace shows: 160 <code>draw</code> measures for 160 messages in the first 200 ms. In the burst it shows 6 renders for 1,066 messages. Each message still ran its own task and updated the data (1,066 <code>tick apply</code> measures), but the state update only <em>schedules</em> a render through React's scheduler (<code>performWorkUntilDeadline</code> in the profile, a separate task), and that task waits its turn behind message tasks already queued. React coalesced the notifications and kept every mutation. The rule I keep: count the units in the burst before predicting its cost; "per message" in steady state need not hold under a backlog.</p></div>
+    <table class="mtable" data-rows="c-7,n-stall-msg-regular,n-stall-raf-tanstack" data-names="c-7,a draw per message · regular-table (Module 8),applied once per frame (Module 8)" data-head="Trace, each with a stall of 1.3 to 1.5 s" data-cols="ticks.ageWhenHandled.max|oldest value handled|ms,ticks.messages|messages,ticks.applies|applies,frames.dropped|vsyncs dropped,frames.mainQueueMs.max|longest frame wait|ms,main.forcedLayouts|forced layouts"></table>
+    <p><b>Fix, and how to verify it.</b> The page cannot repair the network. What it can do: (1) make burst work independent of the number of queued messages by design rather than by a framework's courtesy: apply once per frame (<code>n-stall-raf-tanstack</code>, recorded at 500 messages a second: about a hundred applies for 1,600 messages, no dropped vsync), where a renderer that draws per message pays for each (<code>n-stall-msg-regular</code>, second row); (2) show age: during the stall the table displayed values up to 1.3 s old as if current, and no trace-level fix changes that; (3) on the server, send one snapshot after a stall instead of the backlog (the conflation of <code>n-bw-256-conflate</code>). These are proposals in order of cost.</p>
+    <p><b>The distractor I ruled out.</b> "The page froze because the main thread was blocked": during the gap the main thread has no task longer than about a millisecond and the server's spans continue; the proxy's lane names the stall.</p>
+  </details>
+  <div class="insight"><span class="label">For a table engine</span><p>The burst is Tablelab's Pass 1 question in miniature: React bounded the <em>notifications</em> while every <em>mutation</em> was applied, and that was enough to absorb a thousand queued messages in 30 ms. Proposal: after a reconnect or stall, the engine should publish one invalidation for the latest version and carry the data's age to the view, so that staleness is displayed rather than discovered.</p></div>
+  <ul class="add" hidden>
+    <li data-kind="measured">c-7: no message for 1,299 ms while the server kept sending; then 1,066 messages in 38 ms (30.5 ms of main-thread work), oldest 1.3 s old; one dropped vsync.</li>
+    <li data-kind="rejected">"One React render per message in the burst": 6 renders for 1,066 messages; React's scheduler coalesced the renders while every message was applied.</li>
+    <li data-kind="inferred">A stall's lasting harm is data age shown without a sign; burst cost depends on whether notifications are bounded.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Case 8: two inputs in one trace, and the user says only one of them is slow.</p>
+</section>
+
+<section class="step" data-part="B · Eight cases" data-title="Case 8 · Page Down takes a moment, the scrollbar does not" data-node="input frame js"
+  data-ask="portable|Which of the readings that solved these cases would survive a move to a renderer that is not Chrome?">
+  <p class="holding"><span class="label">Question I hold</span><span>The same page, the same load, two ways of scrolling. What differs between them: the thread that scrolls, or something else?</span></p>
+  <div class="complaint"><span class="label">Complaint as filed</span>"While the dashboard is live, Page Down takes a moment to respond; dragging the scrollbar does not."</div>
+  <div class="tracelink" data-trace="c-8">Two key presses (at 0 and 450 ms on the charts' axis), then a scrollbar drag from about 1050 to 1550 ms.</div>
+  <div class="beat"><span class="label">What I do</span><div><p>Run the routine twice within one trace: once around a key press, once inside the drag. Compare the same numbers. Write down what "respond" means as a number, the mechanism, and the smallest fix.</p></div></div>
+  <details class="hint"><summary>Hint 1 · where to look</summary><p><code>node harness/q.mjs c-8 frames -20 360</code> and <code>… frames 1040 1300</code>: compare the last column of the main-frame list (queue wait) in the two windows. Then the task list with priorities, leaving out the flood: <code>node harness/q.mjs c-8 tasks -20 130 0 | grep -v FRAME_LOADING</code> and the same for <code>1070 1200</code>.</p></details>
+  <details class="hint"><summary>Hint 2 · what you should see there</summary><p>The main thread is busy 94 % of the time with tasks of about 4.7 ms, one per message. The key itself is dispatched 1 ms after it arrives and a first BeginMainFrame follows at once with priority <code>HIGHEST</code>. The next BeginMainFrame runs at 105 ms with priority <code>VERY_HIGH</code>, and the whole Page Down gets three scroll events. The vsyncs in between are presented by the compositor alone. During the drag every BeginMainFrame runs at <code>HIGHEST</code> and waits at most 5 ms.</p></details>
+  <details class="hint"><summary>Hint 3 · the mechanism's name</summary><p>Both scrolls move on the compositor. The rows are drawn on the main thread, which has more work than time (case 3's condition). The browser's scheduler decides which waiting task goes next, and it treats a key press, the animation after it, and a continuing pointer gesture differently.</p></details>
+  <div class="predict" data-right="c"><span class="label">Commit to an answer</span>
+    <p>Which sentence is your diagnosis?</p>
+    <div class="opts"><button data-k="a">The key event waits in the queue behind the messages</button><button data-k="b">Page Down scrolls on the main thread; the scrollbar drag scrolls on the compositor</button><button data-k="c">Both scroll on the compositor; the rows need main-thread frames, which the scheduler serves promptly during the drag and only every 100 ms during the key's animation</button></div>
+    <div class="reveal"><p>The third. The second was the intended answer when the case was designed; the trace corrected it.</p></div>
+  </div>
+  <details class="dx"><summary>Diagnosis</summary>
+    <div class="lanes" data-lanes='{"traces":["c-8","c-fix-8"],"titles":["c-8 · the first Page Down","the repaired page, same key (c-fix-8)"],"from":-40,"to":380,"rows":["inputs","frames","mainFrames","tasks"],"pins":[[1,0,"inputs",0],[2,1.5,"mainFrames",0],[3,60,"mainFrames",0],[4,90,"frames",0],[5,250,"frames",0],[6,100,"mainFrames",1]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>The key. The <code>keydown</code> is dispatched at 1.0 ms.</li>
+      <li><i>2</i>A first main frame at 1.4 ms, 0.6 ms long: the scroll animation starts.</li>
+      <li><i>3</i>The next main frame is asked for at 16.6 ms and starts 89 ms later. Then two more, each after about 100 ms. Below them: an unbroken row of 4.7 ms tasks.</li>
+      <li><i>4</i>Amber: the compositor presents its animation every vsync (the frame records say <code>has_compositor_animation</code>). The scrollbar moves; the rows do not.</li>
+      <li><i>5</i>Red: vsyncs with nothing new, until the third main frame lands at 333 ms.</li>
+      <li><i>6</i>The repaired page: a main frame per vsync, nine scroll events, done at 183 ms.</li>
+    </ol>
+    <div class="lanes" data-lanes='{"traces":["c-8"],"titles":["c-8 · the scrollbar drag, same load"],"from":1040,"to":1300,"rows":["inputs","frames","mainFrames","tasks"],"pins":[[1,1050,"inputs"],[2,1125,"mainFrames"],[3,1200,"tasks"]]}'></div>
+    <ol class="pins">
+      <li><i>1</i>Mouse down on the thumb.</li>
+      <li><i>2</i>Main frames at one or two per 33 ms, each waiting 0 to 5 ms.</li>
+      <li><i>3</i>The message tasks are still there, back to back; the frames are let in between them.</li>
+    </ol>
+    <p><b>The number.</b> "Respond" for a table is rows changing. After the key at 0 ms the rows change on screen at about 114, 224 and 334 ms (three scroll events: 105.7, 217.0, 324.9 ms). In the repaired page they change every vsync from 45 ms and the scroll ends at 183 ms. Over the whole trace the median wait of a main frame is <b data-m="c-8/frames.mainQueueMs.p50"></b> ms (most main frames belong to the drag) and the p95, set by the two key animations, is <b data-m="c-8/frames.mainQueueMs.p95"></b> ms.</p>
+    <p><b>Configuration:</b> <code>lib=regular&amp;apply=msg&amp;span=2000&amp;formatUs=50</code>, with the message rate raised from 50 to 400 a second at the start of the recording (<code>window.__lab.setRate(400)</code>). <code>formatUs=50</code> is the lab's stand-in for a cell that costs something: 50 µs each, 4.1 ms per draw of 78 cells. With a draw per message the thread can serve about 190 messages a second (<b data-m="c-8/ticks.perSecondHandled"></b> measured) and 400 arrive: ρ ≈ 2.</p>
+    <p><b>Mechanism.</b> Three scheduler rules, visible as the priority of <code>COMPOSITOR_TQ</code> tasks in the trace. The first two are read in the source below; for the third the source lists the use cases that would produce what the trace shows. Input tasks always go first, so the key is not late. After a discrete input the next BeginMainFrame is voted to highest priority: one frame. After that the animation's frames compete with the message tasks in arrival order, and get in only through the starvation rule of case 3: 100 ms. A pointer gesture in progress keeps the vote at highest for as long as input arrives. Priorities are taught in <a href="streaming.html">Module 7</a>; why a drag and a key travel differently, in <a href="walkthrough.html">Module 1</a>.</p>
+    <div class="boxes">
+      <div class="box file"><span class="label">File I am reading, and why</span>
+        <span class="path">third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc:2911–2940</span>
+<pre><span class="n">2911</span>  switch (current_use_case()) {
+<span class="n">2912</span>    case UseCase::kCompositorGesture:
+<span class="n">2913</span>      if (main_thread_only().blocking_input_expected_soon)
+<span class="n">2914</span>        return TaskPriority::kHighestPriority;
+<span class="n">2919</span>      return TaskPriority::kLowPriority;
+<span class="n">2931</span>    case UseCase::kMainThreadGesture:
+<span class="n">2932</span>    case UseCase::kTouchstart:
+<span class="n">2933</span>    case <mark>UseCase::kDiscreteInputResponse</mark>:
+<span class="n">2938</span>      <mark>return TaskPriority::kHighestPriority;</mark>
+<span class="n">2940</span>    case UseCase::kNone:</pre>
+        <p>A key press is a discrete input; its use case lasts until the next BeginMainFrame or 50 ms (<code>user_model.h:38–39</code>). Which use case applied during the drag is not in the file: the <code>renderer.scheduler</code> category was requested, but I found no <code>Scheduler.UseCase</code> event. I infer from the <code>HIGHEST_PRIORITY</code> on every compositor task that it was one of the cases voting highest.</p>
+      </div>
+      <div class="box"><span class="label">Fix, and how to verify it</span>
+        <p>Remove the saturation and the priorities stop mattering: one draw request per animation frame instead of one per message. <code>c-fix-8</code> is this case with only that changed.</p>
+        <table class="mtable" data-rows="c-8,c-fix-8" data-names="c-8,one draw per frame" data-head="Trace" data-cols="threads.mainUtilPct|main busy|%,ticks.perSecondHandled|messages handled per second,ticks.ageSecondHalf|age when handled in 2nd half|ms,frames.mainQueueMs.p95|frame's queue wait p95|ms,eventLatency.KEY_PRESSED.p50|key EventLatency p50|ms"></table>
+      </div>
+    </div>
+    <p><b>The distractors I ruled out.</b> "The key waits behind the messages": dispatched after 1 ms. "<code>EventLatency</code> will show it": the key's is <em>shorter</em> in the broken trace than in the repaired one (table), because it ends at the first frame after the key, which the scheduler protects; it does not see the rows. "Optimize <code>formatCell</code>": that would raise the knee, and the next increase in message rate brings the complaint back; the unit of work is wrong, not its price.</p>
+    <p><b>Limits.</b> One recording with two key presses; the second (at 450 ms) repeats the pattern. With regular-table the table stays in place until redrawn, so what a user sees of the drag is the thumb plus rows at 30 to 60 per second; with a design whose rows move with the scroller the contrast would look different.</p>
+  </details>
+  <ul class="add" hidden>
+    <li data-kind="measured">c-8: main thread 94 % busy with a 4.7 ms task per message (ρ ≈ 2). After a key: one BeginMainFrame at HIGHEST priority within 1.4 ms, then one per ~100 ms at VERY_HIGH; three scroll events per Page Down. During a drag: every BeginMainFrame at HIGHEST, waiting ≤ 5 ms.</li>
+    <li data-kind="read">The compositor queue's priority follows the use case: highest for a discrete input response and a main-thread gesture (main_thread_scheduler_impl.cc:2931–2938).</li>
+    <li data-kind="rejected">"Page Down scrolls on the main thread, the drag on the compositor": both offsets move on the compositor (has_compositor_animation); the difference is the priority of the main thread's frames.</li>
+    <li data-kind="measured">The key's EventLatency is no worse in the saturated trace than in the repaired one: it ends at the first frame, not at the rows.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Eight diagnoses. What did they have in common, and where did my own designs go wrong?</p>
+</section>
+
+<section class="step" data-part="B · Eight cases" data-title="Debrief: what the eight had in common" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>Which moves of the routine did the work, and which habits would have misled me?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>I put the eight side by side by the branch of the tree they took, with the six first-look numbers of step 2. Open the table only after your eighth answer: its labels give the mechanisms away.</p></div></div>
+  <details class="dx"><summary>The eight cases side by side (contains the answers)</summary>
+    <table class="mtable" data-rows="c-1,c-2,c-3,c-4,c-5,c-6,c-7,c-8" data-names="1 · wheel blocked on main,2 · line at the backend,3 · message backlog on main,4 · frame too big for the CPU,5 · layout forced per column,6 · raster holds back the rows,7 · network stall and burst,8 · saturated main and scheduler priorities" data-head="Case" data-cols="frames.mainFrameMs.p50|main frame p50|ms,frames.mainQueueMs.p95|queue wait p95|ms,threads.mainUtilPct|main busy|%,main.longTasks|tasks ≥ 50 ms,main.maxTaskMs|longest task|ms,frames.partial|vsyncs without main,frames.dropped|vsyncs dropped"></table>
+    <table class="guide">
+      <tr><th>Case</th><th>Branch</th><th>Unit of work</th><th>The reading that decided it</th></tr>
+      <tr><td>1</td><td>held</td><td>one wheel event</td><td>the acknowledgement's time and its <code>ack</code> value</td></tr>
+      <tr><td>2</td><td>waiting (reply)</td><td>one request</td><td>wait before service against service time</td></tr>
+      <tr><td>3</td><td>held by a flood</td><td>one message</td><td>the slope of age; sent against handled per second</td></tr>
+      <tr><td>4</td><td>busy</td><td>one frame (cells × cost)</td><td>frame duration with no queue wait; a control's unit cost</td></tr>
+      <tr><td>5</td><td>busy, not late</td><td>one column</td><td>layouts per frame against a sibling</td></tr>
+      <tr><td>6</td><td>waiting (raster)</td><td>one tile</td><td>commit → activation; scroll offset against rows</td></tr>
+      <tr><td>7</td><td>waiting (network)</td><td>one message, then one render</td><td>gap in arrivals while the sender continues; units counted in the burst</td></tr>
+      <tr><td>8</td><td>held by a flood</td><td>one message</td><td>queue wait and priority of BeginMainFrame, per input</td></tr>
+    </table>
+    <p>Frame colours decided none of them. In cases 2 and 5 the frame numbers are clean; in case 6 half the vsyncs are "without main" and no frame is slow; in cases 3 and 8 frames are missing because the thread is full, which the queue wait says directly.</p>
+  </details>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Without naming cases: in three of the eight a thread's work was too big or was held by other work; in three the page was waiting for something off the main thread; and in three (one of them counted twice) a queue had ρ above 1 and no single unit was slow. In five, the decisive reading was a <b>rate or a count compared with a control</b> (per second, per frame, per event), not a duration.</p>
+    <p>Twice my own design note was wrong about the mechanism and the trace corrected it, and three cases did not show their problem at all on first recording. Step 15 uses those as study-design material.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the routine's first four moves put each case on the right branch; naming the unit of work and counting it found the mechanism.</p>
+    <p><b>No:</b> that eight cases cover the space. All are single causes in a lab page whose code you can read; none involves a memory leak, a worker, a third-party script, or two causes at once.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Pick the case you got most wrong and redo it from <code>q.mjs c-N summary</code> alone, covering the diagnosis. Then open its control with the same commands. Expected: the one number you chose in step 1 differs by a factor you can state, and you can say which knob produced it.</div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">In five of eight cases the deciding evidence was a rate or count against a control; in none was it the colour of the frame boxes.</li>
+    <li data-kind="inferred">Three shapes cover the eight: a unit that is too big or held, a wait off the main thread, and a queue with ρ > 1 in which no unit is slow.</li>
+  </ul>
+  <p class="next" data-answer="cases"><b>Next question →</b> Outside a clinic nobody hands you eight candidates. What does a trace pattern usually mean?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · Field guide" data-title="When the main thread is working: pattern → cause → confirmation" data-node="frame js layout paint raster"
+  data-ask="trust|How far can a single headless recording be trusted, and what did the instruments themselves change?">
+  <p class="holding"><span class="label">Question I hold</span><span>I see a pattern in a trace of a page I do not know. What is the likely cause, how do I confirm it, and where in the course is it worked through?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>I collect the patterns that the course's traces actually show, one row each, with a scenario that exhibits it and one bound number from that scenario. "Likely" means: this is what it was in these recordings. The confirmation column is the move that separates it from its nearest look-alike. This step covers a thread that is working; the next, a page that is waiting.</p></div></div>
+  <table class="guide">
+    <tr><th>What you see in the trace</th><th>Likely cause</th><th>How to confirm</th><th>Seen in · taught in</th></tr>
+    <tr><td>Main frames longer than one interval, queue wait near zero; rows change every 2nd or 3rd vsync</td><td>The frame's own work is too big (cells × cost per cell)</td><td>Open one <code>BeginMainFrame</code>; divide by cells. The thread's utilisation <em>falls</em> once a vsync is missed</td><td><code>f-budget-250</code>: main frame p50 <b data-m="f-budget-250/frames.mainFrameMs.p50"></b> ms · <a href="frames.html">Module 2</a></td></tr>
+    <tr><td>Short main frames with a long queue wait; one task of 50 ms or more</td><td>Something unrelated holds the thread</td><td><code>frames.mainQueueMs</code> against <code>mainFrameMs</code>; name the task with <code>tree</code></td><td><code>f-longtask-tanstack</code>: wait up to <b data-m="f-longtask-tanstack/frames.mainQueueMs.max"></b> ms · <a href="frames.html">Module 2</a></td></tr>
+    <tr><td>Thread near 100 % busy, no long task, a main frame exactly every 100 ms</td><td>A flood of short tasks, ρ &gt; 1; frames admitted by the starvation rule</td><td>Count tasks per queue (<code>taskQueues</code>); compare arrivals and completions per second</td><td><code>s-msg-8000-regular</code>: <b data-m="s-msg-8000-regular/threads.mainUtilPct"></b> % busy, longest task <b data-m="s-msg-8000-regular/main.maxTaskMs"></b> ms · <a href="streaming.html">Module 7</a></td></tr>
+    <tr><td>Most vsyncs "without the main update", main frames of 1 ms</td><td>Not lateness: the BeginMainFrame is sent before the draw (a compositor-animated scroll, separate wheel notches)</td><td>Main-frame duration and queue wait are small; the scheduler's deadline mode</td><td><code>f-click-tanstack</code>: <b data-m="f-click-tanstack/frames.partial"></b> such vsyncs, main frame p50 <b data-m="f-click-tanstack/frames.mainFrameMs.p50"></b> ms · <a href="frames.html">Module 2</a></td></tr>
+    <tr><td>A clean Frames track in DevTools although rows are visibly late</td><td>DevTools marks only frames of tracked smooth effects</td><td>Read <code>PipelineReporter</code> states and main-frame lifetimes instead</td><td><code>f-slow-tanstack</code>: <b data-m="f-slow-tanstack/frames.partial"></b> vsyncs without main, <b data-m="f-slow-tanstack/frames.devtoolsPartial"></b> marked · <a href="frames.html">Module 2</a></td></tr>
+    <tr><td>Many <code>Layout</code> slices under JavaScript within one event; layouts ≫ frames</td><td>A layout read after each write, in a loop</td><td>Layouts per frame against a sibling; the dirty-object count of each</td><td><code>r-thrash-tanstack</code>: <b data-m="r-thrash-tanstack/main.layouts"></b> layouts for <b data-m="r-thrash-tanstack/main.scrollEvents"></b> scroll events · <a href="rendering.html">Module 5</a></td></tr>
+    <tr><td>Exactly one forced layout per scroll event; layout count and time unchanged</td><td>The frame's own layout, done early by a read at the start of a second listener</td><td>Remove the second reader: the layout moves into the lifecycle, the total stays</td><td><code>r-two-virtualizers</code>: <b data-m="r-two-virtualizers/main.forcedLayouts"></b> forced, <code>r-one-virtualizer</code>: <b data-m="r-one-virtualizer/main.forcedLayouts"></b> · <a href="rendering.html">Module 5</a>, <a href="anatomy.html">Module 3</a></td></tr>
+    <tr><td>Style recalculated for every element of the table on every scrolled frame</td><td>An inherited property written on an ancestor each step</td><td><code>UpdateLayoutTree</code>'s <code>elementCount</code> per frame against cells changed</td><td><code>j-cells-L-regular</code>: <b data-m="j-cells-L-regular/main.styleElements"></b> elements restyled over the scroll · <a href="rendering.html">Module 5</a></td></tr>
+    <tr><td>Script dominated by one function that runs once per cell</td><td>Per-cell cost, classically a formatter constructed per call</td><td><code>prof</code> by self time; our measure per draw ÷ cells</td><td><code>j-fmt-newintl</code> <b data-m="j-fmt-newintl/app.data listener.p50"></b> ms per draw, <code>j-fmt-intl</code> <b data-m="j-fmt-intl/app.data listener.p50"></b> ms · <a href="javascript.html">Module 4</a></td></tr>
+    <tr><td>Layout and paint per frame grow with scroll speed in one design and are flat in another</td><td>Reuse policy: keyed rows touch only entering rows; positional pools rewrite every cell</td><td>Dirty objects per <code>Layout</code>; cells written per draw</td><td>layout over the scroll: <code>j-speed-2400-keyed</code> <b data-m="j-speed-2400-keyed/main.layoutMs"></b> ms, <code>j-speed-2400-positional</code> <b data-m="j-speed-2400-positional/main.layoutMs"></b> ms · <a href="javascript.html">Module 4</a></td></tr>
+    <tr><td>Frequent <code>MinorGC</code> slices, each short</td><td>Short-lived allocation per draw; usually cheap, occasionally the frame that misses</td><td>GC count against draws; <code>main.gcMs</code> against script time before blaming it</td><td><code>j-gc-4096</code>: <b data-m="j-gc-4096/gc.minor"></b> scavenges, <b data-m="j-gc-4096/main.gcMs"></b> ms in all · <a href="javascript.html">Module 4</a></td></tr>
+    <tr><td>Raster worker time far above main-thread time; rows presented two intervals after their vsync; nothing flagged missing</td><td>Expensive pixels: the pending tree waits for raster</td><td>Commit → <code>ActivateSyncTree</code>; the same scroll with plain cells</td><td><code>r-paint-heavy-tanstack</code>: raster <b data-m="r-paint-heavy-tanstack/raster.ms"></b> ms against <b data-m="r-paint-plain-fast/raster.ms"></b> ms plain · <a href="rendering.html">Module 5</a></td></tr>
+    <tr><td>Wheel acknowledged <code>NOT_CONSUMED</code> late; scroll state <code>main_thread</code></td><td>A non-passive wheel (or touch) listener</td><td>Follow one wheel: forwarded → acknowledged → scrolled</td><td><code>r-wheel-blocking</code>: scroll begin p50 <b data-m="r-wheel-blocking/eventLatency.GESTURE_SCROLL_BEGIN.p50"></b> ms, <code>r-wheel-passive</code> <b data-m="r-wheel-passive/eventLatency.GESTURE_SCROLL_BEGIN.p50"></b> ms · <a href="rendering.html">Module 5</a></td></tr>
+    <tr><td>One task of hundreds of ms with many forced layouts and a single presented frame</td><td>A script-driven loop (often a benchmark) that never yields to a frame</td><td>Count presented frames against iterations; find what the reported number counts</td><td><code>u-rt-bench-loop</code>: one task of <b data-m="u-rt-bench-loop/main.maxTaskMs"></b> ms, <b data-m="u-rt-bench-loop/frames.all"></b> frame with content · <a href="showcases.html">Module 10</a></td></tr>
+  </table>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> each row is a pattern that occurred in a named recording with the cause shown there.</p>
+    <p><b>No:</b> that the pattern implies the cause elsewhere. Rows 6 and 7 look alike in a flame chart and differ only in a count; rows 1 and 3 can both show "frames without main". The third column is the part to use.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node harness/analyze.mjs --print r-</code> prints one line per rendering scenario with frames, utilisation, category times, long tasks, forced layouts and raster. Expected: the <code>forced</code> column singles out <code>r-autosize-reset</code> and <code>r-thrash-tanstack</code>, the <code>raster</code> column the two <code>r-paint-heavy</code> traces, and nothing else in the line would.</div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Field guide, working thread: fourteen patterns, each tied to a recorded scenario and a confirming move; look-alikes are separated by a count against a control, not by the flame chart's shape.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> And when the main thread is idle and the user is still unhappy?</p>
+</section>
+
+<section class="step" data-part="C · Field guide" data-title="When the page is waiting: pattern → cause → confirmation" data-node="network backend present">
+  <p class="holding"><span class="label">Question I hold</span><span>The main thread is idle or nearly so. What is the page waiting for, and how do I tell a normal wait from a problem?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>The same table for branch 5b of the routine. The backend's lanes and counters exist because the lab's server writes its own events on the trace's clock (<a href="backend.html">Module 6</a>); without them most of these rows could only be inferred from the page's side.</p></div></div>
+  <table class="guide">
+    <tr><th>What you see in the trace</th><th>Likely cause</th><th>How to confirm</th><th>Seen in · taught in</th></tr>
+    <tr><td>Round trips grow during an interaction; service time flat; a queue counter climbs</td><td>Open-loop requests against a server with fixed capacity (ρ &gt; 1)</td><td>Wait before service against service time; requests per second against completions</td><td><code>b-drag-every-tanstack</code>: line up to <b data-m="b-drag-every-tanstack/backend.queueMax"></b>, wait up to <b data-m="b-drag-every-tanstack/ws.serverWait.max"></b> ms · <a href="backend.html">Module 6</a></td></tr>
+    <tr><td>A reply handled late although the server was fast and no queue formed</td><td>The reply's task waits behind the main-thread task that sent the request (style, layout, paint of the placeholders)</td><td>Server done → <code>onmessage</code>; what the main thread ran in between</td><td><code>b-window-drag-tanstack</code>: service <b data-m="b-window-drag-tanstack/ws.serverService.p50"></b> ms, round trip p50 <b data-m="b-window-drag-tanstack/ws.roundTrip.p50"></b> ms · <a href="backend.html">Module 6</a></td></tr>
+    <tr><td>Round trip ≈ twice a constant; no wait at the server; rows right one round trip after the scroll stops</td><td>Network delay</td><td><code>upMs</code> and <code>downMs</code> equal and constant</td><td><code>n-lat-500-tanstack</code>: round trip p50 <b data-m="n-lat-500-tanstack/ws.roundTrip.p50"></b> ms · <a href="network.html">Module 8</a></td></tr>
+    <tr><td><code>downMs</code> large with near-zero service; bytes queued in the proxy; a small reply stuck behind a large one</td><td>Bandwidth and head-of-line blocking on one ordered connection</td><td>Reply bytes ÷ link rate ≈ the wait; order of sends against order of arrivals</td><td><code>n-hol-regular</code>: down p50 <b data-m="n-hol-regular/ws.downMs.p50"></b> ms · <a href="network.html">Module 8</a></td></tr>
+    <tr><td>Age of pushed values grows steadily while the main thread is idle; hundreds of kilobytes queued in the proxy</td><td>The link is slower than the stream</td><td>Bytes per second sent against link rate; the same with conflation</td><td><code>n-bw-256-ticks</code>: age on screen p95 <b data-m="n-bw-256-ticks/ticks.ageOnScreen.p95"></b> ms; conflated <b data-m="n-bw-256-conflate/ticks.ageOnScreen.p95"></b> ms · <a href="network.html">Module 8</a></td></tr>
+    <tr><td>A gap in arrivals while the sender continues, then a burst whose oldest message is as old as the gap</td><td>A stall on an ordered stream</td><td>Sender's spans against the page's message marks; count the work units in the burst</td><td><code>n-stall-msg-regular</code>: oldest value <b data-m="n-stall-msg-regular/ticks.ageWhenHandled.max"></b> ms · <a href="network.html">Module 8</a></td></tr>
+    <tr><td>Values handled within a millisecond of being sent, on screen 8 to 25 ms later</td><td>Nothing wrong: waiting for the next vsync, plus the pipeline's constant</td><td>Age when handled against age on screen; the latter does not depend on the rate</td><td><code>s-msg-2000-tanstack</code>: handled p50 <b data-m="s-msg-2000-tanstack/ticks.ageWhenHandled.p50"></b> ms, on screen p50 <b data-m="s-msg-2000-tanstack/ticks.ageOnScreen.p50"></b> ms · <a href="streaming.html">Module 7</a></td></tr>
+    <tr><td>Far fewer applies than messages; applies ≈ frames; thread has slack at a rate that floods a per-message design</td><td>Per-frame application (or conflation in a worker or on the server) is working</td><td><code>ticks.applies</code> against <code>ticks.messages</code> and against frames</td><td><code>s-raf-8000-regular</code>: <b data-m="s-raf-8000-regular/ticks.applies"></b> applies for <b data-m="s-raf-8000-regular/ticks.messages"></b> messages · <a href="streaming.html">Module 7</a></td></tr>
+    <tr><td>Draws clearly fewer than updates, none inside an animation frame, spacing that tracks the draw time</td><td>A library's own throttle between engine and table (Perspective's viewer)</td><td>Draws per second against updates; where the draw starts (a timer, not rAF)</td><td><code>x-stream-worker-1000</code>: <b data-m="x-stream-worker-1000/main.rafCallbacks"></b> rAF callbacks in two seconds of 1,000 updates a second · <a href="perspective.html">Module 9</a>, <a href="anatomy.html">Module 3</a></td></tr>
+    <tr><td>Rows blank during a scroll with every round trip fast</td><td>An all-or-nothing read of the window: one missing row keeps the arrived rows hidden</td><td>Our <code>content complete</code> marks against replies; draws with <code>filled: false</code></td><td><code>b-scroll-fast-ws-tanstack</code>: <b data-m="b-scroll-fast-ws-tanstack/content.completeMarks"></b> complete marks in a two-second scroll, round trip p95 <b data-m="b-scroll-fast-ws-tanstack/ws.roundTrip.p95"></b> ms · <a href="backend.html">Module 6</a></td></tr>
+    <tr><td>A benchmark reports 60 fps; the frame records agree; the list was empty</td><td>The reported number counts a clock (rAF, draw calls) that is not "right rows on screen"</td><td>Find the line that increments the number; add a mark for content at the presentation point</td><td><code>u-tv-bench-drive</code>: <b data-m="u-tv-bench-drive/frames.all"></b> vsyncs presented with a main update; 89 of 91 written positions had no rendered row (Module 10's count) · <a href="showcases.html">Module 10</a></td></tr>
+  </table>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> an idle main thread narrows the search to a short list: a reply, the network, raster, the next vsync, a throttle.</p>
+    <p><b>No:</b> that an idle thread is innocent. In the second row the wait is on the main thread after all, in a task the page itself started; "idle on average" hid it.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Half of these rows are readable only because the server stamped receive, start and done on the client's clock. Proposal: Tablelab's wire protocol carries those three engine timestamps (and the data's version time) on every reply and patch from the start, on a clock whose alignment with the viewer's is documented. Without them the field guide's "how to confirm" column is empty for anything behind the socket.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node harness/q.mjs n-hol-regular marks 'ws round trip'</code>. Expected: four round trips of about 280 to 400 ms, and in each one's detail <code>srvRecv</code>, <code>srvStart</code> and <code>srvDone</code> within some 20 µs of each other: the server took no time, the whole round trip is the way back.</div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Field guide, waiting page: eleven patterns; each is confirmed by splitting a wait into its hops (up, queue, service, down, main-thread queue, vsync) rather than by its total.</li>
+    <li data-kind="inferred">Without server-side timestamps on the client's clock, most waits behind the socket can only be inferred.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Every row above rests on a recording somebody designed. How were they designed, and how did my own go wrong?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · How these studies were designed" data-title="One question, one knob, a yardstick fixed in advance" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>What makes a recording answer a question, instead of being a trace one stares at?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>I read three entries of <code>lab/harness/scenarios.mjs</code> as designs rather than as configuration, and extract what they have in common. Then I confront the rules with what happened to my own eight cases.</p></div></div>
+<pre class="wrap">for (const us of [0, 50, 150, 250, 600])
+  add(`f-budget-${us}`, <mark>`Each visible cell costs ${us} µs to format: what happens to frames as a draw crosses 16.7 ms?`</mark>,
+      grid({ lib: "regular", <mark>formatUs: us</mark> }, [scroll(2400), ["wait", 700]], …));
+
+for (const wheel of ["none", "passive", "blocking"])
+  add(`r-wheel-${wheel}`, `A wheel listener (${wheel}) while the main thread is busy 100 ms out of every 150: who waits for whom?`,
+      grid({ lib: "tanstack", <mark>wheel</mark> }, [["eval", "window.__lab.jank(150, 100)"], ["wait", 200], ["wheel", { n: 30, every: 33 }], ["wait", 700]], …));
+
+for (const policy of ["every", "inflight", "cancel"])
+  add(`b-drag-${policy}-tanstack`, `A thumb drag against a backend that serves one 40 ms query at a time, request policy "${policy}": how long is the line?`,
+      grid({ lib: "tanstack", source: "ws", serverMs: 40, conc: 1, <mark>policy</mark> }, [["drag", { dy: 150, ms: 900 }], ["wait", 2500]], …));</pre>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>One question per scenario</b>, written as a sentence a person would ask (the <code>asks</code> string; it travels into the trace's metadata). A scenario without a question produces a trace without a reading order.</p>
+    <p><b>Control and treatment differ in one knob</b> (highlighted): a loop variable. Everything else, including the input, is the same expression. The control is recorded in the same session, by the same harness, with the same instruments on.</p>
+    <p><b>A yardstick fixed before looking.</b> The question names its measure: "as a draw crosses 16.7 ms", "who waits for whom", "how long is the line". If the number is chosen after seeing the trace, any trace confirms something.</p>
+    <p><b>Inputs are real browser input events at a controlled speed.</b> The harness sends them through the DevTools protocol's Input domain (<code>record.mjs:77–80</code>): the browser process dispatches them as device events, so the compositor, the input queues and the scheduler's use cases take part. A scroll written to <code>scrollTop</code> from script exercises a different path (Module 10 shows how different). Each <code>scroll(speed)</code> in the scenarios is two one-second gestures back to back, about two seconds of scrolling.</p>
+    <p><b>Observation points are named.</b> "Done" is one of: DOM written (the end of our measure), animation frame, commit, presented. The harness marks "content complete" in the DOM and the analysis finds the frame that presented it (<code>analyze-lib.mjs:375–381</code>); a number without its point is not comparable (Module 2).</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed a scenario's label. Three of my eight cases, as first recorded, did not contain the problem their design note described, and I only knew because I diagnosed them blind before writing.</p>
+    <details><summary>Which three, and why (contains answers to cases 2, 3 and 8)</summary>
+      <p><b>Case 2</b> was a drag of 60 mouse moves in 1.5 s against a 25 ms server: 40 requests a second against a capacity of 40. ρ = 1.0; the line never exceeded one request and the longest wait was 24 ms. I raised the moves to 90 (60 a second, ρ = 1.5).</p>
+      <p><b>Case 3</b> sent 6,000 messages a second, chosen because another recording of that panel saturated near 6,000. In its own recording the panel served 6,018 a second and age <em>fell</em> from 23 to 6 ms over the run. At 7,000 the capacity that day was 6,740: ρ = 1.04, a slope too small to call "more and more". I settled on 9,000. Three saturated recordings of this one panel served about 5,150, 6,030 and 6,740 messages a second.</p>
+      <p><b>Case 8</b> sent 3,000 messages a second to a small table: 33 % of the main thread, and Page Down answered in a frame. Making it saturate by rate alone would have meant a trace several times the size, so the final case makes each draw cost 4 ms and sends 400 a second. Its first attempt at saturating from page load could not be recorded at all: the harness's own setup calls queued behind the backlog and timed out, so the load is now switched on inside the recording.</p>
+      <p>The rule I keep: a scenario's name is a hypothesis about what the trace contains. Before teaching from a recording, compute its ρ (or its frame time, or its wait) from the trace itself; and design overload with a margin that survives a 30 % move of the knee.</p>
+    </details>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a pair of recordings that differ in one knob, with the measure named beforehand, supports "this knob changes this number here".</p>
+    <p><b>No:</b> that the effect size transfers. A knob's effect depends on where the other knobs stand: a formatter that costs 8 ms per frame at a quarter of the CPU speed costs 2 ms at full speed, and matters only if the frame was near its budget.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node harness/record.mjs --list | grep '^b-drag'</code>. Expected: five lines; for each, say the one knob in which it differs from <code>b-drag-every-tanstack</code> and the number you would compare. (For <code>b-drag-regular</code> the knob is the library, which changes the request policy with it: not a one-knob pair, and Module 6 treats it as its own case.)</div>
+  <ul class="add" hidden>
+    <li data-kind="read">A scenario is a question (asks), a page query, an input script and optional throttles; pairs are generated by a loop over one knob (scenarios.mjs: f-budget, r-wheel, b-drag).</li>
+    <li data-kind="measured">Three of eight clinic cases did not show their designed problem when first recorded (ρ = 1.0; ρ just under 1; 33 % utilisation). One panel, saturated, served about 5,150, 6,030 and 6,740 messages a second in three recordings.</li>
+    <li data-kind="rejected">"The scenario's label says what the trace contains": it says what the author expected.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The capacity of one page moved by 30 % between recordings. How much do the instruments and plain repetition move the numbers?</p>
+</section>
+
+<section class="step" data-part="D · How these studies were designed" data-title="The instrument's own cost, run-to-run spread, and what one run can establish" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>Which differences between two traces are too small to mean anything, and which conclusions does a single headless run never support?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The same scenario is recorded ten times in a row. Which of these moves least from run to run?</p>
+    <div class="opts"><button data-k="a">Total script milliseconds</button><button data-k="b">The count of frames per outcome</button><button data-k="c">The longest task</button></div>
+    <div class="reveal"><p>The counts. In the ten runs below, vsyncs "without main" are identical in every run; totals of script and layout vary by about a quarter; the longest task by a factor of two and a half. Counts and ratios are the robust readings; maxima of single events are the fragile ones.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div><p>Module 2 measured the instruments; I collect its three controls here as rules for comparing any two traces, and add one of my own from the flood traces.</p></div></div>
+  <table class="mtable runs" data-runs="f-variance" data-cols="main.scriptMs|script|ms,main.layoutMs|layout|ms,threads.mainUtilPct|main busy|%,main.maxTaskMs|longest task|ms,frames.partial|vsyncs without main"></table>
+  <table class="mtable" data-rows="f-marks-on,f-marks-off" data-names="scroll · with our marks and measures,scroll · marks=0" data-head="Trace" data-cols="main.scriptMs|script|ms,threads.mainUtilPct|main busy|%,frames.mainFrameMs.p50|main frame p50|ms"></table>
+  <table class="mtable" data-rows="s-msg-8000-regular,s-quiet-msg-8000-regular" data-names="message flood · with marks,message flood · marks=0" data-head="Trace" data-cols="taskQueues.FRAME_LOADING_TQ.n|message tasks run,windowMs|window|ms,threads.mainUtilPct|main busy|%,main.scriptMs|script|ms"></table>
+  <div class="prof" data-prof="s-msg-8000-regular" data-top="4" data-by="self"></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Repetition.</b> Ten runs of one scroll: outcome counts identical, script and layout totals within a factor of about 1.25. A difference of 20 % in a total between two single recordings is inside the spread; Module 2 found that <em>ratios within a run</em> (script ÷ paint) vary two to four times less than totals.</p>
+    <p><b>Our own marks.</b> In a scroll, a measure and a mark per frame accounted for about a third of the (small) script time in one pair of runs. In the flood they decide the result: with marks the panel completed about 6,230 message tasks a second, with <code>marks=0</code> about 8,140 (tasks ÷ window in the second table), and the sampled profile above puts <code>measure</code> first by a wide margin. Instrumentation that is negligible per frame is not negligible per message. The clinic's case 3 inherits this.</p>
+    <p><b>Trace categories.</b> Module 2's five-run comparison: the 0.1 ms JavaScript sampler inflates script by about 10 %, Blink's internal category inflates layout by about 15 % on a table of about 600 cells. The rendering traces (<code>r-</code>) carry that category; the others do not: compare <code>r-</code> layout totals with <code>r-</code>.</p>
+  </div></div>
+  <table class="guide">
+    <tr><th>One headless, software-raster, traced run</th><th>Can establish</th><th>Cannot establish</th></tr>
+    <tr><td>Mechanism</td><td>Which thread did what in which order; what waited for what; that an effect exists and its direction</td><td>That it is the only mechanism on a real device</td></tr>
+    <tr><td>Counts</td><td>Layouts, forced layouts, requests, messages, renders, frames per outcome</td><td>—</td></tr>
+    <tr><td>Durations</td><td>Order of magnitude; ratios within the run</td><td>Differences under about 25 % between two runs; any absolute figure for other hardware</td></tr>
+    <tr><td>Raster and presentation</td><td>That raster was the wait, in software</td><td>Anything about GPU raster, a real display's vsync, or physical latency: "presented" here is a timer in the GPU process</td></tr>
+    <tr><td>Tails</td><td>That a tail exists (one long task, one stalled frame)</td><td>Its percentile: one run has one sample of a rare event</td></tr>
+    <tr><td>Knees</td><td>That a knee exists and roughly where, with instruments on</td><td>The rate to within 30 %, or the rate without tracing</td></tr>
+  </table>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> use single traces to explain; use counts, ratios and one-knob pairs to compare; repeat runs before quoting a difference in milliseconds.</p>
+    <p><b>No:</b> that the course's numbers are benchmarks. Every bound number on these pages will change when the traces are re-recorded; the sentences around them were written to survive that.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>The ten runs are in <code>data/runs.jsonl</code>, one line per repeated scenario. From <code>lab/</code>: <code>node -e "for (const l of require('fs').readFileSync('../data/runs.jsonl','utf8').trim().split('\n')) { const r = JSON.parse(l); if (r.id === 'f-variance') console.log(r.runs.map(m =&gt; m.frames.partial + ' / ' + m.main.scriptMs).join('  ')) }"</code>. Expected: ten pairs "vsyncs without main / script ms"; the first number is the same in all ten, the second ranges from about 79 to about 100.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Ten runs of one scroll: frame-outcome counts identical; script and layout totals vary by about 1.25×; longest task by about 2.6× (f-variance).</li>
+    <li data-kind="measured">With performance.measure on, the flooded regular-table panel completed about 6,230 message tasks a second; with marks=0 about 8,140 (s-msg-8000-regular, s-quiet-msg-8000-regular).</li>
+    <li data-kind="inferred">Counts and within-run ratios are comparable between single recordings; totals within about 25 %, maxima and knees are not.</li>
+  </ul>
+  <p class="next" data-answer="trust"><b>Next question →</b> The course did not ask every question Tablelab has. How do I add one?</p>
+</section>
+
+<section class="step" data-part="D · How these studies were designed" data-title="Adding a scenario: a worked design for a question the course did not ask" data-node="method js frame">
+  <p class="holding"><span class="label">Question I hold</span><span>Tablelab's Pass 1 asks: does bounding <em>notifications</em> remove the backlog while every <em>mutation</em> is kept? Can the lab answer it, and what would the experiment look like?</span></p>
+  <div class="predict" data-right="x"><span class="label">Predict first</span>
+    <p>9,000 one-cell messages a second into the regular-table panel. Every message is parsed and stored (the mutation); the table is asked to draw once per frame (the notification). Does data age still grow?</p>
+    <div class="opts"><button data-k="a">Yes: parsing 9,000 messages is already too much</button><button data-k="b">No: the backlog was the draws, not the messages</button><button data-k="c">It depends on the cell count per message</button></div>
+    <div class="reveal"><p>No recording of this exists yet, so there is no right button. My prediction, with its basis, is below; hold yours against the result when you run it.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The four steps for any new scenario: an entry in <code>lab/harness/scenarios.mjs</code> (or a module's file in <code>harness/extra/</code>) → <code>node harness/record.mjs ID</code> → <code>node harness/analyze.mjs</code> → <code>node harness/q.mjs ID summary</code>. The design work is before the first of them. I write it out for the Pass 1 question as a <b>proposal: nothing below has been recorded.</b></p>
+    <p><b>1 · The question, as one sentence.</b> "At a message rate that floods a draw-per-message page, does one draw request per frame remove the growth of data age while every message is still applied to the model?"</p>
+    <p><b>2 · Map the question's words onto knobs, by reading the code.</b> In <code>ticks.ts</code> a message always updates <code>overlay</code>, the latest value per cell (lines 74–77): that is the mutation, and it is not skipped in any mode. <code>apply=msg</code> then calls the table at once (line 81); <code>apply=raf</code> calls it once per animation frame with the cells that changed (lines 82–88). So <code>msg → raf</code> is notification coalescing with mutations kept. <code>conflate=16</code> makes the <em>server</em> merge updates before sending: data conflation, a different thing, which also removes parse work. Three arms, two knobs; the pair that answers the question is the first two.</p>
+    <p><b>3 · Invariants that make the arms comparable.</b> Same panel, rate, span and seed. "Every mutation kept" must be checked, not assumed: the page's snapshot counts <code>ticks.messages</code>, <code>lastSeq</code> and <code>gaps</code> (<code>ticks.ts:72–73</code>); the arm is valid if <code>messages = lastSeq</code> and <code>gaps = 0</code>, and the final cell texts equal the last value sent (a check the lab lacks today).</p>
+    <p><b>4 · The yardstick, before looking.</b> Primary: the slope of age when handled, <code>ticks.ageSecondHalf − ticks.ageFirstHalf</code>; "no backlog" means it is zero within a few milliseconds. Secondary: <code>threads.mainUtilPct</code> (headroom), <code>ticks.applies</code> against frames, and drain time: from the server's last <code>produce + send</code> span to the last <code>tick message</code> mark.</p>
+  </div></div>
+<pre class="wrap"><span class="c">// proposal for lab/harness/extra/streaming.mjs — not recorded</span>
+const arms = { notify: { apply: "msg" }, coalesce: { apply: "raf" }, conflate: { apply: "msg", conflate: 16 } };
+for (const [arm, q] of Object.entries(arms))
+  scenarios.push({
+    id: `s-pub-${arm}`,
+    asks: "9000 messages a second into regular-table for 1.5 s, then silence: does data age grow, and how long is the drain? (" + arm + ")",
+    query: { lib: "regular", hz: 9000, span: 12, n: 1, ...q },
+    actions: [["wait", 1500], ["eval", "window.__lab.setRate(0)"], ["wait", 2500]],
+    zero: "start", endTimeoutMs: 20000,
+  });</pre>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p><b>Prediction, and its basis.</b> The course already holds two of the three arms at 8,000 messages a second on this panel: per message, age in the second half of the run is <b data-m="s-msg-8000-regular/ticks.ageSecondHalf"></b> ms and growing; per frame it is <b data-m="s-raf-8000-regular/ticks.ageSecondHalf"></b> ms with the thread <b data-m="s-raf-8000-regular/threads.mainUtilPct"></b> % busy. From that utilisation the per-message cost without a draw is about 0.05 ms, so I expect the <code>coalesce</code> arm at 9,000 to sit near 43 % with no slope, and the same design to reach its own knee near 20,000 messages a second. I expect <code>conflate</code> to be far lower still, because it also removes the parses. What the existing pair does not have is the drain phase, the invariant check and the third arm on the same panel.</p>
+    <p><b>A trap I already walked into.</b> Under saturation the harness's <code>eval</code> waits its turn behind the backlog (case 8's first recording). In the <code>notify</code> arm the <code>setRate(0)</code> will therefore land late; drain time must be measured from the server's last send in the trace, as defined above, not from the action's scheduled time.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes, today:</b> that per-frame notification removed the backlog at 8,000 a second in one recording of this lab page.</p>
+    <p><b>No:</b> that this answers Pass 1. The lab's "model" is a JavaScript map and its notification a function call; Tablelab's engine publishes versions across a socket, and its question includes version progress and mixed-version viewports, which the lab does not model. The experiment above is the browser-side half.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal for Pass 1's own harness: adopt the same three-arm shape and the same primary yardstick (slope of age, then drain time after the producer stops), and record the engine's commit count next to the view's applied count so that "every mutation kept" is an assertion in the run, not a property claimed of the design.</p></div>
+  <div class="try"><span class="label">Try it</span>If you record it (one recording at a time, on a quiet machine): <code>cd lab &amp;&amp; node harness/record.mjs s-pub &amp;&amp; node harness/analyze.mjs --print s-pub</code>, then <code>node harness/q.mjs s-pub-coalesce summary | grep age</code>. Expected if the prediction holds: <code>ageFirstHalf</code> and <code>ageSecondHalf</code> both under a millisecond in the coalesce arm and hundreds of milliseconds apart in the notify arm. If they are not, the prediction is wrong, and that is the more interesting result.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">In the lab every message updates the latest-value overlay in all modes (ticks.ts:74–77); apply=msg notifies the table per message (81), apply=raf once per frame (82–88): msg → raf is notification coalescing with mutations kept; conflate=N is server-side data conflation.</li>
+    <li data-kind="inferred">Proposed, not recorded: three arms (notify, coalesce, conflate) at 9,000 messages a second with a drain phase; yardstick fixed as the slope of age when handled, then drain time; predicted no slope and about 43 % utilisation for coalesce.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> All of this was Chrome. Tablelab will also paint with Blitz and perhaps its own GPU renderer. What survives the move?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · What carries to another renderer" data-title="Chrome's machinery, and the general problems underneath it" data-node="compositor frame raster method">
+  <p class="holding"><span class="label">Question I hold</span><span>If I delete every Chromium class name from what I learned, what is left?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Which of these facts from the cases would still be true in a single-threaded native renderer with no compositor thread?</p>
+    <div class="opts"><button data-k="a">A scroll keeps moving while the table's code is busy</button><button data-k="b">A frame is admitted every 100 ms under a message flood</button><button data-k="c">When messages arrive faster than they are handled, data age grows without bound</button></div>
+    <div class="reveal"><p>Only the third. The first is the compositor thread's doing and the second is one constant in Blink's scheduler. The third is arithmetic about any single server and its queue.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div><p>I sort what the eleven modules established into two lists. The first is Chrome's: true because of how Chromium is built, and to be re-derived, not assumed, anywhere else.</p></div></div>
+  <table class="guide">
+    <tr><th>Chrome's</th><th>What it gave us in the traces</th><th>Elsewhere</th></tr>
+    <tr><td>A compositor thread that scrolls and animates ahead of the main thread</td><td>Scroll position on time while rows are late (cases 4, 6, 8); "frames without main"</td><td>A design decision each renderer makes or does not. Tablelab's view core scrolls in whole rows and owns the offset (<code>notes/04-view-core.md</code>): there is no second thread to hide a slow draw</td></tr>
+    <tr><td>Main-thread task queues with priorities and use cases; the 100 ms starvation rule</td><td>Case 8's whole diagnosis; the 10 fps floor of cases 3 and 8</td><td>Absent unless built. A native loop gets exactly the fairness its author writes</td></tr>
+    <tr><td>Mojo pipes and the WebSocket's data pipe between network service and renderer</td><td>Where a backlog sits in the browser; backpressure towards the server (Module 8)</td><td>The engine's own channel and its bound; nothing is inherited</td></tr>
+    <tr><td><code>PipelineReporter</code>, <code>EventLatency</code>, DevTools' frame marks</td><td>Per-vsync outcomes for free, with their traps (Module 2)</td><td>Must be instrumented: a frame id and an outcome per frame</td></tr>
+    <tr><td>Tiles, pending and active trees, activation gated on raster</td><td>Case 6: content held back whole rather than shown half-rastered</td><td>A renderer that draws the whole window per frame has no tiles; its analogue is the frame not being ready at the deadline</td></tr>
+    <tr><td>Passive and non-passive listeners; forced synchronous layout by a property read</td><td>Cases 1 and 5</td><td>API-shaped hazards of the DOM. A table-owned layout has no hidden "read forces layout", but can have its own measure-inside-a-loop</td></tr>
+  </table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Every row in this list is a <em>mitigation or a hazard of a general-purpose engine</em>. The compositor thread mitigates a slow main thread; the scheduler mitigates a flooded queue; tiles mitigate expensive raster; forced layout is the price of a layout engine with a synchronous query API. A specialized renderer loses the mitigations along with the hazards. That is the trade of Tablelab's Pass 4, and it is why the next list matters more.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> these six are properties of Chromium at the pinned revision, read in its source in the modules cited.</p>
+    <p><b>No:</b> that Blitz or a GPU renderer lacks analogues; I have not traced them in this course. The right-hand column is inference from Tablelab's notes, to be checked there.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Chrome-specific: compositor-thread scrolling, main-thread queue priorities and the 100 ms starvation rule, mojo and data-pipe backpressure, PipelineReporter, tile-gated activation, DOM read hazards. Each mitigates or creates a problem of a general-purpose engine.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> And the list that does carry over: which trace of this course demonstrates each item, and what would I instrument to see it in a native renderer?</p>
+</section>
+
+<section class="step" data-part="E · What carries to another renderer" data-title="What is general, and the instruments a native renderer needs" data-node="method frame raster network">
+  <p class="holding"><span class="label">Question I hold</span><span>For each general problem: where did this course show it, and what is the smallest instrument that would show it without Chrome?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>One row per item. The middle column is evidence from this course. The right column is what the native side needs in order to make the same reading: spans on one clock, a frame id, counters. Tablelab's Blitz painter already has the first (<code>tablelab-blitz --trace</code>, spans with thread CPU time, <code>notes/04-view-core.md</code>).</p></div></div>
+  <table class="guide">
+    <tr><th>General</th><th>Demonstrated here by</th><th>Instrument in a native renderer (inference)</th></tr>
+    <tr><td><b>A frame budget with a deadline inside it.</b> Work that misses the deadline costs a whole interval, and the worker then idles.</td><td><code>f-budget-150 → 250</code>: main frame p50 <b data-m="f-budget-150/frames.mainFrameMs.p50"></b> → <b data-m="f-budget-250/frames.mainFrameMs.p50"></b> ms, utilisation <b data-m="f-budget-150/threads.mainUtilPct"></b> → <b data-m="f-budget-250/threads.mainUtilPct"></b> % · case 4</td><td>A span per frame stage with a <b>frame id</b>; the deadline as an instant; per frame: made it, or missed by how much</td></tr>
+    <tr><td><b>One thread serving a queue, and ρ.</b> Above 1 the wait is (time under overload) × (ρ − 1), whatever a unit costs.</td><td><code>b-drag-every-tanstack</code> (backend), <code>s-msg-8000-regular</code> (main thread) · cases 2, 3, 8</td><td><b>Counters</b>: arrivals, completions, queue length, per queue; a timestamp at enqueue so that wait and service separate</td></tr>
+    <tr><td><b>Work proportional to changed cells, or to visible cells.</b></td><td><code>j-speed-2400-keyed</code> against <code>-positional</code>: layout <b data-m="j-speed-2400-keyed/main.layoutMs"></b> against <b data-m="j-speed-2400-positional/main.layoutMs"></b> ms · case 4's limit</td><td>Counters per frame: cells entered, cells rewritten, cells measured, cells painted. The browser's own counts (dirty objects, restyled elements) were the most useful numbers of Module 5</td></tr>
+    <tr><td><b>Text shaping and layout cost of changed text.</b></td><td>Module 5: one shaping event per rewritten cell, about 4 µs of layout per cell</td><td>A span or counter around shaping and measurement; cache hits against misses (Parley, glyph caches)</td></tr>
+    <tr><td><b>Raster cost of pixels.</b> Proportional to area and effects, not to cell count; can be a wait rather than work.</td><td><code>r-paint-heavy-tanstack</code>: <b data-m="r-paint-heavy-tanstack/raster.ms"></b> ms of raster · case 6. Tablelab's own Blitz trace: <code>render</code> 14 ms elapsed with 1.6 ms on the CPU, the rest waiting for the GPU (<code>notes/04-view-core.md</code>, 2026-11-13)</td><td>Thread CPU time next to elapsed time on every span (working or waiting); GPU time per frame from the driver's accounting; pixels drawn per frame</td></tr>
+    <tr><td><b>Data age.</b> A value's time since its source, at each observation point.</td><td><code>s-msg-2000-tanstack</code>: handled <b data-m="s-msg-2000-tanstack/ticks.ageWhenHandled.p50"></b> ms, on screen <b data-m="s-msg-2000-tanstack/ticks.ageOnScreen.p50"></b> ms · cases 3, 7</td><td>A source timestamp (or version time) carried with the data to the painter; age recorded at apply and at present, per frame</td></tr>
+    <tr><td><b>Bounded queues and what happens at the bound.</b> Unbounded: age grows. Bounded: drop, conflate, or push back.</td><td><code>n-bw-256-ticks</code> against <code>-conflate</code>: age on screen p95 <b data-m="n-bw-256-ticks/ticks.ageOnScreen.p95"></b> against <b data-m="n-bw-256-conflate/ticks.ageOnScreen.p95"></b> ms · case 7's burst</td><td>Queue length and high-water counters; a counter for every drop or merge, so that "kept every mutation" is checkable</td></tr>
+    <tr><td><b>Coalescing notifications is not conflating data.</b></td><td>Case 7: 6 renders for 1,066 applied messages. <code>s-raf-8000-regular</code>: <b data-m="s-raf-8000-regular/ticks.applies"></b> applies for <b data-m="s-raf-8000-regular/ticks.messages"></b> messages</td><td>Separate counters for mutations applied, invalidations published, frames drawn</td></tr>
+    <tr><td><b>Observation points.</b> Model updated ≠ drawn ≠ submitted ≠ on the glass.</td><td>Module 2: DOM written 0.5 ms, presented 1.6 to 2.1 ms after the send on an idle page, and one to three frames later under a scroll · case 8 (the key's <code>EventLatency</code> ends before the rows)</td><td>An instant at each point with the frame id; say which is the last one the platform lets you see</td></tr>
+    <tr><td><b>The method.</b> Complaint as a number; frames; working or waiting; the unit; a one-knob control.</td><td>Steps 1 to 3 and the eight cases</td><td>Seeded, replayable input; the control recorded in the same session</td></tr>
+  </table>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Spans on one clock</dt><dd>Every span from every thread and process on one monotonic clock. The course's backend did this with <code>process.hrtime</code> merged into Chrome's trace (Module 6); Tablelab's server and Blitz painter stamp CLOCK_MONOTONIC.</dd>
+      <dt>Frame id</dt><dd>One number that joins the stages of one frame across threads, as Chromium's frame sequence number does. Without it "which frame carried this change" is guesswork.</dd>
+      <dt>Counters</dt><dd>Named numbers sampled over time: queue lengths, bytes buffered, cells touched. The backend's <code>rows queue</code> counter decided case 2 in one glance.</dd>
+    </dl></div>
+    <div class="box"><span class="label">What Chrome gave for free and a native renderer must add</span><dl>
+      <dt>A sampling profiler joined to the timeline</dt><dd>Function-level attribution inside a span. Natively: <code>perf</code> or similar, joined by thread and time; label it as a separate instrument.</dd>
+      <dt>Counts of the engine's own work</dt><dd>Dirty layout objects, restyled elements, raster tasks. A table-specific renderer knows its own counts exactly; emitting them per frame costs almost nothing.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> each general item was demonstrated by a named recording in this course, in Chrome.</p>
+    <p><b>No:</b> that the instruments in the right-hand column suffice or are cheap in Blitz or on a GPU path: that column is a proposal. The one data point from outside Chrome (the Blitz <code>render</code> span) is from Tablelab's own notes, recorded on a shared GPU under load, and is quoted, not re-measured.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal for Pass 4's observability ledger: before optimizing either painter, require of both the same seven readings: per-frame stage spans with CPU time, a frame id, deadline hit or miss, queue length and age at each boundary, cells changed against cells visible, and mutations, invalidations and frames as three separate counters. With those, the routine of step 3 runs unchanged on a trace that has never seen DevTools.</p></div>
+  <div class="try"><span class="label">Try it</span>Take <code>traces/c-2.json.gz</code> in Perfetto and collapse every Chrome process, leaving only <code>Backend (node)</code>. Expected: you can still state ρ and the longest wait from the <code>query</code> spans and the <code>rows queue</code> counter alone. That is what a diagnosis from spans and counters, without a browser, looks like.</div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">General, with a demonstrating trace each: frame budget with a deadline, one server and ρ, work ∝ changed vs visible cells, shaping and layout of changed text, raster ∝ pixels, data age, bounded queues, coalescing ≠ conflation, observation points.</li>
+    <li data-kind="inferred">Proposed minimum instruments for a native painter: spans on one clock with CPU time, a frame id, deadline outcome, queue length and age per boundary, per-frame cell counts, and separate counters for mutations, invalidations and frames.</li>
+  </ul>
+  <p class="next" data-answer="portable"><b>Next question →</b> Can you answer the course's questions without scrolling back?</p>
+</section>
+
+<!-- ═════════════════════════ CHECK ═════════════════════════ -->
+
+<section class="step" data-part="F · Check" data-title="Self-check across the whole course" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>Ten questions, one or two per module. Answer each in a sentence or two before opening it.</span></p>
+  <div class="exercise"><span class="label">1 · First minute</span>
+    <p>A trace arrives with the sentence "typing in the filter box is laggy". Which number do you write down first, and which three readings tell you where to look next?</p>
+    <details><summary>Answer</summary><p>Key press → first presented frame that shows the typed character (and, separately, → filtered rows on screen: two observation points). Then main-frame duration, the frame's queue wait, and main-thread utilisation with the longest task: long frame and no wait means the frame's own work; short frame and long wait means the thread is held; idle means waiting elsewhere (steps 1 and 2).</p></details>
+  </div>
+  <div class="exercise"><span class="label">2 · Frame colours</span>
+    <p>Half the vsyncs of a scroll are "presented without the main update". Name two readings that would make this harmless and one that would make it a problem.</p>
+    <details><summary>Answer</summary><p>Harmless: main frames of a millisecond or two with no queue wait, in a compositor-animated scroll or separate wheel notches (the BeginMainFrame is sent before the draw); or a page whose content simply changes on few frames. A problem: main frames longer than an interval, or a queue wait near the frame's whole duration. The colour says where to look, not that anything is late (Module 2; step 2).</p></details>
+  </div>
+  <div class="exercise"><span class="label">3 · Two tables, one library</span>
+    <p>Two pages use regular-table on the same data. One runs about eighteen layouts per scroll event, the other one per frame. What differs in what the library knows, and which read causes the extra layouts?</p>
+    <details><summary>Answer</summary><p>Column widths. With widths cached the draw is planned without reading layout and committed in an animation frame; with the cache emptied (<code>resetAutoSize()</code> per scroll) each drawn column is measured with <code>th.offsetWidth</code> inside the draw loop, and each read forces a layout of what was just written (Modules 3 and 5; case 5).</p></details>
+  </div>
+  <div class="exercise"><span class="label">4 · A forced layout</span>
+    <p>A flame chart shows a <code>Layout</code> under a scroll listener. When is that an extra cost and when not? Which count decides?</p>
+    <details><summary>Answer</summary><p>Not extra when it is the frame's one layout done early (a read before any write, as with two virtualizers on one scroller): the lifecycle then has nothing left to lay out. Extra when writes follow the read and force another layout. Layouts per frame, against a control, decides (Module 5; field guide rows 6 and 7).</p></details>
+  </div>
+  <div class="exercise"><span class="label">5 · The backend's number</span>
+    <p>Service time is 25 ms and constant. Users wait 700 ms. Give the arithmetic that makes both true, and the cheapest change on the client.</p>
+    <details><summary>Answer</summary><p>Requests arrive faster than one server completes them: at 60 a second against 40, ρ = 1.5, and after t seconds of overload the wait is about t × (ρ − 1): 1.45 s × 0.5 ≈ 0.73 s. The cheapest change is one request in flight with only the newest wanted range remembered, which ties the arrival rate to the service rate (Module 6; case 2).</p></details>
+  </div>
+  <div class="exercise"><span class="label">6 · Three paces</span>
+    <p>Messages arrive at 9,000 a second, the display shows 60 frames a second, and the page draws per message. Which two buffers separate the three paces in a design that keeps up, and what does each hold?</p>
+    <details><summary>Answer</summary><p>A queue of messages before the handler (bounded by making the handler cheap: parse and store only), and a table of latest values per cell before the frame (which conflates by construction: a cell overwritten twice between frames is drawn once). The draw is then per frame, whatever the message rate (Module 7; case 3).</p></details>
+  </div>
+  <div class="exercise"><span class="label">7 · A stall</span>
+    <p>The network delivers nothing for 1.3 s and then everything. State the age of the oldest value at that moment, and the property of the page that decides whether the burst is one dropped frame or a quarter of a second of them.</p>
+    <details><summary>Answer</summary><p>About 1.3 s: the stall's length. The property is whether the expensive step (the render or draw) runs once per message or is bounded per frame. A page that only schedules a render per message may coalesce a burst by accident; one that draws synchronously per message pays for each (Module 8; case 7).</p></details>
+  </div>
+  <div class="exercise"><span class="label">8 · Priorities</span>
+    <p>Under a flood of WebSocket messages, why does a key press get a frame within milliseconds, the animation that follows it one frame per 100 ms, and a mouse drag a frame nearly every vsync?</p>
+    <details><summary>Answer</summary><p>Input tasks run at the highest priority; a discrete input makes the next BeginMainFrame highest too, once. After that the compositor queue is at normal priority behind the backlog and is lifted only by the 100 ms starvation rule. A gesture in progress keeps the use case, and with it the compositor queue's priority, at highest while input continues (Module 7; case 8).</p></details>
+  </div>
+  <div class="exercise"><span class="label">9 · A benchmark's number</span>
+    <p>A library's benchmark prints 60 fps. Name three things you need to know before comparing it with anything.</p>
+    <details><summary>Answer</summary><p>Its clock (what increments the counter: round trips, draw calls, rAF callbacks, presented frames), its driver (real input or a script writing <code>scrollTop</code>, and when in the frame), and the contents of one unit (was the right content on screen at the presentation point). Module 10 found 60 fps reported for a list that was empty in 89 of 91 positions.</p></details>
+  </div>
+  <div class="exercise"><span class="label">10 · Another renderer</span>
+    <p>You get a trace from a native renderer: spans with CPU time, a frame id, a few counters. A span <code>render</code> is 14 ms long with 1.6 ms of CPU. What do you conclude, what do you not, and which case of this module is its analogue?</p>
+    <details><summary>Answer</summary><p>The thread was waiting for 12 ms inside <code>render</code>, not working: optimizing its code cannot shorten it. Not concluded: what it waited for (GPU work, a present deadline, another client of the GPU) until a counter or the driver's accounting says. The analogue is case 6: a short main-thread frame whose content waits for raster. "Working or waiting" is the question that needs no browser (steps 18 and 19).</p></details>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> if you answered most of these from memory, you can take a trace you did not record from complaint to mechanism and name the control that would test it.</p>
+    <p><b>No:</b> that you have seen every failure. The course's traces are single causes on one machine in a headless browser; the habit that transfers is the order of the questions.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">The course in one line: turn the complaint into a number at a named observation point; find the unit of work and count it; decide working or waiting; change one input; state what the recording cannot show.</li>
+  </ul>
+  <p class="next"><b>End of the course.</b> The next traces are Tablelab's own: start with <code>STUDY-PLAN.md</code> Pass 1 and the three-arm design of step 17.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>
