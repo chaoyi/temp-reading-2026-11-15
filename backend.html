@@ -6,6 +6,7 @@
 <title>One trace, two processes · Table engines under load</title>
 <link rel="stylesheet" href="assets/course.css">
 <script src="data/index.js"></script>
+<style>.box pre, pre.fold { white-space: pre-wrap; overflow-wrap: anywhere; }</style>
 </head>
 <body>
 <div class="bar">
@@ -57,7 +58,7 @@
     <p>I open <code>b-click-ws-tanstack</code>: one click on the scrollbar track, rows from a backend whose query takes 5 ms. Below Chrome's processes there is one more, <b>Backend (node)</b>, with two tracks and a counter. I print its first events as they are in the file:</p>
   </div></div>
   <div class="tracelink" data-trace="b-click-ws-tanstack">In Perfetto, scroll to the last process, <code>Backend (node)</code>; pin its two tracks next to <code>CrRendererMain</code> of the Renderer.</div>
-<pre class="wrap"><span class="cp">1</span>{"ph":"M","name":"process_name","pid":1704645,"tid":0,"args":{"name":"Backend (node)"}}
+<pre class="wrap fold"><span class="cp">1</span>{"ph":"M","name":"process_name","pid":1704645,"tid":0,"args":{"name":"Backend (node)"}}
    {"ph":"M","name":"thread_name","pid":1704645,"tid":1,"args":{"name":"ws io (recv/send)"}}
    {"ph":"M","name":"thread_name","pid":1704645,"tid":2,"args":{"name":"query service"}}
 <span class="cp">2</span>{"ph":"i","s":"t","cat":"backend","name":"recv #2","pid":1704645,"tid":1,"ts":260796786568,"args":{"y0":13,"y1":14,"queued":0,"busy":0}}
@@ -140,7 +141,7 @@
       <dt>Causality as a test</dt><dd>A message cannot arrive before it was sent. If the cross-process differences are positive and small for every message, the clocks agree to within that small amount.</dd>
     </dl></div>
   </div>
-  <div class="hard"><span class="label">Hard learning</span><p>I expected Perfetto to draw an arrow from each request to its query and back: <code>record.mjs</code> has a function that adds flow events (<code>cat: "rpc"</code>) for that. There are none in these traces: <code>q.mjs b-click-ws-tanstack raw 'ws rpc' 1</code> prints nothing. The function looks up the end of the round trip under the key <code>e.name.slice(19)</code> (record.mjs:169), but <code>"app: ws round trip #"</code> is 20 characters long, so the key is <code>"#5"</code>, never matches <code>"5"</code>, and line 174 skips every request. The rule I keep: before I rely on an annotation, I check that it is in the file. Here the join is by the number in the names: <code>ws request #5</code>, <code>recv #5</code>, <code>query #5</code>, <code>send #5</code>, <code>ws round trip #5</code>. (If that command prints an event in your copy, the harness was fixed and the arrows are there.)</p></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected Perfetto to draw an arrow from each request to its query and back: the harness has a function that adds flow events (<code>cat: "rpc"</code>) for that. In the first recording there were none: <code>q.mjs b-click-ws-tanstack raw 'ws rpc' 1</code> printed nothing. The function looked up the end of the round trip under the key <code>e.name.slice(19)</code>, but <code>"app: ws round trip #"</code> is 20 characters long, so the key was <code>"#5"</code>, never matched <code>"5"</code>, and every request was skipped without an error. The harness is fixed since (<code>lab/harness/flows.mjs</code>) and the arrows were added to these traces afterwards, without re-recording: the same command now prints the three steps of a flow. The rule I keep: before I rely on an annotation, I check that it is in the file. And the join that never depended on the arrows is the number in the names: <code>ws request #5</code>, <code>recv #5</code>, <code>query #5</code>, <code>send #5</code>, <code>ws round trip #5</code>.</p></div>
   <div class="beat conclude"><span class="label">May conclude</span><div>
     <p><b>Yes:</b> on one machine, backend and browser times can be subtracted; the error is below the 0.1 ms that the fastest hop takes.</p>
     <p><b>No:</b> that this carries to a backend on another host. Two machines have two monotonic clocks with unrelated origins. Then the offset has to be estimated from the messages themselves, and only the <em>sum</em> of up and down is known for certain: an asymmetric path and a clock offset look the same.</p>
@@ -148,7 +149,7 @@
   <div class="try"><span class="label">Try it</span>In Perfetto's search box type <code>#5</code> and step through the hits: the page's mark and span, then <code>recv #5</code>, <code>query #5</code>, <code>encode #5</code>, <code>send #5</code> in the backend. Or: <code>node lab/harness/q.mjs b-click-ws-tanstack slices '#5$'</code>. Expected: the mark at 56.34 ms, <code>recv</code> at 56.54, <code>query</code> at 56.58 for 5.17 ms, <code>send</code> at 61.75.</div>
   <ul class="add" hidden>
     <li data-kind="measured">Chrome's trace clock is LINUX_CLOCK_MONOTONIC (trace metadata); in 588 requests the server's receive follows the page's send by 0.08–0.5 ms (one 2.1 ms) and no reply is handled before the server finished it.</li>
-    <li data-kind="rejected">"The trace has flow arrows per request": none in these traces; record.mjs:169 builds a key that never matches. Join by the request number in the event names.</li>
+    <li data-kind="rejected">"The first recording has flow arrows per request": it had none; the harness built a key that never matched (fixed since, arrows added afterwards). Join by the request number in the event names; check an annotation is in the file before relying on it.</li>
     <li data-kind="inferred">Cross-process subtraction is valid here because both programs read one machine's monotonic clock; with a remote backend only up + down would be certain.</li>
   </ul>
   <p class="next" data-answer="clock"><b>Next question →</b> Then I can follow one request across the boundary. Which threads touch it on the way out?</p>
@@ -229,7 +230,7 @@
 <pre>  ms       process · thread                          event
  61.703    Backend (node) · query service            encode #5: JSON.stringify, 192 bytes, 0.047 ms
  61.750    Backend (node) · ws io                    <span class="cp">1</span> <mark>send #5</mark> {bytes: 192, buffered: 0}
- 61.850    Network service · Chrome_ChildIOThread    <span class="cp">2</span> EpollEvent (socket readable, net/socket/socket_posix.cc), 0.048 ms
+ 61.850    Network service · Chrome_ChildIOThread    <span class="cp">2</span> EpollEvent (socket readable), 0.048 ms
  61.876      └ Send mojo message ───────────────────────────┐
  61.893    Renderer · Chrome_ChildIOThread           <span class="cp">3</span> EpollEvent (mojo channel readable), 0.021 ms
  61.910      └ SequenceManager PostTask ──────────┐        │
@@ -298,10 +299,10 @@
   </div>
   <div class="beat"><span class="label">What I do</span><div>
     <p>First the budget of request #5, from the listings of the last two steps:</p>
-<pre>  0.243 ms  up        main → network service → socket → Node handler     0.10 ms CPU (network service), rest wake-ups
-  0.038 ms  queue     recv → a server is free                            waiting (nothing ahead of it)
-  5.125 ms  service   query #5: a 5 ms timer                             waiting, by design: the lab's stand-in for a query
-  0.354 ms  down      encode → socket → network service → IO → main      0.05 + 0.05 + 0.02 ms CPU, then 0.13 ms in our task
+<pre>  0.243 ms  up        main → network service → socket → Node     0.10 ms CPU (network service), rest wake-ups
+  0.038 ms  queue     recv → a server is free                    waiting (nothing ahead of it)
+  5.125 ms  service   query #5: a 5 ms timer                     waiting, by design: stands in for a query
+  0.354 ms  down      encode → socket → net. service → IO → main 0.05 + 0.05 + 0.02 ms CPU, 0.13 ms in our task
   ────────
   5.760 ms  round trip, as the page measures it</pre>
     <p>Then I put the frames next to it, for both libraries (the same click, <code>b-click-ws-regular</code> below).</p>
@@ -400,10 +401,10 @@
   </ol>
   <div class="beat"><span class="label">What I see</span><div>
     <p><b data-m="b-drag-every-tanstack/ws.requests"></b> requests, all answered. The line reached <b data-m="b-drag-every-tanstack/backend.queueMax"></b>. The round trip, 40 ms for the first request, has a median of <b data-m="b-drag-every-tanstack/ws.roundTrip.p50" data-unit="ms"></b> and a maximum of <b data-m="b-drag-every-tanstack/ws.roundTrip.max" data-unit="ms"></b>; almost all of it is <code>serverWait</code> (max <b data-m="b-drag-every-tanstack/ws.serverWait.max" data-unit="ms"></b>). The service time never changed.</p>
-    <p>And the screen: every <code>app: draw</code> from 35 ms to 1,240 ms has <code>filled: false</code>. The panel showed rows of "…" for 1.2 seconds. Twenty-nine replies arrived for rows that were no longer in the DOM (the keyed pool had removed them) and were drawn by nobody.</p>
+    <p>And what was drawn: every <code>app: draw</code> from 35 ms to 1,240 ms has <code>filled: false</code>. Every row the panel put in the DOM was a "…" placeholder for 1.2 seconds. Twenty-nine replies arrived for rows that were no longer in the DOM (the keyed pool had removed them) and were drawn by nobody.</p>
   </div></div>
-  <div class="boxes">
-    <div class="box"><span class="label">What I think: the arithmetic of the line</span>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The arithmetic of the line:</p>
 <pre>arrivals   30 requests between 35.3 and 917.8 ms    one every 30.4 ms   λ = 32.9 per second
 service    query starts 40.1 ms apart               S = 40.1 ms         the server finishes 24.9 per second
 load       ρ = λ × S = 32.9 × 0.0401                = <mark>1.32</mark>              more work arrives than can be done
@@ -411,8 +412,9 @@ load       ρ = λ × S = 32.9 × 0.0401                = <mark>1.32</mark>     
 each request waits 40.1 − 30.4 = 9.7 ms longer than the one before it
 the 30th waits 29 × 9.7 = <mark>281 ms</mark>                                    measured: 281.6 ms
 the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured: 7 waiting + 1 in service</pre>
-      <p>The wait is not a property of the backend. It is the product of how long the overload has lasted and by how much ρ exceeds 1. Had the drag lasted 3 seconds, the last wait would have been about a second.</p>
-    </div>
+    <p>The wait is not a property of the backend. It is the product of how long the overload has lasted and by how much ρ exceeds 1. Had the drag lasted 3 seconds, the last wait would have been about a second.</p>
+  </div></div>
+  <div class="boxes">
     <div class="box file"><span class="label">File I am reading, and why</span>
       <span class="path">lab/server/backend.mjs:45–47, 86–87 · lab/pages/src/source.ts:113–118</span>
       <p>The server: a first-in-first-out line in front of <code>conc</code> servers. The client: ask for whatever is neither cached nor already asked for, immediately, every time.</p>
@@ -427,20 +429,18 @@ the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured
 <span class="n">115</span>    while (lo &lt; y1 &amp;&amp; covered(lo, x0, x1)) lo++;
 <span class="n">118</span>    <mark>if (lo &lt; hi) send(lo, hi, x0, x1);</mark></pre>
     </div>
-  </div>
-  <div class="boxes">
     <div class="box"><span class="label">Knowledge I am using</span><dl>
       <dt>Arrival rate λ, service time S, load ρ</dt><dd>ρ = λ × S ÷ (number of servers) is the fraction of server time the arrivals ask for. Below 1 a line forms and empties. At 1 or above it only grows, for as long as the arrivals keep coming: there is no steady state to quote, only "how long has this been going on".</dd>
       <dt>Open loop</dt><dd>The sender does not look at the receiver before sending. Our "every" policy is open-loop: the scroll position generates requests, whatever the backend is doing.</dd>
     </dl></div>
-    <div class="box"><span class="label">May conclude</span>
-      <p><b>Yes:</b> an open-loop client with ρ = 1.3 for 0.9 s makes the answer the user is waiting for 330 ms late, behind work nobody wants.</p>
-      <p><b>No:</b> that the backend is "slow". Its service time is 40 ms from the first query to the last, and throughput is at its maximum the whole time. A throughput graph of this run looks perfect.</p>
-    </div>
   </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> an open-loop client with ρ = 1.3 for 0.9 s makes the answer the user is waiting for 330 ms late, behind work nobody wants.</p>
+    <p><b>No:</b> that the backend is "slow". Its service time is 40 ms from the first query to the last, and throughput is at its maximum the whole time. A throughput graph of this run looks perfect.</p>
+  </div></div>
   <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-drag-every-tanstack slices '^(recv|query)'</code>. Expected: in the <code>recv</code> lines <code>queued</code> climbs 0, 0, 0, 0, 0, 1, 1, … 7; in the <code>query</code> lines <code>waitedMs</code> climbs 0.02, 7.2, 14.2, 21.2, … 281.6. In Perfetto the counter track draws the same staircase.</div>
   <ul class="add" hidden>
-    <li data-kind="measured">Every-range policy against one 40 ms server: 30 requests in 0.88 s (ρ = 1.32), line up to 8, last wait 281.6 ms, rows right 330 ms after release; the screen showed placeholders for 1.2 s.</li>
+    <li data-kind="measured">Every-range policy against one 40 ms server: 30 requests in 0.88 s (ρ = 1.32), line up to 8, last wait 281.6 ms, rows right 330 ms after release; every draw wrote placeholders for 1.2 s.</li>
     <li data-kind="inferred">Under overload the last wait is about (time under overload) × (ρ − 1), not a property of the service time; here 0.88 s × 0.32, or 29 requests × 9.7 ms.</li>
   </ul>
   <p class="next"><b>Next question →</b> The server cannot go faster. What if the client simply never has more than one request out?</p>
@@ -459,7 +459,7 @@ the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured
   </ol>
   <div class="beat"><span class="label">What I see</span><div>
     <p><b data-m="b-drag-inflight-tanstack/ws.requests"></b> requests instead of 30; the round trip stays at <b data-m="b-drag-inflight-tanstack/ws.roundTrip.p50" data-unit="ms"></b> (max <b data-m="b-drag-inflight-tanstack/ws.roundTrip.max" data-unit="ms"></b>); the line never forms (<b data-m="b-drag-inflight-tanstack/backend.queueMax"></b>). Seven of the thirty ranges the viewport passed were never asked for.</p>
-    <p>The screen <em>during</em> the drag did not improve: every draw is <code>filled: false</code> until 970.95 ms. Each reply is for the range wanted one round trip ago, and one scroll event later the viewport is 1,930 rows away.</p>
+    <p>What was drawn <em>during</em> the drag did not improve: every draw is <code>filled: false</code> until 970.95 ms. Each reply is for the range wanted one round trip ago, and one scroll event later the viewport is 1,930 rows away.</p>
   </div></div>
   <div class="boxes">
     <div class="box file"><span class="label">File I am reading, and why</span>
@@ -555,7 +555,7 @@ the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured
   </ol>
   <div class="beat"><span class="label">What I see</span><div>
     <p><b data-m="b-drag-regular/ws.requests"></b> requests, one at a time, round trip <b data-m="b-drag-regular/ws.roundTrip.p50" data-unit="ms"></b>, no line. It is the one-in-flight policy with one difference: between the reply and the next request sits a wait for an animation frame, in this drag 9 ms (seven times) or 26 ms (nine times). The cycle is 50 or 67 ms, the arrival rate 16.7 per second, ρ = 16.7 × 0.0407 = 0.68. The server is idle a third of the time.</p>
-    <p>The screen is the opposite of the TanStack panel's. regular-table draws what it asked for, even though the viewport has moved on: fifteen times during the drag the table commits real rows, each set 50 to 67 ms old, about two scroll events (the commit at 106.6 ms shows rows 1,930…, while the request leaving at 106.7 ms is for 3,860…). No placeholders, ever. The ◆ mark, "the first row drawn is the row the scrollbar points at", appears once, at 989 ms, <b data-m="b-drag-regular/content.settleMs" data-unit="ms"></b> after release.</p>
+    <p>What is drawn is the opposite of the TanStack panel's. regular-table draws what it asked for, even though the viewport has moved on: fifteen times during the drag the table commits real rows, each set 50 to 67 ms old, about two scroll events (the commit at 106.6 ms shows rows 1,930…, while the request leaving at 106.7 ms is for 3,860…). No placeholders, ever. The ◆ mark, "the first row drawn is the row the scrollbar points at", appears once, at 989 ms, <b data-m="b-drag-regular/content.settleMs" data-unit="ms"></b> after release.</p>
   </div></div>
   <div class="boxes">
     <div class="box file"><span class="label">File I am reading, and why</span>
@@ -697,10 +697,10 @@ the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured
  522.820   Backend · query service                 encode #26: JSON.stringify, 1,000,156 bytes, 0.403 ms
  523.223   Backend · ws io                         send #26 {bytes: 1000156, buffered: 0}
  523.345   Network service · Chrome_ChildIOThread  EpollEvent (socket readable), then one mojo message per chunk
- 523.453   Renderer · CrRendererMain               <span class="cp">1</span> seven tasks, 0.06–0.08 ms each, 0.07 ms apart: Receive mojo message (WebSocketClient)
+ 523.453   Renderer · CrRendererMain               <span class="cp">1</span> seven tasks of 0.06–0.08 ms: Receive mojo message
  523.954   Renderer · CrRendererMain               <span class="cp">2</span> the eighth: ThreadControllerImpl::RunTask, 2.062 ms
  525.304       WebSocketReceive {dataLength: 66713}                       <span class="cp">3</span> 1.35 ms into the task
- 525.527       FunctionCall socket.onmessage, 0.400 ms                    <span class="cp">4</span> ws parse #26: 0.33 ms, MinorGC 0.15 ms
+ 525.527       FunctionCall socket.onmessage, 0.400 ms              <span class="cp">4</span> ws parse #26: 0.33 ms, MinorGC 0.15 ms
  526.016     ThreadControllerImpl::RunTask ends
  529.990   the enclosing RunTask slice ends: 6.039 ms                     <span class="cp">5</span> 3.97 ms after the task inside it</pre>
   <div class="lanes" data-lanes='{"traces":["b-pad-1mb"],"from":514,"to":534,"rows":["tasks","main","gc","app","backendQuery"],"pins":[[4,525.7,"main"],[5,528,"tasks"]]}'></div>
@@ -784,7 +784,7 @@ the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured
     <li><i>7</i>334.0 ms: commit, and the next request, now for rows 16–28. The table shows rows 14…; the scrollbar is two rows further.</li>
   </ol>
   <div class="beat"><span class="label">What I see</span><div>
-    <p><b>TanStack panel:</b> <b data-m="b-scroll-ws-tanstack/ws.requests"></b> requests, each answered in <b data-m="b-scroll-ws-tanstack/ws.roundTrip.p50" data-unit="ms"></b>. The rows already on screen move smoothly with the compositor's scroll. At the bottom a band of "…" grows by a row per frame, up to five visible rows (120 px of a 288 px viewport), then fills at once. The viewport is completely right (◆) <b data-m="b-scroll-ws-tanstack/content.completeMarks"></b> times in two seconds.</p>
+    <p><b>TanStack panel:</b> <b data-m="b-scroll-ws-tanstack/ws.requests"></b> requests, each answered in <b data-m="b-scroll-ws-tanstack/ws.roundTrip.p50" data-unit="ms"></b>. Rows that are filled stay filled while the compositor scrolls them (the frame lane has a presented frame at every vsync). At the bottom a band of "…" grows by a row per frame, up to five visible rows (120 px of a 288 px viewport), then fills at once. The viewport is completely right (◆) <b data-m="b-scroll-ws-tanstack/content.completeMarks"></b> times in two seconds.</p>
     <p><b>regular-table:</b> <b data-m="b-scroll-ws-regular/ws.requests"></b> requests: a strict two-frame cycle of request, reply, commit. No cell is ever blank. But the table is pinned in place between commits, so the content advances in steps of about 1.6 rows, 30 times a second, and what it shows is the scroll position of two frames (33 ms) ago. ◆ appears <b data-m="b-scroll-ws-regular/content.completeMarks"></b> times: at 1,051 ms, where the synthesized scroll pauses for a few frames, and at the end.</p>
   </div></div>
   <div class="boxes">
@@ -830,7 +830,7 @@ the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured
   <div class="predict" data-right="b"><span class="label">Predict first</span>
     <p>The scroll runs for two seconds, with a pause of a few frames in the middle. The backend answers all <b data-m="b-scroll-fast-ws-tanstack/ws.requests"></b> requests in 30 ms each. How many times are rows filled?</p>
     <div class="opts"><button data-k="a">About 120 times: once per reply.</button><button data-k="b">Twice.</button><button data-k="c">About 20 times: every 100 ms, as before.</button></div>
-    <div class="reveal"><p><b>Twice:</b> at 1,030 ms, in the pause, and at 2,098 ms, after the end. Each fill writes 90 cells, all fifteen rows in the DOM. For most of two seconds the whole table shows "…".</p></div>
+    <div class="reveal"><p><b>Twice:</b> at 1,030 ms, in the pause, and at 2,098 ms, after the end. Each fill writes 90 cells, all fifteen rows in the DOM. Between them every draw has <code>filled: false</code>. The fifteen rows of a fill scroll out at two per frame, so about eight frames later every row in the DOM is a placeholder, until the next fill.</p></div>
   </div>
   <div class="tracelink" data-trace="b-scroll-fast-ws-tanstack"></div>
   <div class="lanes" data-lanes='{"traces":["b-scroll-ws-tanstack","b-scroll-fast-ws-tanstack"],"titles":["b-scroll-ws-tanstack · 1,170 px/s","b-scroll-fast-ws-tanstack · 2,400 px/s"],"from":-20,"to":2200,"rows":["frames","app"],"pins":[[1,414.5,"app",0],[2,1030.5,"app",1],[3,2098.3,"app",1]]}'></div>
@@ -841,7 +841,7 @@ the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured
   </ol>
   <table class="mtable" data-rows="b-scroll-ws-tanstack,b-scroll-fast-ws-tanstack,b-scroll-ws-regular" data-names="TanStack panel · 1170 px/s,TanStack panel · 2400 px/s,regular-table · 1170 px/s" data-head="30 ms backend" data-cols="ws.requests|requests,ws.roundTrip.p50|round trip p50|ms,ws.roundTrip.max|max|ms,content.completeMarks|times all visible rows were right,content.settleMs|input end → rows right|ms,frames.dropped|frames dropped" data-hi="b-scroll-fast-ws-tanstack:content.completeMarks"></table>
   <div class="beat"><span class="label">What I see</span><div>
-    <p>The prediction holds. By every number the backend and the transport report, the fast scroll is the healthier run: more requests, the same 30 ms, no line, no dropped frame. On screen it is the worst case in this module: an empty table that scrolls smoothly.</p>
+    <p>The prediction holds. By every number the backend and the transport report, the fast scroll is the healthier run: more requests, the same 30 ms, no line, no dropped frame. In the DOM it is the worst case in this module: between the two fills every draw wrote placeholders, while a frame was presented at every vsync. An empty table, scrolling smoothly.</p>
     <p>The trace shows a second thing I did not go looking for. The panel drew <b data-m="b-scroll-fast-ws-tanstack/app.draw.n"></b> times for <b data-m="b-scroll-fast-ws-tanstack/main.scrollEvents"></b> scroll events (<b data-m="b-scroll-ws-tanstack/app.draw.n"></b> for <b data-m="b-scroll-ws-tanstack/main.scrollEvents"></b> at the slower speed). Near the end one reply is followed by thirty and more <code>app: draw</code> spans within a millisecond.</p>
   </div></div>
   <div class="boxes">

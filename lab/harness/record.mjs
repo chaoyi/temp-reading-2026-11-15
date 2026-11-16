@@ -17,6 +17,7 @@
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 import { analyze } from "./analyze-lib.mjs";
+import { addRpcFlows } from "./flows.mjs";
 import { LAB, launch, startServer, startTrace } from "./browser.mjs";
 import { SCENARIOS } from "./scenarios.mjs";
 
@@ -158,25 +159,6 @@ async function run(browser, srv, s) {
   };
   const analysis = analyze(trace, s);
   return { trace, analysis, state, errors, dataLossOccurred };
-}
-
-/** Flow arrows for each WebSocket request: page send → backend query → page reply. */
-function addRpcFlows(ev) {
-  const marks = ev.filter((e) => e.cat === "blink.user_timing" && /^app: ws request #\d+/.test(e.name) && e.ph !== "e" && e.ph !== "b");
-  if (!marks.length) return;
-  const { pid, tid } = marks[0];
-  const queries = new Map(ev.filter((e) => e.cat === "backend" && e.ph === "X" && e.name.startsWith("query #")).map((e) => [e.name.slice(7), e]));
-  const ends = new Map(ev.filter((e) => e.cat === "blink.user_timing" && e.ph === "e" && e.name.startsWith("app: ws round trip #")).map((e) => [e.name.slice(19), e]));
-  for (const m of marks) {
-    const id = m.name.match(/#(\d+)/)[1];
-    const q = queries.get(id);
-    const end = ends.get(id);
-    if (!q || !end) continue;
-    const base = { cat: "rpc", name: "ws rpc", id: "rpc" + id };
-    ev.push({ ...base, ph: "s", pid, tid, ts: m.ts });
-    ev.push({ ...base, ph: "t", pid: q.pid, tid: q.tid, ts: q.ts + 1 });
-    ev.push({ ...base, ph: "f", bp: "e", pid, tid, ts: end.ts - 1 });
-  }
 }
 
 mkdirSync(REPO + "traces", { recursive: true });
