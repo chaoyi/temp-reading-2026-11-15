@@ -1,0 +1,54 @@
+:root {
+  --ink: #171a20; --soft: #55606e; --rule: #cdd5dc; --hair: #e8ecef;
+  --w: 640px; --h: 312px;
+  font: 15px/1.5 system-ui, sans-serif; color: var(--ink);
+}
+body { margin: 0; padding: 16px 20px 40px; background: #f5f7f9; }
+header h1 { font-size: 1.2rem; margin: 4px 0 6px; }
+header p { max-width: 70em; margin: 0 0 10px; color: var(--soft); }
+#status { min-height: 1.5em; font-size: 0.9rem; color: var(--soft); margin: 0 0 8px; }
+.panel { background: #fff; border: 1px solid var(--rule); border-radius: 6px; padding: 10px 12px; max-width: 100%; display: inline-block; }
+.panel h2 { font-size: 0.95rem; margin: 0 0 6px; }
+.readout { font: 12px/1.4 ui-monospace, monospace; color: var(--soft); margin: 6px 0 0; min-height: 1.4em; }
+
+/* The scroller: a 24 px header and rows of 24 px. An opaque background, so
+   Chrome composites it at any device scale factor (walkthrough 1, step 21). */
+.scroller { width: var(--w); max-width: calc(100vw - 60px); height: var(--h); overflow: auto; position: relative; display: block; outline-offset: 2px; background: #fff; }
+.scroller, .scroller td, .scroller th { font: 13px/23px ui-monospace, "DejaVu Sans Mono", monospace; }
+
+/* TanStack and React: a sticky header and absolutely positioned rows inside a sizer. */
+.head { position: sticky; top: 0; z-index: 1; display: flex; height: 24px; background: #f0f2f4; font-weight: 600; box-sizing: border-box; }
+.sizer { position: relative; }
+.row { position: absolute; top: 0; left: 0; display: flex; height: 24px; box-sizing: border-box; }
+.head > div, .row > div {
+  width: 100px; flex: none; box-sizing: border-box; padding: 0 8px; overflow: hidden; white-space: nowrap;
+  border-bottom: 1px solid var(--hair);
+}
+
+/* regular-table: it measures a probe cell for the row height, so 24 px here. */
+regular-table td, regular-table th {
+  height: 24px; box-sizing: border-box; padding: 0 8px; white-space: nowrap; min-width: 100px; max-width: 100px;
+  overflow: hidden; border-bottom: 1px solid var(--hair); text-align: left;
+}
+regular-table thead th { background: #f0f2f4; }
+regular-table.fixed-columns table { table-layout: fixed; }
+
+/* cls=1: conditional classes. */
+.neg { color: #b01c48; }
+.big { font-weight: 700; background: #eef6ff; }
+
+/* contain=1: tell the engine a row's inside cannot affect the outside. */
+html.contain .row { contain: strict; width: max-content; min-width: 100%; }
+html.contain .row > div, html.contain regular-table td { contain: content; }
+
+html.bare header, html.bare #status, html.bare .panel h2, html.bare .readout { display: none; }
+html.bare body { padding: 8px; }
+html.bare .panel { border: 0; padding: 0; }
+
+/* paint=heavy: blurred shadows and a gradient on every cell. Costly to rasterize; no extra layout. */
+html.heavy-paint .row > div, html.heavy-paint regular-table tbody td {
+  box-shadow: 0 0 14px rgba(20, 30, 80, 0.45), inset 0 0 10px rgba(200, 60, 40, 0.35);
+  text-shadow: 0 0 6px rgba(0, 0, 0, 0.6), 0 0 12px rgba(40, 80, 200, 0.5);
+  background: linear-gradient(135deg, #ffffff, #e9eef7 60%, #fdf3e7);
+  border-radius: 5px;
+}

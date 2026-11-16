@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Table engine trace lab · grid</title>
+    <script src="/__env.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Table engine trace lab: one table, many knobs</h1>
+      <p>
+        One virtualized table, configured from the URL. Scroll it (wheel, Page Down, scrollbar), then change a
+        knob and do it again. The knobs are listed in <a href="./index.html">the page index</a>.
+      </p>
+    </header>
+    <p id="status" role="status"></p>
+    <main id="tables"></main>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

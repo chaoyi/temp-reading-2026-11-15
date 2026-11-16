@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table engines under load: a traced course</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+<style>
+  .hub { max-width: 1120px; margin: 0 auto; padding: 26px 22px 80px; }
+  .hub h1 { font-size: clamp(1.7rem, 3.2vw, 2.5rem); line-height: 1.12; margin: 6px 0 12px; max-width: 22em; }
+  .hub h2 { font-size: 1.25rem; margin: 34px 0 8px; padding-top: 14px; border-top: 2px solid var(--ink); }
+  .hub h3 { font-size: 1rem; margin: 18px 0 4px; }
+  .hub .lede { font-size: 1.08rem; color: var(--soft); max-width: 46em; }
+  .hub p, .hub li { max-width: 50em; }
+  .loop { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; margin: 10px 0 16px; counter-reset: s; }
+  .loop div { border: 1.5px solid var(--ink); border-radius: 5px; background: var(--panel); padding: 8px 10px; font-size: 0.86rem; line-height: 1.38; }
+  .loop div b { display: block; font-family: var(--label); font-size: 0.82rem; }
+  .loop div b::before { counter-increment: s; content: counter(s) " · "; color: var(--hot-text); }
+  .route { border-left: 4px solid var(--kept); background: var(--kept-wash); padding: 10px 14px; margin: 10px 0; border-radius: 0 4px 4px 0; }
+  .route b { font-family: var(--label); }
+  #catalog td { font-size: 0.82rem; } #catalog td:nth-child(2) { font-family: var(--read); font-size: 0.86rem; white-space: normal; }
+  #catalog td a { color: var(--kept); font: 0.76rem var(--label); margin-right: 8px; }
+  .filter { font: 0.86rem var(--label); padding: 5px 9px; border: 1.5px solid var(--ink); border-radius: 4px; width: 22em; max-width: 100%; margin: 4px 0 8px; }
+  .yard td:first-child { font-family: var(--label); font-weight: 700; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <span class="title">Table engines under load</span>
+  <span class="count" style="flex:1">a traced course · TanStack Virtual, regular-table, Perspective · Chrome 154</span>
+  <a class="home" href="https://github.com/chaoyi/temp-reading-2026-11-15">Repository</a>
+</div>
+<div class="hub">
+
+<p class="kicker">Tablelab studies · recorded 2026-11-16</p>
+<h1>A table scrolls, updates arrive, the network misbehaves. What runs, on which thread, and which frames does the user get?</h1>
+<p class="lede">Eleven modules, each a chain of questions answered from real Chrome traces of three table implementations and checked against the source of the libraries and of Chromium. Every trace is in this repository: open it in Perfetto or DevTools next to the page and look for yourself.</p>
+
+<p>The subjects are <b>TanStack Virtual</b> (the library computes which rows are visible; your code owns the DOM), <b>regular-table</b> (the library owns a <code>&lt;table&gt;</code> and asks you for a rectangle of data), and <b>Perspective</b> (a query engine in a worker or on a server, drawing through regular-table). They are good implementations that made different choices, which is what makes them worth tracing side by side. The frame of every module is the same: a case you can run, a prediction, the trace, the source that explains it, what may be concluded, and what the trace taught that I did not expect.</p>
+
+<h2>The modules</h2>
+<p class="note" id="wip"><b>In progress (2026-11-16):</b> Module 1, the lab and all traces are here; Modules 2–11 are being written against the traces and appear as they are finished.</p>
+<div class="cards" id="cards">
+  <a class="card" href="walkthrough.html"><span class="num">Module 1 · 32 steps</span><h3>Where does a scroll go?</h3><p>What a trace file is, how a bar gets drawn, which thread moves the pixels, the fixed order inside one frame, and the two libraries taking one scrollbar click, Page Down, a long task and a WebSocket backend.</p><span class="meta">The foundation. Start here if traces are new.</span></a>
+  <a class="card" href="frames.html"><span class="num">Module 2</span><h3>What happened to each frame?</h3><p>The compositor's record of every vsync: presented with the main thread's update, presented without it, or dropped. Budgets, CPU throttling, when a DOM write is really on screen, and what the instruments themselves cost.</p><span class="meta">Frame production · observation points · observer effect · variance</span></a>
+  <a class="card" href="anatomy.html"><span class="num">Module 3</span><h3>Three designs, read in source</h3><p>What a virtualizer owns. TanStack's memo chain and measurement cache, regular-table's two draw pipelines and its lock, and how Perspective stacks an engine on top; each mechanism found again in a trace.</p><span class="meta">Code reading · design contrast</span></a>
+  <a class="card" href="javascript.html"><span class="num">Module 4</span><h3>What JavaScript costs per frame</h3><p>Cells per frame, scroll speed and the point where a keyed pool stops paying, number formatting idioms, React's render on top of the same range math, garbage collection, and the first scroll against the second.</p><span class="meta">Scaling curves · crossover · sampling profiles</span></a>
+  <a class="card" href="rendering.html"><span class="num">Module 5</span><h3>Style, layout, paint, compositing</h3><p>A layout hiding inside a scroll event, layout thrashing, what rewriting every cell costs the layout engine, containment, expensive pixels, and a wheel listener that makes the compositor wait for a busy main thread.</p><span class="meta">Forced layout · raster · scroll blocking</span></a>
+  <a class="card" href="backend.html"><span class="num">Module 6</span><h3>One trace, two processes</h3><p>The backend's spans on the browser's clock. One request followed hop by hop, then a drag against a backend that serves one query at a time: three request policies and the queue each one builds.</p><span class="meta">WebSocket request/response · queues · stale or blank</span></a>
+  <a class="card" href="streaming.html"><span class="num">Module 7</span><h3>Live updates: three paces</h3><p>The server produces at its pace, the page applies at another, the display shows at a third. Rate sweeps to the knee, how old the data is when it reaches the screen, conflation, and what the scheduler does with a flood of messages.</p><span class="meta">Throughput · data age · scheduler priorities</span></a>
+  <a class="card" href="network.html"><span class="num">Module 8</span><h3>Congestion and extreme latency</h3><p>Delay, a narrow link, a stall and its burst, a slow consumer. Where bytes wait when nobody reads them, what backpressure reaches, and what each table shows while the answer is a second away.</p><span class="meta">Bad networks · backpressure · head-of-line blocking</span></a>
+  <a class="card" href="perspective.html"><span class="num">Module 9</span><h3>Perspective end to end</h3><p>A query engine in a worker or on a server, drawing through regular-table. One scroll and one update followed through viewer, datagrid, client, engine and back, and what changes when the engine is a network away.</p><span class="meta">Worker vs remote · layers · requests per draw</span></a>
+  <a class="card" href="showcases.html"><span class="num">Module 10</span><h3>The libraries' own showcases</h3><p>The examples and benchmarks each library ships to show itself off, traced with the same instruments: two billion rows, a 10,000 × 10,000 grid, measured rows, a sorted table, and what a benchmark's "frame" is.</p><span class="meta">Upstream examples · what a benchmark measures</span></a>
+  <a class="card" href="clinic.html"><span class="num">Module 11</span><h3>Diagnose these traces</h3><p>Unlabelled traces to work out on your own, a field guide from symptom to cause, how these studies were designed, and what carries over to a renderer that is not Chrome.</p><span class="meta">Practice · study design · synthesis</span></a>
+</div>
+
+<div class="route"><b>Shortest useful route (about two hours):</b> Module 1's core route, Module 2, then Module 7. <b>For the frontend alone:</b> 1 → 2 → 4 → 5. <b>For frontend + backend:</b> 1 → 2 → 6 → 7 → 8. Module 3 can be read at any point after 1; Module 11 last.</div>
+
+<h2>The method every module uses</h2>
+<p>It is the method of the two earlier lessons (<a href="walkthrough.html">Where does a scroll go?</a> and Tablelab's <code>notes/trace-reading.html</code>), applied to harder cases. A trace has no beginning and no point; a question gives it both.</p>
+<div class="loop">
+  <div><b>Ask</b>One question, written down, with the number that would count as an answer.</div>
+  <div><b>Predict</b>Commit to an expectation before looking. A wrong prediction is the most useful thing a step can produce.</div>
+  <div><b>Orient</b>What did this trace record: which processes, threads, categories? What can it not show?</div>
+  <div><b>Find the unit</b>One repetition of the work: a frame, a draw, a message, a request.</div>
+  <div><b>Budget it</b>Account for the whole period. What is left over is a part you have not named.</div>
+  <div><b>Check the population</b>Counts, median, tail, worst case. Is the unit you looked at typical?</div>
+  <div><b>Working or waiting?</b>Elapsed time against work done. A long bar can be a queue.</div>
+  <div><b>Change one input</b>A control and a treatment that differ in one thing.</div>
+  <div><b>Cross-check</b>Does the source say the same? Does a second trace?</div>
+  <div><b>Conclude</b>Claim, evidence, limit. Each limit is a candidate next question.</div>
+</div>
+<p>Each step tags what it establishes as <b>read in source</b>, <b>measured</b>, <b>inferred</b> or <b>rejected</b>, and the side rail collects them as you go. Steps marked <b>Hard learning</b> record a belief the trace contradicted.</p>
+
+<h2>Yardsticks</h2>
+<table class="yard">
+  <tr><td>16.7 ms</td><td>One frame at 60 Hz, the rate these traces were recorded at. At 120 Hz it is 8.3 ms. The main thread does not get all of it: the compositor draws at a deadline inside the interval (Module 2).</td></tr>
+  <tr><td>50 ms</td><td>The length at which a task is called long: input that arrives during it waits for it.</td></tr>
+  <tr><td>100 ms</td><td>How long Chrome's main-thread scheduler lets rendering starve before it raises the priority of the next frame (Module 7).</td></tr>
+  <tr><td>ρ = arrival rate × service time</td><td>Utilisation of anything that serves one thing at a time: a main thread applying messages, a backend running queries. Above 1 the queue grows without bound, however fast each item is (Modules 6–8).</td></tr>
+  <tr><td>Data age</td><td>Now minus the time the value was produced, measured where the user sees it. Throughput can look fine while age grows.</td></tr>
+</table>
+
+<h2>Opening the traces</h2>
+<p>Every trace is a gzipped Chrome JSON trace in <code>traces/</code>, recorded with the categories DevTools uses plus the compositor's, the scheduler's and V8's sampler. Where the scenario has a backend, the backend's own spans are in the same file as a process named <b>Backend (node)</b>, on the same clock.</p>
+<ul>
+  <li><b>Perfetto</b> (every process and thread, SQL): each step has an "open in Perfetto" link, which loads the file from this repository. Or drag a downloaded file onto <a href="https://ui.perfetto.dev">ui.perfetto.dev</a>. Press <kbd>W</kbd>/<kbd>S</kbd> to zoom, <kbd>A</kbd>/<kbd>D</kbd> to pan; type <kbd>:</kbd> for a SQL prompt.</li>
+  <li><b>Chrome DevTools</b> (the JavaScript flame chart, frames track, friendly names): Performance panel → Load profile → the downloaded <code>.json.gz</code>. Turn off Settings → Ignore list to see library frames by name.</li>
+  <li><b>The terminal</b>: <code>node lab/harness/q.mjs &lt;id&gt; summary | frames | tree | prof | tasks | slices …</code> prints what the charts in these pages are drawn from, on the same time axis.</li>
+</ul>
+<p>To run a case yourself and record your own trace: <code>cd lab &amp;&amp; npm ci &amp;&amp; npm run build &amp;&amp; npm run serve</code>, open the printed address, and use the query string shown under each trace link. <a href="https://github.com/chaoyi/temp-reading-2026-11-15#readme">README</a> has the details and the limits of these recordings.</p>
+
+<h2>All traces</h2>
+<p>Module 1's 24 traces are in <code>traces/m1/</code>, named <code>&lt;scenario&gt;-&lt;library&gt;.json.gz</code> as the walkthrough cites them. Each row below is one scenario recorded for Modules 2–11. Frames are per vsync: presented with the main thread's update / presented without a pending main update / dropped.</p>
+<input class="filter" id="filter" placeholder="filter: f- j- r- b- s- n- x- u- or a word">
+<div class="scroll"><table id="catalog"></table></div>
+
+<h2>Sources and conditions</h2>
+<p class="note">Recorded 2026-11-16 on Linux with headless Chrome 154.0.8037.57 (the real browser in headless mode: software raster and compositing, a synthetic 60 Hz vsync), device scale factor 1.75, one traced run per scenario unless a module says otherwise. Good for explaining mechanisms and comparing a control with a treatment recorded the same way; not a benchmark of the libraries or of a display. Pinned revisions: Chromium <code>73c14f6</code> (M154), V8 <code>671f7c2</code>, DevTools frontend <code>66df492</code>, <code>@tanstack/virtual-core</code> 3.19.11 and <code>@tanstack/react-virtual</code> 3.14.26 (<code>11b48e4</code>), regular-table 0.9.2 (<code>52e86bf</code>), Perspective 5.9.2 (<code>0264ec1</code>), React 19.2.7.</p>
+</div>
+<script src="assets/course.js"></script>
+<script>
+// The trace catalogue, from data/index.js.
+{
+  const INDEX = window.TRACE_INDEX ?? {};
+  const RAW = "https://raw.githubusercontent.com/chaoyi/temp-reading-2026-11-15/main/";
+  const t = document.getElementById("catalog");
+  const rows = Object.values(INDEX).filter((d) => d && d.id);
+  const draw = (q) => {
+    let html = "<tr><th>Scenario</th><th>Asks</th><th>Frames</th><th>Main busy</th><th>Trace</th></tr>";
+    for (const d of rows) {
+      const text = `${d.id} ${d.asks ?? ""}`.toLowerCase();
+      if (q && !q.toLowerCase().split(/\s+/).every((w) => text.includes(w))) continue;
+      const f = d.metrics.frames, file = `traces/${d.id}.json.gz`;
+      html += `<tr><td>${d.id}</td><td>${d.asks ?? ""}</td><td class="num">${f.all} / ${f.partial} / ${f.dropped}</td><td class="num">${d.metrics.threads.mainUtilPct}%</td><td><a href="${file}" download>${(d.traceBytes / 1e6).toFixed(1)} MB</a><a href="https://ui.perfetto.dev/#!/?url=${encodeURIComponent(RAW + file)}" target="_blank" rel="noopener">Perfetto</a></td></tr>`;
+    }
+    t.innerHTML = html;
+  };
+  draw("");
+  document.getElementById("filter").addEventListener("input", (e) => draw(e.target.value));
+}
+</script>
+</body>
+</html>

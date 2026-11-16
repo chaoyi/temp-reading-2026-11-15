@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PAGE TITLE · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">SHORT TITLE</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <!-- The pipeline this module moves along. A step lights the nodes named in its data-node. Adapt the nodes to the module. -->
+  <div class="pipe" id="pipe">
+    <span data-node="input">input</span><span class="sep">→</span><span data-node="compositor">compositor</span><span class="sep">→</span>
+    <span data-node="frame">main frame</span><span class="sep">→</span><span data-node="js">JavaScript</span><span class="sep">→</span>
+    <span data-node="layout">style + layout</span><span class="sep">→</span><span data-node="paint">paint</span><span class="sep">→</span>
+    <span data-node="raster">raster</span><span class="sep">→</span><span data-node="present">screen</span>
+    <span class="sep">·</span><span data-node="network">network</span><span class="sep">·</span><span data-node="backend">backend</span>
+    <span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module N · recorded 2026-11-16</p>
+  <h1>THE MODULE'S QUESTION, AS A SENTENCE A PERSON WOULD ASK</h1>
+  <p class="lede">Two or three sentences: the concrete case this module starts from and what it will let the reader do.</p>
+  <p><b>Why this matters for Tablelab.</b> …</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>) for the trace vocabulary. The traces are in <code>traces/</code>; each step links the one it reads.</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57, device scale factor 1.75, one traced run per scenario unless stated. …</p>
+  <div class="foot"><button class="primary" data-start>Start: N steps →</button></div>
+</div>
+
+<section class="step" data-part="A · Part name" data-title="Step title" data-node="frame"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>…</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>…</p></div></div>
+  <div class="tracelink" data-trace="f-scroll-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["f-scroll-tanstack"],"from":90,"to":150,"rows":["inputs","compositor","frames","mainFrames","main","app"],"pins":[[1,100.4,"mainFrames"]]}'></div>
+  <ol class="pins"><li><i>1</i>…</li></ol>
+  <div class="beat"><span class="label">What I see</span><div><p>…</p></div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div><p><b>Yes:</b> …</p><p><b>No:</b> …</p></div></div>
+  <ul class="add" hidden><li data-kind="measured">…</li></ul>
+  <p class="next"><b>Next question →</b> …</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>
