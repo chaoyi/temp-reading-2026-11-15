@@ -93,7 +93,8 @@ async function start() {
   });
 
   // The update stream.
-  if (config.hz && config.engine === "remote") await fetch(`/__psp?hz=${config.hz}&n=${config.n}&span=${config.span}`);
+  // The server's stream is process-wide: always set it, so a rate left over from an earlier page is cleared.
+  if (config.engine === "remote") await fetch(`/__psp?hz=${config.hz}&n=${config.n}&span=${config.span}`);
   if (config.hz && config.engine === "worker") {
     const numeric: number[] = [];
     for (let c = 0; c < config.cols; c++) if (columnKind(c) === "price") numeric.push(c);

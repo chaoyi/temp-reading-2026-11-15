@@ -47,6 +47,7 @@ async function run(browser, srv, s) {
   const errors = [];
   page.on("pageerror", (e) => errors.push(String(e).slice(0, 200)));
   await srv.netem(s.netem ?? {});
+  await fetch(srv.origin + "/__psp?hz=0").catch(() => {}); // stop a Perspective update stream left by an earlier scenario
   // A clinic case (s.hidden) keeps its knobs out of the URL and out of the trace's metadata.
   if (s.hidden) await page.addInitScript((q) => sessionStorage.setItem("lab-case", q), String(new URLSearchParams({ bare: "", ...(s.query ?? {}) })));
   const url = s.hidden ? `${srv.origin}/${s.page ?? "grid.html"}?case=${s.id.split("-")[1]}` : (s.url ?? `${srv.origin}/${s.page ?? "grid.html"}?${new URLSearchParams({ bare: "", ...(s.query ?? {}) })}`);

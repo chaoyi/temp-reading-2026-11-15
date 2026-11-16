@@ -42,6 +42,20 @@ function pipe(from, to, dir, opened) {
   let lastRelease = 0; // performance.now() ms at which the previous chunk leaves
   let queued = 0;
   let stalled = false;
+  const fifo = [];
+  let timer = null;
+  const release = () => {
+    timer = null;
+    const now = performance.now();
+    while (fifo.length && fifo[0].at <= now) {
+      const { chunk } = fifo.shift();
+      queued -= chunk.length;
+      if (!to.destroyed) to.write(chunk);
+    }
+    if (queued <= HIGH_WATER / 2 && from.isPaused()) from.resume();
+    if (dir === "down") counter("netem queued bytes (to page)", queued);
+    if (fifo.length) timer = setTimeout(release, Math.max(0, Math.ceil(fifo[0].at - now)));
+  };
   from.on("data", (chunk) => {
     const now = performance.now();
     const c = netem;
@@ -62,11 +76,10 @@ function pipe(from, to, dir, opened) {
     queued += chunk.length;
     if (queued > HIGH_WATER) from.pause();
     if (dir === "down") counter("netem queued bytes (to page)", queued);
-    setTimeout(() => {
-      queued -= chunk.length;
-      if (!to.destroyed) to.write(chunk);
-      if (queued <= HIGH_WATER / 2 && from.isPaused()) from.resume();
-      if (dir === "down") counter("netem queued bytes (to page)", queued);
-    }, Math.max(0, at - now));
+    // Chunks leave through one first-in-first-out queue. (A timer per chunk is
+    // not enough: timer delays are whole milliseconds, so two chunks due
+    // 0.3 ms apart could fire in the wrong order and corrupt the stream.)
+    fifo.push({ chunk, at });
+    if (!timer) timer = setTimeout(release, Math.max(0, Math.ceil(at - now)));
   });
 }

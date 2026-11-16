@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Perspective end to end · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">9 · Perspective end to end</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="input">input / update()</span><span class="sep">→</span>
+    <span data-node="viewer">viewer (Rust, WASM)</span><span class="sep">→</span>
+    <span data-node="datagrid">datagrid plugin</span><span class="sep">→</span>
+    <span data-node="rt">regular-table</span><span class="sep">→</span>
+    <span data-node="client">client (protobuf)</span><span class="sep">→</span>
+    <span data-node="pipe">postMessage / WebSocket</span><span class="sep">→</span>
+    <span data-node="engine">engine (worker or Node)</span>
+    <span class="sep">·</span><span data-node="frame">main frame</span><span class="sep">→</span><span data-node="present">screen</span>
+    <span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 9 · recorded 2026-11-16</p>
+  <h1>A real product built on regular-table: what do one scroll and one update cost through every layer of Perspective?</h1>
+  <p class="lede">Perspective 5.9.2 shows a table through regular-table, and keeps the data in a query engine that lives somewhere else: in a Web Worker of the same page, or in a Node process behind a WebSocket. This module follows one scroll and one <code>table.update()</code> through all five layers, counts the requests each draw sends, finds what decides how often the grid redraws, and then moves the engine 100 ms away.</p>
+  <p><b>Why this matters for Tablelab.</b> Tablelab has the same shape: an engine behind a transport, a window that the page pulls, change notifications that the engine pushes, and regular-table to draw. Perspective has already made each of those choices in shipped code. The traces show what each choice costs when it is cheap (a worker 0.05 ms away) and when it is not (a server 100 ms away), so we can keep the good ones and avoid three that the traces show to be expensive.</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>) for the trace vocabulary and for regular-table's sticky table. This module leans on, and does not repeat, <a href="anatomy.html">Module 3</a> (regular-table's draw loop in source), <a href="backend.html">Module 6</a> (request policies), <a href="streaming.html">Module 7</a> (the three paces and conflation) and <a href="network.html">Module 8</a> (delay). The traces are in <code>traces/</code>; each step links the one it reads.</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57, device scale factor 1.75, a 1000 × 600 viewport, one traced run per scenario. The table has 100,000 rows and 6 columns; about 22 rows are visible. Tracing was on with every category of the course switched on, which adds cost to each of the very short tasks this module is made of: durations under a millisecond are upper bounds (<a href="frames.html">Module 2</a> measures the instrumentation itself). Perspective's own bundles are minified; the datagrid's regular-table is served from its TypeScript source, so its function names are readable. Scenarios named <code>x-probe-…</code> are this module's own "change one input" recordings. Perspective source is quoted at tag v5.9.2 (<code>0264ec1</code>), regular-table at v0.9.2 (<code>52e86bf</code>).</p>
+  <div class="foot"><button class="primary" data-start>Start: 15 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · The layers" data-title="Five layers, one thread plus one more" data-node="viewer datagrid rt client pipe engine method"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>Before following anything: which code runs on which thread, and what will this trace be able to name?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the lab page (<code>lab/pages/src/psp.ts</code>, 141 lines) to see how the table is built, then list the threads of one trace with <code>node lab/harness/q.mjs x-scroll-worker threads</code> and match them to Perspective's source.</p>
+  </div></div>
+  <div class="tracelink" data-trace="x-scroll-worker">In Perfetto: the Renderer process has <code>CrRendererMain</code>, <code>Compositor</code> and one <code>DedicatedWorker thread</code>.</div>
+<pre>events   pid:tid            process / thread
+ 63514   1678651:1678651    Renderer / CrRendererMain          <span class="cp">1</span><span class="cp">2</span><span class="cp">3</span><span class="cp">4</span>
+ 58692   1678651:1678669    Renderer / Compositor
+  6125   1678651:1678741    Renderer / DedicatedWorker thread  <span class="cp">5</span>
+ 16754   1659215:1659215    Browser / CrBrowserMain
+ 14654   1659251:1659289    GPU Process / VizCompositorThread</pre>
+  <div class="chain">
+    <div><span class="pin">1</span><b>Viewer</b><code>&lt;perspective-viewer&gt;</code>: Rust compiled to WebAssembly, on the main thread. Owns the configuration and decides <em>when</em> the plugin draws: a lock and a throttle (step 8).</div>
+    <div><span class="pin">2</span><b>Datagrid plugin</b>JavaScript, main thread. Gives regular-table its data listener (fetch a window, parse, format each cell) and its style listeners.</div>
+    <div><span class="pin">3</span><b>regular-table</b>JavaScript, main thread. Virtual scroll, the sticky <code>&lt;table&gt;</code>, cell writes. The same 0.9.2 as Module 1.</div>
+    <div><span class="pin">4</span><b>Client</b>Rust, in the viewer's WebAssembly module, main thread. Turns each call (<code>view.to_columns_string()</code>) into a protobuf <code>Request</code> with an id, and matches each <code>Response</code> to its caller.</div>
+    <div><span class="pin">5</span><b>Engine</b>C++ compiled to WebAssembly. In a dedicated worker of this page (<code>engine=worker</code>), or in the lab's Node process behind <code>/ws/psp</code> (<code>engine=remote</code>). Holds the table, builds views, answers requests.</div>
+  </div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Four of the five layers share the main thread. Only the engine is elsewhere, and the two placements differ in one thing: the pipe between layers 4 and 5. With a worker, a request is one <code>postMessage</code> of a transferred buffer; with a server it is one binary WebSocket frame. The bytes are the same protobuf in both.</p>
+    <p>What the trace can name: regular-table's functions (<code>_on_scroll</code>, <code>draw_sync</code>, <code>_draw_td</code>) appear as written. The datagrid's and the client's JavaScript is minified (<code>K</code>, <code>To</code> in <code>assets/psp-….js</code>). WebAssembly frames are numbers (<code>wasm-function[1650]</code>), with one useful exception: a call from WebAssembly out to the browser keeps the name of the browser API (<code>__wbg_offsetParent_…</code>, which step 6 uses). In the worker, property names such as <code>handle_request</code> and <code>poll</code> survive.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-js/src/ts/wasm/browser.ts#L100-L114">rust/perspective-js/src/ts/wasm/browser.ts:100–114</a>
+      <p>The worker pipe. One copy out of WebAssembly memory (<code>slice</code>), then a transfer, which moves the buffer without copying it again:</p>
+<pre><span class="n">100</span>    const client = new Client(
+<span class="n">101</span>        async (proto: Uint8Array) =&gt; {
+<span class="n">102</span>            <mark>const f = proto.slice().buffer;</mark>
+<span class="n">103</span>            <mark>port.postMessage(f, { transfer: [f] });</mark>
+<span class="n">104</span>        },
+<span class="n">112</span>    port.onmessage = (json: MessageEvent&lt;Uint8Array&gt;) =&gt; {
+<span class="n">113</span>        client.handle_response(json.data);</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-js/src/ts/websocket.ts#L63-L84">rust/perspective-js/src/ts/websocket.ts:63–65, 82–83</a>
+      <p>The server pipe: the same two closures around a socket.</p>
+<pre><span class="n"> 63</span>        ws.onmessage = (event) =&gt; {
+<span class="n"> 64</span>            client.handle_response(event.data);
+<span class="n"> 82</span>            const buffer = proto.slice().buffer;
+<span class="n"> 83</span>            <mark>ws.send(buffer);</mark></pre>
+      <span class="path">lab/pages/src/psp.ts:61–70 · lab/server/psp.mjs:62–84</span>
+      <p>The lab's two modes: <code>perspective.worker()</code> then <code>worker.table(columns, { index: "row" })</code>, or <code>perspective.websocket(url)</code> then <code>client.open_table("lab")</code>. The server wraps every request in a <code>handle_request</code> span on the trace clock, so the engine's side is visible in the remote traces.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Request and response</dt><dd>Every call to the engine is a protobuf <code>Request { msg_id, entity_id, one of ~40 request kinds }</code>; the answer is a <code>Response</code> with the same <code>msg_id</code> (<code>perspective.proto:116–213</code>). A round trip is one request and its answer.</dd>
+      <dt>One-shot and subscription</dt><dd>Most calls resolve once. <code>view.on_update</code> registers a callback that the engine may answer many times with the same id: the push channel.</dd>
+      <dt>Dedicated worker</dt><dd>A second thread with its own event loop. In the trace, a message leaving a thread is a <code>SchedulePostMessage</code> instant and its handling on the other side is a <code>HandlePostMessage</code> span.</dd>
+      <dt>What a minified or WebAssembly frame still gives</dt><dd>Its duration and its place in the order. Most of this module is counting messages and reading their order, which does not need names.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> viewer, plugin, regular-table and client all compete for the main thread; the engine does not. Moving the engine to a server changes the pipe and nothing else on the page.</p>
+    <p><b>No:</b> that the WebAssembly parts are unmeasurable. Their spans and message counts are exact; only the names inside are missing.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-scroll-remote threads</code>: the <code>DedicatedWorker thread</code> row is gone and a process <code>Backend (node)</code> appears with a thread <code>perspective session</code>. Same page code, different pipe.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">Perspective's viewer, datagrid plugin, regular-table and protobuf client all run on the main thread; only the engine runs in a worker (or in Node behind a WebSocket).</li>
+    <li data-kind="read">Worker and WebSocket placements send the same protobuf bytes: postMessage with transfer (browser.ts:102–103) or ws.send (websocket.ts:82–83).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The wheel turns. Which of these layers act, in what order, and when are the new rows in the DOM?</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · One scroll" data-title="One scroll draw, hop by hop" data-node="input rt datagrid client pipe engine frame"
+  data-ask="late|When rows arrive late, what is on screen, and what do the frame records say about it?">
+  <p class="holding"><span class="label">Question I hold</span><span>A steady wheel scroll moves the table 40 px per frame. For one frame: who asks for rows, who answers, and in which frame are those rows written?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The engine sits in a worker and answers a window request in about 0.15 ms. A scroll event is dispatched at the start of frame N. The rows for that scroll position are written to the DOM…</p>
+    <div class="opts"><button data-k="a">in frame N, as soon as the answer is back</button><button data-k="b">in frame N+1</button><button data-k="c">two or more frames later</button></div>
+    <div class="reveal"><p><b>In frame N+1.</b> Two waits, and neither is the engine. The answer is a message task, and it queues behind frame N's own style, layout and paint (2.5 ms here). Then regular-table writes cells only inside a <code>requestAnimationFrame</code> callback, and frame N's callbacks have already run.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div><p>I take one frame from the middle of the scroll in <code>x-scroll-worker</code>, the one whose main frame starts at 500.37 ms, and list every hop on both threads up to the next frame.</p></div></div>
+  <div class="tracelink" data-trace="x-scroll-worker">In Perfetto: pin <code>CrRendererMain</code> and <code>DedicatedWorker thread</code>; search <code>HandlePostMessage</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["x-scroll-worker"],"from":497,"to":522,"rows":["frames","mainFrames","main","marks","worker"],"pins":[[1,500.8,"main.js"],[2,501.35,"marks"],[3,501.5,"worker"],[4,502.4,"main.layout"],[5,504.1,"main.js"],[6,517.3,"main.js"],[7,517.68,"marks"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>500.78 ms, main:</b> <code>Event: scroll</code>, 0.04 ms. regular-table's <code>_on_scroll</code> records the new position, sees that a scroll draw is already pending, sets a flag and returns.</li>
+    <li><i>2</i><b>500.82 ms, main:</b> the frame's animation callback (0.69 ms) writes the rows that were fetched during the <em>previous</em> frame. The lab's style listener marks <code>app: psp draw</code> with first row 50. Still inside this callback, regular-table sees the flag and starts the next round: two <code>postMessage</code> calls at 501.47 ms.</li>
+    <li><i>3</i><b>501.48 ms, worker:</b> the engine handles the first request in 0.115 ms and the second in 0.036 ms (too short for this chart, which draws worker tasks of 50 µs or more). Both answers are posted by 501.63 ms.</li>
+    <li><i>4</i><b>501.52 – 504.04 ms, main:</b> the frame's rendering: style (207 elements, 0.84 ms), layout (289 of 400 objects, 0.80 ms), paint, commit. The answers wait.</li>
+    <li><i>5</i><b>504.06 and 504.14 ms, main:</b> the two answers are handled (0.07 and 0.13 ms): decode, <code>JSON.parse</code>, format the cells. regular-table then asks for an animation frame at 504.27 ms. Nothing more happens for 12.6 ms.</li>
+    <li><i>6</i><b>517.30 ms, main:</b> the next frame's animation callback writes those rows…</li>
+    <li><i>7</i>…and marks <code>app: psp draw</code> with first row 52, and the cycle repeats.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The rows requested for the scroll position of frame N are written in frame N+1. The mark's detail shows the same thing as a distance: at 517.68 ms the first row drawn is 52, while the scroller is at 1240 px, which is row 53.9 at 23 px a row. The DOM is one frame of travel (40 px at this speed) behind the scroll position, in every frame of the scroll.</p>
+    <p>The engine's part is 0.15 ms of work. The time from request to DOM is 15.8 ms (501.47 → 517.30), and almost all of it is waiting: 2.5 ms behind the frame's own rendering, 13 ms for the next animation frame.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>This is a pipeline with a depth of one frame, built from two reasonable rules: fetch asynchronously, and write the DOM only in <code>requestAnimationFrame</code>. Module 1 saw the same in raw regular-table with a WebSocket source. What is new here is that a worker which answers inside the frame does not remove the frame of delay; it only guarantees that the delay is not two frames.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/events.ts#L60-L97">regular-table src/ts/events.ts:60–97</a>
+      <p>The scroll handler is a loop. One fetch is in flight; a newer position only sets a flag; the write waits for an animation frame. (<a href="anatomy.html">Module 3</a> reads <code>predraw</code> itself.)</p>
+<pre><span class="n">62</span>        this._scroll_left = this.scrollLeft;
+<span class="n">63</span>        this._scroll_top = this.scrollTop;
+<span class="n">64</span>        if (this._scroll_pending) {
+<span class="n">65</span>            <mark>this._scroll_dirty = true;</mark>
+<span class="n">66</span>            return;
+<span class="n">67</span>        }
+<span class="n">74</span>            await throttle_tag(this, async () =&gt; {
+<span class="n">75</span>                do {
+<span class="n">76</span>                    this._scroll_dirty = false;
+<span class="n">77</span>                    const commit = <mark>await this.predraw(</mark>width, height, {   <span class="c">// calls the data listener</span>
+<span class="n">86</span>                    if (!commit.inline) {
+<span class="n">87</span>                        <mark>await new Promise(requestAnimationFrame);</mark>
+<span class="n">88</span>                        commit();
+<span class="n">89</span>                    }
+<span class="n">90</span>                } while (this._scroll_dirty);</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Order inside a main frame</dt><dd>Input and scroll events, then animation callbacks, then style, layout, paint, commit, as one task (Module 1, step 8). A message that arrives during that task runs after it.</dd>
+      <dt>Pipeline depth</dt><dd>How many frames pass between the input a draw answers and the frame that shows it. Depth one means the content is always one frame of scrolling behind; nothing is blank, because regular-table's table is sticky and keeps showing the previous rows.</dd>
+      <dt>Work or waiting</dt><dd>Of the 15.8 ms from request to DOM, about 1 ms is work on either thread. A faster engine cannot shorten the rest.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with the engine in a worker, a scroll draw costs the main thread one animation callback and two short message tasks, and shows rows one frame late.</p>
+    <p><b>No:</b> that one frame late is visible at this speed, or that it is the same at other speeds: the lag is one frame of travel, so it grows with scroll speed. And one run: other frames in this trace differ by tenths of a millisecond.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected a 0.15 ms engine in a worker to give same-frame rows. The trace shows the answer sitting in the task queue while the frame renders, then waiting for the next <code>requestAnimationFrame</code>. Rule: the time to the DOM is set by where the answer lands in the frame's order of work, not by how fast it was computed. Budget "input in frame N, content in frame N+1" as the best case of any asynchronous pull.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-scroll-worker tree 500 505</code>. Expected: <code>ProxyMain::BeginMainFrame</code> from 500.37 ms for 3.67 ms, and after it two tasks containing <code>HandlePostMessage</code> at 504.06 and 504.14 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Worker placement, steady scroll: rows requested in frame N are written in frame N+1's animation callback; the DOM is one frame of travel behind the scroll position.</li>
+    <li data-kind="measured">Of 15.8 ms from window request to DOM write, the engine works 0.15 ms; the answer waits 2.5 ms behind the frame's rendering and 13 ms for the next animation frame.</li>
+    <li data-kind="read">regular-table's scroll loop: one fetch in flight, newer positions set <code>_scroll_dirty</code>, the write waits for requestAnimationFrame (events.ts:64–90).</li>
+    <li data-kind="rejected">"A sub-millisecond engine in a worker puts rows in the same frame."</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The loop posted two messages per draw. What are they, what comes back, and where does it become text?</p>
+</section>
+
+<section class="step" data-part="B · One scroll" data-title="Two requests per scroll draw, and what is in them" data-node="datagrid client pipe engine"
+  data-ask="reqs|How many requests does one draw cost, and why that many?">
+  <p class="holding"><span class="label">Question I hold</span><span>What are the two messages of a scroll draw, how big is the answer, and on which thread do the values become the strings in the cells?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the datagrid's data listener, then count messages on both ends of all three scroll traces. The remote traces add sizes: the lab's server records the bytes of every request and answer.</p>
+  </div></div>
+  <table>
+    <tr><th>Trace</th><th>Scroll draws</th><th>Requests the engine handled</th><th>Answers the page handled</th><th>Sizes (protobuf bytes)</th></tr>
+    <tr><td><code>x-scroll-worker</code></td><td class="num"><b data-m="x-scroll-worker/marks.psp draw"></b></td><td>242 <code>HandlePostMessage</code> on the worker</td><td>242 <code>HandlePostMessage</code> on main</td><td>not recorded</td></tr>
+    <tr><td><code>x-scroll-remote</code></td><td class="num"><b data-m="x-scroll-remote/marks.psp draw"></b></td><td>242 <code>handle_request</code> spans (121 of 43–46 B, 121 of 30–32 B)</td><td>242 <code>WebSocketReceive</code></td><td>window answer 1.1–1.3 kB; the other 42–43 B</td></tr>
+    <tr><td><code>x-scroll-remote-lat50</code></td><td class="num"><b data-m="x-scroll-remote-lat50/marks.psp draw"></b></td><td>38</td><td>38</td><td>the same two kinds</td></tr>
+  </table>
+  <p class="note">Message counts were read from these recordings with the commands in "Try it"; the ratio, two per draw, is what the source predicts.</p>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Exactly two requests per scroll draw in every placement. The source names them: <code>view.to_columns_string(window)</code> and <code>view.num_columns()</code>, sent together and awaited together, so they cost one round trip, not two.</p>
+    <p>The answer to the first is a protobuf message whose only field is a <b>JSON string</b> of column arrays for the visible rectangle plus a row-id column: about 1.2 kB for 23 rows × 6 columns. The page parses it with <code>JSON.parse</code> and then formats every cell on the main thread, numbers through cached <code>Intl.NumberFormat</code> objects. The second request asks for the view's dimensions again on every draw, although only the column count is used and it does not change during a scroll.</p>
+    <p>The datagrid keeps no rows between draws. Each draw fetches the whole visible rectangle again, including the 21 rows that were already on screen.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/packages/viewer-datagrid/src/ts/data_listener/index.ts#L117-L126">packages/viewer-datagrid/src/ts/data_listener/index.ts:117–126</a>
+      <p>The function regular-table awaits for every window: the two requests and the parse.</p>
+<pre><span class="n">117</span>            const [x, z] = <mark>await Promise.all([</mark>
+<span class="n">118</span>                <mark>this._view.to_columns_string({</mark>
+<span class="n">119</span>                    ...new_window,
+<span class="n">120</span>                    end_row: y1 + lookahead,
+<span class="n">121</span>                } as any),
+<span class="n">122</span>                <mark>this._view.num_columns(),</mark>
+<span class="n">123</span>            ]);
+<span class="n">125</span>            num_columns = z;
+<span class="n">126</span>            columns = <mark>JSON.parse(x as string)</mark> as ColumnData;</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-js/src/rust/view.rs#L433-L437">rust/perspective-js/src/rust/view.rs:433–436</a>
+<pre><span class="n">433</span>    pub async fn num_columns(&amp;self) -&gt; ApiResult&lt;u32&gt; {
+<span class="n">436</span>        Ok(<mark>self.0.dimensions().await?</mark>.num_view_columns)</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-client/perspective.proto#L542-L544">rust/perspective-client/perspective.proto:542–544</a>
+<pre><span class="n">542</span>message ViewToColumnsStringResp {
+<span class="n">543</span>    <mark>string json_string = 1;</mark></pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/packages/viewer-datagrid/src/ts/data_listener/format_cell.ts#L69-L70">…/data_listener/format_cell.ts:69–70</a>
+      <p>Called once per visible cell, on the main thread:</p>
+<pre><span class="n">69</span>        const formatter = FORMAT_CACHE.get(type, plugin);
+<span class="n">70</span>        return formatter ? <mark>formatter.format(val)</mark> : String(val);</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Parallel requests are one round trip</dt><dd>Two requests sent in the same task and awaited with <code>Promise.all</code> wait for the slower answer once. Requests awaited one after another wait once each. Step 6 has both kinds.</dd>
+      <dt>Where the cost of this design sits</dt><dd>Parse and format of 138 cells fit inside the 0.13 ms task that handles the second answer in step 2. The sampled profile has no <code>format</code> or <code>parse</code> frame at all: at this window size they are too short to catch. <a href="javascript.html">Module 4</a> shows where per-cell formatting starts to matter.</dd>
+      <dt>Text inside binary</dt><dd>The envelope is protobuf, the payload is JSON text. The engine serializes numbers to text, the page parses them back and then formats them to text again.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a scroll draw is one round trip carrying two requests, and the page holds no row cache: the pipe carries the full window every time.</p>
+    <p><b>No:</b> that JSON-in-protobuf is slow here. For 138 cells the whole answer is handled in about 0.2 ms. The traces say nothing about a 5,000-cell window.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A proposal: let the window answer carry everything a draw needs (rows, row and column counts, a version), so that "one draw" is one request by construction. Perspective's second request is free while it travels in parallel, and becomes a habit that costs a round trip each time it is awaited alone, as step 6 shows.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-scroll-worker slices '^HandlePostMessage$' DedicatedWorker</code> ends with <code>242 events … total 25.33 ms</code>; <code>node lab/harness/q.mjs x-scroll-remote slices handle_request</code> lists each request with its <code>bytes</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Two requests per scroll draw in every placement (242 for 121 draws; 38 for 19), sent in parallel: one round trip.</li>
+    <li data-kind="read">The window travels as a JSON string inside protobuf (perspective.proto:543), is parsed on the main thread (data_listener/index.ts:126) and formatted per cell there (format_cell.ts:69–70).</li>
+    <li data-kind="read">The datagrid keeps no rows between draws; every draw refetches the whole visible rectangle, about 1.2 kB here.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Parse and format are small. Then where do the main thread's milliseconds go in a scroll draw, and how much of the total is the engine?</p>
+</section>
+
+<section class="step" data-part="B · One scroll" data-title="The budget of a scroll draw" data-node="rt datagrid frame engine method">
+  <p class="holding"><span class="label">Question I hold</span><span>Per scroll draw: how much is JavaScript, how much is style and layout, how much is the engine? And is the top line of the profile Perspective's?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>Totals over the whole scroll for the worker and the localhost-server placements, with Module 2's raw regular-table scroll (<code>f-scroll-regular</code>) beside them for scale (a smaller viewport: 72 cells against 138). Then the sampled profile of the main thread.</p></div></div>
+  <table class="mtable" data-rows="x-scroll-worker,x-scroll-remote,f-scroll-regular" data-names="Perspective · engine in worker,Perspective · engine in Node (localhost),raw regular-table · local data (Module 2)" data-head="Scroll of 2 s"
+    data-cols="state.cellsInDom|cells in DOM,frames.mainFrameMs.p50|main frame p50|ms,main.scriptMs|script|ms,main.styleMs|style|ms,main.layoutMs|layout|ms,main.paintMs|paint|ms,threads.workerBusyMs|worker busy|ms"></table>
+  <div class="bars" data-bars='{"ids":["x-scroll-worker","x-scroll-remote","f-scroll-regular"],"labels":["engine in worker","engine in Node","raw regular-table"],"series":[{"path":"main.scriptMs","label":"script","color":"#d9a800"},{"path":"main.styleMs","label":"style","color":"#9b59d0"},{"path":"main.layoutMs","label":"layout","color":"#c39be0"},{"path":"main.paintMs","label":"paint","color":"#2e9e5b"}],"stack":true,"unit":"ms","title":"Main thread over the whole scroll, by kind of work"}'></div>
+  <div class="prof" data-prof="x-scroll-worker" data-top="8" data-by="self"></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>In the worker trace the main thread spends <b data-m="x-scroll-worker/main.scriptMs"></b> ms in script, <b data-m="x-scroll-worker/main.styleMs"></b> ms in style and <b data-m="x-scroll-worker/main.layoutMs"></b> ms in layout: the browser's work on the changed cells is twice the JavaScript that changed them. Each draw rewrites the text of every visible cell, so each frame restyles 207 elements and lays out 289 of 400 layout objects. The worker is busy <b data-m="x-scroll-worker/threads.workerBusyMs"></b> ms in total, about a quarter of a millisecond per draw.</p>
+    <p>The localhost-server placement is the same picture with slightly more script: the answers arrive through a socket instead of a message port, and still before the frame's rendering has finished.</p>
+    <p>The first line of the profile is <code>mark</code>. That is <code>performance.mark</code> with a detail object, called by the lab's own style listener to leave <code>app: psp draw</code> in the trace. With tracing on, it is the largest single JavaScript function of the scroll.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/psp.ts:84–92</span>
+      <p>To know which lines of the profile are the lab's. The listener runs once per draw, after regular-table has written the cells:</p>
+<pre><span class="n">84</span>  rt.addStyleListener(() =&gt; {
+<span class="n">85</span>    counters.draws++;
+<span class="n">86</span>    const td = rt.querySelector("tbody td");
+<span class="n">87</span>    const meta = td &amp;&amp; rt.getMeta(td);
+<span class="n">88</span>    <mark>performance.mark("app: psp draw", { detail: { y0: meta?.y0, first: meta?.y } });</mark></pre>
+      <p>The second mark, <code>app: content complete</code>, fires when the first cell is the first row of the fetched window. In this page that does not compare against the scroll position; its detail carries both numbers, and this module compares them by hand.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Self time, sampled</dt><dd>The profile comes from stack samples about 0.1 ms apart. It ranks functions that run long enough to be hit; it cannot rank the many 20–50 µs tasks of this module. Native work (style, layout, message handling) is not in it at all, which is why the table above comes from spans.</dd>
+      <dt>Observer effect</dt><dd>What the measuring adds. Here one mark per draw is visible in the profile; the trace events written for every task and microtask are a second, larger cost that no profile line shows. <a href="frames.html">Module 2</a> measures both.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in a scroll, the engine is a few percent of the work and the main thread's largest share is style and layout of rewritten cells. Putting the engine in a worker protects the page from queries, not from drawing.</p>
+    <p><b>No:</b> that Perspective's grid is "twice as slow" as raw regular-table: the two rows differ in viewport, cell count, CSS and listeners. The row is there for scale only.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read the top of the profile as the product's hot spot. It was my own <code>performance.mark</code>. Rule: before ranking a library's functions, find your instrumentation in the list and take it out; and never rank sub-0.1 ms work from samples.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-scroll-worker prof 0 2100</code>. Expected: after <code>(idle)</code> and <code>(program)</code>, the first named function is <code>mark</code>, then regular-table's <code>_draw_td</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Scroll, worker placement: style plus layout on the main thread is about twice the script time; the worker's share is about 0.25 ms per draw.</li>
+    <li data-kind="measured">The largest sampled JavaScript function of the scroll is the lab's own performance.mark with detail (an observer effect).</li>
+    <li data-kind="rejected">"The top line of the sampled profile is the product's hot spot."</li>
+  </ul>
+  <p class="next"><b>Next question →</b> On localhost the server placement looks like the worker. What does the same scroll show when each round trip takes 100 ms?</p>
+</section>
+
+<section class="step" data-part="B · One scroll" data-title="The same scroll, 100 ms from the engine" data-node="rt pipe engine frame present">
+  <p class="holding"><span class="label">Question I hold</span><span>With the table on a server 50 ms away in each direction: how often does the grid redraw during a scroll, what is on screen in between, and do the frame records notice?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The same 2-second scroll at 2,400 px/s, round trip 100 ms. What do the frame records and the draw count say?</p>
+    <div class="opts"><button data-k="a">Many frames are dropped or partial: the compositor has nothing new to show</button><button data-k="b">Nearly every frame is "presented with the main thread's update", while the table redraws fewer than 10 times a second</button><button data-k="c">Frames are fine and the table redraws every frame, with blank rows filled in 100 ms later</button></div>
+    <div class="reveal"><p><b>Frames are green; the table redraws 8.6 times a second.</b> The compositor scrolls the scroller and the main thread commits every frame (it has nothing heavy to do). The rows on screen are simply old.</p></div>
+  </div>
+  <table class="mtable" data-rows="x-scroll-worker,x-scroll-remote,x-scroll-remote-lat50" data-names="engine in worker,engine in Node (localhost),engine in Node · 50 ms each way" data-head="Scroll of 2 s"
+    data-cols="marks.psp draw|draws,frames.all|frames with main update,frames.partial|partial,frames.dropped|dropped,content.settleMs|last rows after last input|ms,frames.mainFrameMs.p50|main frame p50|ms" data-hi="x-scroll-remote-lat50:marks.psp draw"></table>
+  <div class="tracelink" data-trace="x-scroll-remote-lat50">The <code>Backend (node)</code> process shows each <code>handle_request</code>; delay is added by the lab's proxy (<code>lab/server/netem.mjs</code>) in both directions.</div>
+  <div class="lanes" data-lanes='{"traces":["x-scroll-remote-lat50"],"from":-10,"to":520,"rows":["frames","main","app","psp"],"pins":[[1,17.5,"main.js"],[2,68.3,"psp"],[3,118.9,"main.js"],[4,135.4,"app"],[5,200,"frames"],[6,251.6,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>17.8 ms:</b> the first scroll event sends the pair of requests.</li>
+    <li><i>2</i><b>68.3 ms:</b> they reach the server 50 ms later. It answers both within 0.2 ms.</li>
+    <li><i>3</i><b>118.8 ms:</b> the answers reach the page. regular-table asks for an animation frame.</li>
+    <li><i>4</i><b>135.3 ms:</b> the rows are written (◆): first row 1, while the scroller is already at 311 px, row 13. The next pair leaves at once.</li>
+    <li><i>5</i>Meanwhile every vsync is a green box: a frame was presented with the main thread's (empty) update.</li>
+    <li><i>6</i><b>251.6 ms:</b> the next draw: first row 13, scroller at 590 px (row 25). Draws repeat every 116.5 ms: one round trip plus the wait for an animation frame.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>On localhost the server placement equals the worker placement in every column. With 100 ms of round trip the scroll produces <b data-m="x-scroll-remote-lat50/marks.psp draw"></b> draws instead of <b data-m="x-scroll-worker/marks.psp draw"></b>, each showing rows that were right 117 ms earlier: about 12 rows, half the viewport, behind the scrollbar. The frame counts do not change at all: <b data-m="x-scroll-remote-lat50/frames.all"></b> frames with the main thread's update, <b data-m="x-scroll-remote-lat50/frames.dropped"></b> dropped.</p>
+    <p>No queue builds. There are 38 requests for 19 draws: while a pair is in flight, newer scroll positions only overwrite <code>_scroll_top</code> and set the dirty flag, so the next pair asks for the newest position. The server is idle between pairs: its two spans per draw total under 0.2 ms.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The screen shows a table that stands still and jumps half a screen 8.6 times a second, under a scrollbar that moves smoothly. The frame pipeline is healthy the whole time, because a sticky table with old rows is a perfectly valid frame. This is Module 1's sticky stale table, with a number on it: staleness equals one round trip plus up to one frame.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/harness/analyze-lib.mjs:176–205, 341–347</span>
+      <p>To know what "frames with main update" is: one <code>PipelineReporter</code> per vsync, ended in state <code>STATE_PRESENTED_ALL</code>. It records that the compositor and the main thread both delivered for that vsync. It does not know what the page wanted to show.</p>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/docs/md/explanation/architecture/server_only.md">docs/md/explanation/architecture/server_only.md:12–14</a>
+      <p>Perspective's documentation says as much about this placement: "interactive performance is poor, as every user interaction must page the server to render. Operations like scrolling are not as responsive and can be impacted by network latency."</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Latest wins, one in flight</dt><dd>regular-table's dirty flag is a request policy: never more than one fetch outstanding, and the next one asks for the newest position. <a href="backend.html">Module 6</a> calls it "inflight" and compares it with asking for every range.</dd>
+      <dt>Content rate and frame rate</dt><dd>Frames per second counts presentations. Draws per second counts new content. They are equal only while every frame's content is ready in time.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with a remote engine and no rows kept on the page, content staleness during a scroll is one round trip plus up to a frame, and the draw rate is its inverse. Frame records stay green throughout.</p>
+    <p><b>No:</b> what the eye sees: headless Chrome recorded no screenshots here; the positions come from the marks' details. And 100 ms is one point; <a href="network.html">Module 8</a> has the curve for raw regular-table.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I would have reported this scroll as smooth: zero dropped frames, every frame with the main thread's update. The table changed 19 times in 2 seconds. Rule: a frame record certifies that a frame was produced, not that it showed what the user asked for. For a pulled window, measure how far the drawn rows are from the scroll position.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposals. Keep regular-table's "one pull in flight, newest position wins": it held the request rate at one pair per round trip with no backlog. Add what Perspective's datagrid does not have: rows kept on the page around the viewport (overscan or a small row cache), so that a scroll shorter than the cache draws without a round trip. And report scroll quality as distance between drawn rows and scroll position over time, next to the frame counts.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-scroll-remote-lat50 marks 'psp draw'</code>: <code>19 entries</code>, about 116.5 ms apart. Then <code>… frames 0 600</code>: after the first vsync (<code>partial</code>: its main frame was sent after the compositor had drawn) every vsync line says <code>all</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Remote engine at 100 ms round trip: 19 scroll draws in 2 s, each about 12 rows behind the scroll position; frame records unchanged (no drops).</li>
+    <li data-kind="measured">One pair of requests in flight at a time, newest position next: 38 requests for 19 draws, no queue, server idle.</li>
+    <li data-kind="rejected">"All frames presented with the main thread's update means the scroll was smooth."</li>
+  </ul>
+  <p class="next" data-answer="late"><b>Next question →</b> That was a pull the user started. What happens when the data changes by itself: one <code>table.update()</code>?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · One update" data-title="One update, hop by hop" data-node="input client pipe engine viewer datagrid rt"
+  data-ask="pace|What decides how often the grid redraws when data keeps changing?">
+  <p class="holding"><span class="label">Question I hold</span><span>The page calls <code>table.update()</code> with one new price. Follow it to the engine and back until the cell shows it. How many requests does that take?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>One <code>table.update({row: [7], price: [12.5]})</code>, engine in the worker, the row is visible. Until the new price is in the DOM, the page sends the engine…</p>
+    <div class="opts"><button data-k="a">1 request: the update; the engine pushes the changed cell back</button><button data-k="b">2 requests: the update, then one fetch of the window</button><button data-k="c">7 requests</button></div>
+    <div class="reveal"><p><b>Seven.</b> The update, one request by the viewer when the change notification arrives, and five more for the draw: schema, row count, dimensions, then the window and the column count together.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div><p>In <code>x-stream-worker-100</code> the page calls <code>table.update()</code> 100 times a second (one row, one price, among the 12 top rows). I take update number 118, at 106.62 ms, and list every task on both threads until the draw mark. Each line's meaning comes from the source files below.</p></div></div>
+  <div class="tracelink" data-trace="x-stream-worker-100">In Perfetto: zoom to 106.5–108 ms and pin both threads; each <code>HandlePostMessage</code> on one thread follows a <code>SchedulePostMessage</code> on the other.</div>
+<pre>   ms      thread   task (duration)                what it is
+106.621   main     TimerFire (0.09 ms)            the page's producer calls table.update()            <span class="cp">1</span>
+106.686   main  →  postMessage                    <b>request 1</b>  TableUpdateReq
+106.688   worker   HandlePostMessage (0.049)      append the row to the table's input port, mark the table dirty, answer   <span class="cp">2</span>
+106.739   main     HandlePostMessage (0.031)      the update() promise resolves. No view has changed yet.
+106.740   worker   TimerFire (0.054)              the 0 ms "poll" timer: apply the port to the views, notify subscribers
+106.795   main     HandlePostMessage (0.059)      notification "view changed" (no data)                <span class="cp">3</span>
+                →  postMessage                    <b>request 2</b>  ViewDimensionsReq   (viewer: status-bar statistics)
+106.859   main     HandlePostMessage (0.259)      answer; read plugin.offsetParent: forced style + layout, 0.20 ms   <span class="cp">4</span>
+                                                  take the draw lock; setTimeout(0)                    ← the throttle
+107.123   main     TimerFire (0.055)              <b>request 3</b>  ViewSchemaReq       (viewer: render limits)   <span class="cp">5</span>
+107.184   main     HandlePostMessage (0.196)      answer → plugin.update():
+                →                                 <b>request 4</b>  ViewDimensionsReq   (datagrid: row count)
+107.387   main     HandlePostMessage (0.060)      answer → regular_table.draw():
+                →                                 <b>request 5</b>  ViewDimensionsReq   (regular-table's dimension probe)
+107.453   main     HandlePostMessage (0.086)      answer → the data listener, as in a scroll:
+                →                                 <b>requests 6, 7</b>  ViewToColumnsStringReq + ViewDimensionsReq
+107.544   main     HandlePostMessage (0.019)      answer 6
+107.567   main     HandlePostMessage (0.278)      answer 7 → JSON.parse, format, write cells, style listeners   <span class="cp">6</span>
+107.803   main     mark "app: psp draw"                                                                <span class="cp">7</span></pre>
+  <div class="lanes" data-lanes='{"traces":["x-stream-worker-100"],"from":106.5,"to":108.0,"rows":["main","app","marks","worker"],"pins":[[1,106.63,"app"],[2,106.71,"worker"],[3,106.83,"main.js"],[4,107.0,"main.layout"],[5,107.14,"main.js"],[6,107.7,"main.js"],[7,107.8,"marks"]]}'></div>
+  <p class="note">The chart draws worker tasks of 50 µs or more and thins dense rows, so it shows two of the worker's seven tasks; the list above has all of them.</p>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>From <code>update()</code> to the DOM: 1.18 ms, 7 requests, 8 messages handled on the main thread (7 answers and the notification). Over the whole trace the counts are exact multiples: 200 updates, 1,400 messages handled by the worker, 1,600 by the main thread, <b data-m="x-stream-worker-100/marks.psp draw"></b> draws. One draw per update, nothing merged.</p>
+    <p>The same stream with the engine on a server lets me check the kinds by size, because the lab's server logs every answer: in <code>x-stream-remote-100</code> it sent 200 notifications (32 bytes each), 802 dimension answers (42–44 bytes), 200 schema answers (96–97 bytes) and 201 window answers (about 1.2 kB). Four dimension requests, one schema request and one window request per update, as listed.</p>
+    <p>Five of the seven requests are awaited one after another. Requests 3, 4, 5 and the pair 6+7 form a chain of <b>four serial round trips</b> for every draw, and request 2 is a fifth before the draw is even asked for. With a worker each round trip costs 0.05–0.2 ms and nobody notices.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <p>One line of source for each request, to know who sends it.</p>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/session/view_subscription.rs#L64-L84">rust/perspective-viewer/src/rust/session/view_subscription.rs:69–84</a> <span class="src">request 2, once per notification</span>
+<pre><span class="n">69</span>        self.clone().update_view_stats().await?;
+<span class="n">73</span>            on_update.emit(());   <span class="c">// the redraw request</span>
+<span class="n">84</span>        <mark>let dimensions = self.view.dimensions().await?;</mark></pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/renderer/limits.rs#L73-L74">rust/perspective-viewer/src/rust/renderer/limits.rs:74</a> <span class="src">request 3</span>
+<pre><span class="n">74</span>            <mark>let schema = view.schema().await?;</mark></pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/packages/viewer-datagrid/src/ts/custom_elements/datagrid.ts#L264-L265">packages/viewer-datagrid/src/ts/custom_elements/datagrid.ts:264–265</a> <span class="src">request 4, then the draw</span>
+<pre><span class="n">264</span>            <mark>this.model._num_rows = await view.num_rows();</mark>
+<span class="n">265</span>            await this.regular_table.draw();</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/packages/viewer-datagrid/src/ts/data_listener/index.ts#L220-L222">…/data_listener/index.ts:221</a> <span class="src">request 5: regular-table asks the listener for an empty window to learn the dimensions</span>
+<pre><span class="n">221</span>            <mark>num_columns = await this._view.num_columns();</mark></pre>
+      <p>Requests 6 and 7 are the pair of step 3 (<code>index.ts:117–123</code>). A scroll skips request 5 because <code>_on_scroll</code> draws with <code>cache: true</code> (regular-table <code>scroll_panel.ts:369–371</code> resets the cached dimensions only <code>if (!cache)</code>).</p>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/renderer/dispatch.rs#L447-L455">rust/perspective-viewer/src/rust/renderer/dispatch.rs:447–453</a> <span class="src">the forced layout at pin 4</span>
+<pre><span class="n">447</span>    pub fn is_plugin_hidden(&amp;self) -&gt; bool {
+<span class="n">451</span>                <mark>.offset_parent()</mark>
+<span class="n">452</span>                .is_none(),</pre>
+      <p>The sampled stack at 106.98 ms ends in <code>__wbg_offsetParent_9627ebca6b03e8b2</code>: the viewer asks, on every notification, whether the plugin is displayed. Reading <code>offsetParent</code> makes the browser bring style and layout up to date first (<a href="rendering.html">Module 5</a>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>An update is queued, then applied</dt><dd><code>table.update()</code> resolves when the engine has queued the rows. Views change later, in a separate step the source calls <em>poll</em>; in the browser worker that step runs from a <code>setTimeout</code> with no delay (<code>engine.ts:59–69</code>). Step 8 returns to it.</dd>
+      <dt>Notification without data</dt><dd>The message at pin 3 says only "this view changed". Everything the screen needs is then pulled. Step 7 looks at what that implies.</dd>
+      <dt>Serial round trips multiply delay</dt><dd>Four awaits in a row cost four round trips. At 0.1 ms each that is 0.4 ms; at 100 ms each it is 400 ms. Counting them now is what makes step 11 predictable.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> per change notification the page sends 1 request; per executed draw 5 more, as 4 serial round trips; plus the update itself when the page is the producer. In a worker the whole cycle takes about a millisecond.</p>
+    <p><b>No:</b> that 7 requests are a cost problem here: the worker spent 0.25 ms on them. The count is a latency multiplier waiting for a slow pipe.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-stream-worker-100 slices '^HandlePostMessage$' DedicatedWorker 0 2001</code> → <code>1400 events</code>; the same with <code>main</code> instead of <code>DedicatedWorker</code> → <code>1600 events</code>; <code>… marks 'psp draw' 0 2001</code> → <code>200 entries</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One update, worker placement: 7 requests (update, 4 × dimensions, schema, window), 8 messages handled on main, 1.18 ms from update() to DOM; over the trace 200 updates → 1,400 requests → 200 draws.</li>
+    <li data-kind="read">Per change notification the viewer sends one dimensions request before asking for a redraw (view_subscription.rs:69–84); each executed draw adds schema (limits.rs:74), row count (datagrid.ts:264), a dimension probe (index.ts:221) and the window pair: four serial round trips.</li>
+    <li data-kind="measured">Every notification makes the viewer read plugin.offsetParent, which forces style and layout when a previous draw left them dirty.</li>
+  </ul>
+  <p class="next" data-answer="reqs"><b>Next question →</b> The notification carried no data and the page pulled a whole window. Does the grid at least know whether the change is on screen?</p>
+</section>
+
+<section class="step" data-part="C · One update" data-title="The notification says only “something changed”" data-node="engine pipe viewer datagrid rt present">
+  <p class="holding"><span class="label">Question I hold</span><span>If an update changes a row that is not on screen, what does the page do?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The view is sorted by price, descending, so the 12 rows being updated are far below the visible window. 100 updates a second. Per update, the page…</p>
+    <div class="opts"><button data-k="a">does nothing: the engine knows the viewport and stays quiet</button><button data-k="b">handles a notification, sees the rows are off screen, and stops</button><button data-k="c">runs the whole cycle: dimension requests, schema, window fetch, a pass over every cell</button></div>
+    <div class="reveal"><p><b>The whole cycle.</b> The notification has no row information, and the engine is not told which window the page shows. The only way to find out whether the screen changed is to fetch the window and compare.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div><p>A probe with one input changed: <code>x-probe-offscreen</code> is the stream of step 6 with <code>sort=price</code> (one second long). I read the notification's definition, then count draws, frames and layouts.</p></div></div>
+  <div class="tracelink" data-trace="x-probe-offscreen">The <code>DedicatedWorker thread</code> row is the surprise in this trace: look at its <code>TimerFire</code> slices.</div>
+  <table class="mtable" data-rows="x-stream-worker-100,x-probe-offscreen" data-names="updates to visible rows (2 s),updates to rows sorted out of view (1 s)" data-head="100 update() calls a second"
+    data-cols="marks.psp draw|draws,frames.all|frames presented,frames.noUpdate|vsyncs with nothing to show,main.layouts|layouts,main.scriptMs|main script|ms,threads.workerBusyMs|worker busy|ms" data-hi="x-probe-offscreen:frames.all,x-probe-offscreen:threads.workerBusyMs"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="x-probe-offscreen/marks.psp draw"></b> full draw cycles in one second, <b data-m="x-probe-offscreen/frames.all"></b> frames presented, <b data-m="x-probe-offscreen/main.layouts"></b> layouts. Every cycle fetched the window and walked the cells; regular-table compared each value with what the cell already showed and wrote nothing; the browser had nothing to draw. The main thread still spent <b data-m="x-probe-offscreen/main.scriptMs"></b> ms of that second in script.</p>
+    <p>The second surprise is the worker: busy <b data-m="x-probe-offscreen/threads.workerBusyMs"></b> ms of 1,000. In step 6 the engine applied an update in 0.05 ms. With the view sorted, the same step (the worker's <code>TimerFire</code>) takes 4.1–10.3 ms, 6.8 ms on average over the 100 updates of this recording. Requests that arrive meanwhile wait: one posted at 31.03 ms is handled at 35.72 ms, when the 6.55 ms apply step that began at 29.16 ms has ended; 64 of the 578 requests of this second were posted during such a step. The engine is one thread and serves reads and writes in arrival order.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>"Repaints only what changed" is true at the last hop and nowhere before it. The cell text is written only if it differs. To get there, every update anywhere in the table costs every viewer a notification, six requests, a 1.2 kB answer, a parse, a format and a walk over all visible cells.</p>
+    <p>The worker number is a separate finding and I only have this one configuration for it: a one-row update into a 100,000-row view sorted on the updated column. It shows that the engine's cost per update depends on the view, by two orders of magnitude here, and that a worker placement is what keeps that cost off the main thread (main is <b data-m="x-probe-offscreen/threads.mainUtilPct"></b>% busy).</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-client/perspective.proto#L521-L525">rust/perspective-client/perspective.proto:521–525</a>
+      <p>What a notification can carry: an optional delta, and nothing about which rows.</p>
+<pre><span class="n">521</span>message ViewOnUpdateResp {
+<span class="n">522</span>    <mark>optional bytes delta = 1;</mark>
+<span class="n">523</span>    uint32 port_id = 2;
+<span class="n">524</span>    bool reset = 3;
+<span class="n">525</span>}</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/session/view_subscription.rs#L160-L165">rust/perspective-viewer/src/rust/session/view_subscription.rs:160–164</a>
+      <p>The viewer subscribes with default options, which means no delta: the 32-byte message is only a signal.</p>
+<pre><span class="n">160</span>            let result = view
+<span class="n">161</span>                .on_update(
+<span class="n">162</span>                    Box::new(move |msg| emit.poll(msg)),
+<span class="n">163</span>                    <mark>OnUpdateOptions::default(),</mark>
+<span class="n">164</span>                )</pre>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/tbody.ts#L58-L67">regular-table src/ts/tbody.ts:58–67</a>
+      <p>Why no frame was produced: the cell is touched only when its value differs.</p>
+<pre><span class="n">58</span>        <mark>if (metadata.value !== val) {</mark>
+<span class="n">63</span>                td.textContent = String(val ?? "");
+<span class="n">67</span>        metadata.value = val;</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/docs/md/use_cases/real_time_dashboard.md">docs/md/use_cases/real_time_dashboard.md:10–14</a>
+      <p>The claim being tested: "<code>&lt;perspective-viewer&gt;</code> repaints only what changed. There is no polling and no query re-execution. An update of 50 rows to a 10 million row table costs work proportional to the 50 rows."</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Signal or data</dt><dd>A push can carry the change itself (the lab's own tick stream in <a href="streaming.html">Module 7</a> does: row, column, value) or only say that something changed. A signal is small and never stale, and makes every change cost a pull.</dd>
+      <dt>Scope</dt><dd>What a notification says about <em>where</em> the change is. With no scope, a viewer cannot tell an update to row 7 from one to row 70,000.</dd>
+      <dt>NO_UPDATE_DESIRED</dt><dd>The grey frame state: the vsync arrived and neither thread had anything new. <b data-m="x-probe-offscreen/frames.noUpdate"></b> of them in a second of constant drawing means the drawing changed nothing.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> Perspective's datagrid cannot skip work for off-screen changes; it finds out by refetching. Its saving is at the DOM: unchanged cells are not written and no frame is produced.</p>
+    <p><b>No:</b> anything general about the engine's update cost from the worker number: one view configuration, one table size, one run. The documentation's "proportional to the rows" claim was not met in this configuration; I did not look for the reason in the C++.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposals. Tablelab's design already has "a view reports that its window, row count, or summary changed". Make the first of those literal: let the engine know each view's current window and stay silent, or send a count-only notice, when a change does not touch it. Stamp notifications and windows with a version so the page can tell "already have this". And keep reads from queueing behind writes in the engine: a window read that waits for a 7 ms apply step, as here, is the same head-of-line wait as a slow backend in <a href="backend.html">Module 6</a>.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-probe-offscreen slices '^TimerFire$' DedicatedWorker 0 100</code>: every few lines one slice of 5–8 ms (an update being applied to the sorted view) among slices of 0.01 ms (polls with nothing to do). <code>… frames</code> prints <code>none</code> on every vsync line.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">The viewer's change notification carries no data and no row scope (perspective.proto:521–525; subscribed with default options, view_subscription.rs:163).</li>
+    <li data-kind="measured">Updates to rows sorted out of view still run the full cycle (76 draws in 1 s) and produce 0 frames: regular-table writes a cell only when its value differs (tbody.ts:58).</li>
+    <li data-kind="measured">Same probe: applying a one-row update to a 100,000-row sorted view kept the worker busy 6.8 ms on average, against 0.05 ms unsorted; a read request waited 4.7 ms behind one such step.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> One draw per update at 100 a second. What happens at 1,000 a second: does anything hold the draws back?</p>
+</section>
+
+<section class="step" data-part="C · One update" data-title="What paces redraws: a lock, a sleep, and an accident" data-node="input engine viewer frame present">
+  <p class="holding"><span class="label">Question I hold</span><span>At 1,000 updates a second, how many times a second is the DOM redrawn, how many frames is that, and which mechanism sets the number?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The page calls <code>table.update()</code> 1,000 times a second from a <code>setInterval(…, 1)</code>. The viewer has a draw lock ("one running, one parked") and an adaptive throttle. DOM draws per second:</p>
+    <div class="opts"><button data-k="a">about 1,000: one per update, as at 100 a second</button><button data-k="b">about 60: the lock and throttle settle at the frame rate</button><button data-k="c">about 250</button></div>
+    <div class="reveal"><p><b>About 250</b>, and for a reason that has nothing to do with the viewer: the browser clamps a repeating timer to 4 ms, so the producer runs 250 times a second and makes 4 updates each time; the worker folds each burst into one notification. The viewer then draws once per notification, 4 times per frame.</p></div>
+  </div>
+  <table class="mtable" data-rows="x-stream-worker-100,x-stream-worker-1000" data-names="100 update() a second,1000 update() a second" data-head="Engine in worker, 2 s"
+    data-cols="marks.psp draw|draws,frames.all|frames presented,main.rafCallbacks|animation callbacks,main.scriptMs|main script|ms,threads.mainUtilPct|main busy|%,threads.workerBusyMs|worker busy|ms"></table>
+  <div class="tracelink" data-trace="x-stream-worker-1000"></div>
+  <div class="lanes" data-lanes='{"traces":["x-stream-worker-1000"],"from":494,"to":530,"rows":["frames","mainFrames","main","app","marks","worker"],"pins":[[1,502.85,"app"],[2,503.2,"worker"],[3,505.92,"marks"],[4,511.9,"frames"],[5,513.41,"marks"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>502.82 ms:</b> the producer's timer fires (every 4.0 ms) and calls <code>table.update()</code> four times: update numbers 1588–1591, four <code>postMessage</code> calls.</li>
+    <li><i>2</i><b>503.16 ms, worker:</b> the poll timer, armed while handling the first of the four, runs after all four messages (they were already queued) and applies them in one step of 0.10 ms: one notification for four updates.</li>
+    <li><i>3</i><b>505.92 ms:</b> the draw for that notification: dimensions round trip, a throttle timer of 1 ms, then the four serial round trips of step 6. 3.1 ms after the producer's timer.</li>
+    <li><i>4</i>One vsync, one frame presented.</li>
+    <li><i>5</i>Between two frames the DOM is drawn four or five times. Only the last one before each frame is ever on screen.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="x-stream-worker-1000/marks.psp draw"></b> draws and <b data-m="x-stream-worker-1000/frames.all"></b> presented frames in 2 seconds: about 4.2 DOM draws per frame. The message counts say who merged what: 2,002 update requests reached the worker, 501 notifications came back, 501 draws followed. The engine boundary merged 4 to 1; the viewer merged nothing. Neither trace has a single animation callback (<b data-m="x-stream-worker-1000/main.rafCallbacks"></b>): nothing on the update path waits for a frame.</p>
+    <p>The viewer's throttle is visible as one-shot timers on the main thread. Their delays in these two traces are 0 or 1 ms.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/utils/debounce.rs#L103-L110">rust/perspective-viewer/src/rust/utils/debounce.rs:103–110, 197–200</a>
+      <p>The lock. It limits how many draws exist at once, not how often they run.</p>
+<pre><span class="n">108</span>/// runner. <mark>At most TWO debounce evaluations are ever outstanding (one</mark>
+<span class="n">109</span>/// <mark>running, one parked)</mark>; every additional concurrent caller resolves
+<span class="n">110</span>/// without queueing on the lock.
+<span class="n">197</span>        if state.parked.get() {
+<span class="n">198</span>            self.await_settled(next).await;
+<span class="n">199</span>            return Ok(T::default());</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/renderer/dispatch.rs#L485-L509">rust/perspective-viewer/src/rust/renderer/dispatch.rs:485–487, 507–509</a>
+      <p>The sleep. Inside the lock, before every update draw; and the draw is timed.</p>
+<pre><span class="n">485</span>        self.draw_lock()
+<span class="n">486</span>            .debounce_with(|guard| async move {
+<span class="n">487</span>                <mark>set_timeout(timer.get_throttle()).await?;</mark>
+<span class="n">507</span>                    timer
+<span class="n">508</span>                        <mark>.capture_time(self.draw_view(&amp;guard, &amp;view, true, dimensions))</mark>
+<span class="n">509</span>                        .await</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/renderer/render_timer.rs#L110-L150">rust/perspective-viewer/src/rust/renderer/render_timer.rs:113–119, 146–149</a>
+      <p>How long the sleep is: the mean wall-clock time of the last five draws, in whole milliseconds, 0 until there are five.</p>
+<pre><span class="n">113</span>            RenderTimerType::Moving(_, timings) =&gt; {
+<span class="n">115</span>                if state.render_times.len() &lt; 5 {
+<span class="n">116</span>                    0_i32
+<span class="n">118</span>                    <mark>f64::min(5000_f64, state.virtual_fps()) as i32</mark>
+<span class="n">146</span>    fn virtual_fps(&amp;self) -&gt; f64 {
+<span class="n">147</span>        let sum = self.render_times.iter().sum::&lt;f64&gt;();
+<span class="n">149</span>        <mark>sum / len</mark>                      <span class="c">// despite the name: mean draw time in ms</span></pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-js/src/ts/wasm/engine.ts#L59-L85">rust/perspective-js/src/ts/wasm/engine.ts:59–63, 76–77</a>
+      <p>The accident's second half. In the worker, applying updates is deferred to a timer with no delay, at most one outstanding; updates already queued as messages run first.</p>
+<pre><span class="n">59</span>    private set_poll_handle() {
+<span class="n">60</span>        this.poll_handle = new Promise((resolve, reject) =&gt;
+<span class="n">61</span>            <mark>setTimeout(() =&gt;</mark>
+<span class="n">62</span>                this.server
+<span class="n">63</span>                    .poll()
+<span class="n">76</span>        if (!this.poll_handle) {
+<span class="n">77</span>            await this.set_poll_handle();</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Timer clamp</dt><dd>A timer that keeps re-arming itself is held to 4 ms by the browser after a few rounds (the tasks are labelled <code>JAVASCRIPT_TIMER_DELAYED_HIGH_NESTING</code> in the trace; <a href="streaming.html">Module 7</a>). The lab's producer catches up by making all due updates in one callback.</dd>
+      <dt>Lock, throttle, pacing</dt><dd>A lock bounds concurrency. A sleep equal to the last draw time bounds duty cycle at one half. Neither is a clock: "at most once per frame" needs something that waits for the frame, such as <code>requestAnimationFrame</code>.</dd>
+      <dt>The three paces</dt><dd>Ingestion (1,000/s), publication (250 notifications/s, by accident) and rendering (60 frames/s). Here the second drives the DOM directly and the third only samples it.</dd>
+    </dl></div>
+  </div>
+  <div class="beat"><span class="label">What I do next</span><div>
+    <p>Change one input: <code>x-probe-throttle</code> is the 100-a-second stream with <code>viewer.setThrottle(100)</code>, one second long. Draws fall to <b data-m="x-probe-throttle/marks.psp draw"></b>. The worker still handles 245 requests: 100 updates, 100 dimension requests (one per notification, sent before the lock is even tried) and 5 for each of the 9 draws. A throttle removes draws. It does not remove the request that every notification triggers.</p>
+  </div></div>
+  <div class="tracelink" data-trace="x-probe-throttle"></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with the default adaptive throttle and a fast engine, Perspective draws once per notification however many that is; the frame rate plays no part. What limited the notifications here was the producer's timer clamp and the worker's deferred poll.</p>
+    <p><b>No:</b> that 250 is a property of Perspective. A producer that sends from a WebSocket handler, or a server, would give a different number (step 10 has 1,601 notifications in the same 2 seconds).</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed "one running plus one parked" plus an adaptive throttle would hold the draw rate near what the screen can show. At 250 notifications a second the viewer conflated nothing and drew the DOM four times per frame. Rule: check what a limiter limits. A mutex limits overlap; a sleep proportional to work limits duty cycle; only a wait on the frame limits draws to frames.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposals. Pace update draws with the frame: mark the view dirty on notification and pull once in the next animation callback, one pull in flight. Coalesce notifications before they cause any request: Perspective's per-notification dimensions request is the one cost its throttle cannot reach. And decide where publication's pace comes from on purpose; here it came from a browser timer rule.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-stream-worker-1000 marks 'psp draw' 0 2002</code> → <code>501 entries</code>; <code>… frames 494 530</code> lists one vsync at 511.37 ms in a window that holds nine draws.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">1,000 update() calls a second: 2,002 updates → 501 notifications → 501 draws → 119 frames. The viewer's lock conflated nothing; about 4 DOM draws per presented frame.</li>
+    <li data-kind="read">The viewer's adaptive throttle sleeps for the mean wall-clock time of the last 5 draws before each update draw (dispatch.rs:487; render_timer.rs:113–119, 146–149); the lock allows one running and one parked draw (debounce.rs:108–110).</li>
+    <li data-kind="inferred">The 4:1 merge came from the 4 ms timer clamp on the producer plus the worker's 0 ms poll timer (engine.ts:59–63), not from a design decision about rate.</li>
+    <li data-kind="measured">setThrottle(100) cut draws to 9 a second and left the per-notification dimensions request untouched (245 requests in 1 s).</li>
+    <li data-kind="rejected">"One running plus one parked draw keeps the draw rate near the frame rate."</li>
+  </ul>
+  <p class="next"><b>Next question →</b> If each <code>update()</code> call costs a cycle, is one call with many rows cheaper than many calls with one row?</p>
+</section>
+
+<section class="step" data-part="C · One update" data-title="Twenty updates of 50 rows, or a thousand of one" data-node="input engine viewer">
+  <p class="holding"><span class="label">Question I hold</span><span>Perspective's documentation says one <code>update()</code> of N rows is much cheaper than N updates. Where is the saving: in the engine, or on the main thread?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>The same 1,000 rows a second, as 20 calls of 50 rows (<code>x-stream-worker-batch</code>) instead of 1,000 calls of one row. Then one batched cycle next to the single-row cycle of step 6.</p></div></div>
+  <table class="mtable" data-rows="x-stream-worker-1000,x-stream-worker-batch" data-names="1000 calls × 1 row,20 calls × 50 rows" data-head="1,000 rows a second, 2 s"
+    data-cols="marks.psp draw|draws,frames.all|frames presented,main.scriptMs|main script|ms,threads.mainUtilPct|main busy|%,threads.workerBusyMs|worker busy|ms"></table>
+  <div class="bars" data-bars='{"ids":["x-stream-worker-1000","x-stream-worker-batch"],"labels":["1000 × 1 row","20 × 50 rows"],"series":[{"path":"threads.mainBusyMs","label":"main thread busy","color":"#d9a800"},{"path":"threads.workerBusyMs","label":"worker busy","color":"#3d6b8e"}],"unit":"ms","title":"Thread time over 2 s"}'></div>
+  <div class="tracelink" data-trace="x-stream-worker-batch"></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Draws fall from <b data-m="x-stream-worker-1000/marks.psp draw"></b> to <b data-m="x-stream-worker-batch/marks.psp draw"></b>, main-thread script from <b data-m="x-stream-worker-1000/main.scriptMs"></b> to <b data-m="x-stream-worker-batch/main.scriptMs"></b> ms, worker time from <b data-m="x-stream-worker-1000/threads.workerBusyMs"></b> to <b data-m="x-stream-worker-batch/threads.workerBusyMs"></b> ms. Every batched update is one presented frame.</p>
+    <p>One batched cycle (the update at 123.41 ms): the worker handles the 50-row request in 0.175 ms and applies it in 0.131 ms. The single-row cycle of step 6 took 0.049 and 0.054 ms. Fifty times the rows for three times the engine work. Everything after the notification is the same seven-message cycle as before.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The claim holds, and the larger part of the saving is not in the engine. Rows are cheap; <em>calls</em> are expensive, because every call the engine applies separately becomes a notification, and every notification becomes requests and a draw on the main thread. The 1,000 × 1 case would be worse still without step 8's accidental 4-to-1 merge.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/docs/md/integrations/kafka.md">docs/md/integrations/kafka.md:58</a>
+      <p>The claim: "<b>Batch.</b> One <code>update()</code> of 500 rows is much cheaper than 500 updates of…"</p>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-server/cpp/perspective/src/cpp/server.cpp#L3100-L3103">rust/perspective-server/cpp/perspective/src/cpp/server.cpp:3100–3103</a>
+      <p>Why an update is cheap for the engine at the moment it arrives: the rows are appended to a port and the table is marked dirty; views are untouched until the poll.</p>
+<pre><span class="n">3100</span>            <mark>m_resources.mark_table_dirty(req.entity_id());</mark>
+<span class="n">3102</span>            resp.mutable_table_update_resp();
+<span class="n">3103</span>            push_resp(std::move(resp));</pre>
+      <span class="path">lab/pages/src/psp.ts:104–118</span>
+      <p>The lab's producer: <code>n</code> random rows among the first <code>span</code> (12), one random price each, one <code>table.update(batch)</code> per due update.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Fixed and variable cost</dt><dd>Per call: a request, an apply step, a notification, the viewer's cycle. Per row: parsing and applying one row. When the fixed part dominates, batching is the whole optimisation.</dd>
+      <dt>Conflation at the source</dt><dd>Batching 50 rows into one call is conflation done by the producer, before the engine. <a href="streaming.html">Module 7</a> does it at the server with a time window.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> for a viewer, the cost of a stream is set by the number of notifications it causes, not by the number of rows; batching 50 rows per call cut main-thread script by about 85% in these recordings.</p>
+    <p><b>No:</b> that batches are free for the engine at any size, or for other views: 50 rows into an unsorted flat view is the cheapest case (step 7 showed a sorted view costing two orders of magnitude more per apply).</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-stream-worker-batch marks 'table.update|psp draw' 100 330</code>: each <code>psp table.update</code> measure is followed by one <code>psp draw</code> about 3 ms later, every 50 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">1,000 rows a second as 20 × 50 instead of 1,000 × 1: draws 501 → 40, main script about −85%, worker time about −88%; a 50-row update costs the engine about 3× a 1-row update.</li>
+    <li data-kind="inferred">For a Perspective viewer the unit of cost is the notification (one per separately applied update call), not the row.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> All of this had the engine 0.05 ms away. Put it in another process: is the cycle the same?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · Placement and latency" data-title="The engine in another process: the same cycle over a socket" data-node="pipe engine viewer client"
+  data-ask="place|Engine in a worker or on a server: what changes at 0 ms, and what at 100 ms of round trip?">
+  <p class="holding"><span class="label">Question I hold</span><span>Move the engine to a Node process on the same machine and let the server produce the updates. Is the page's cycle the same, and why is the main thread busier at 1,000 updates a second?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>Four traces: 100 and 1,000 updates a second, engine in the worker and in Node (localhost, no added delay). Bound metrics first, then message counts from both ends of each trace.</p></div></div>
+  <div class="bars" data-bars='{"ids":["x-stream-worker-100","x-stream-remote-100","x-stream-worker-1000","x-stream-remote-1000"],"labels":["worker, 100/s","Node, 100/s","worker, 1000/s","Node, 1000/s"],"series":[{"path":"main.scriptMs","label":"script","color":"#d9a800"},{"path":"main.styleMs","label":"style","color":"#9b59d0"},{"path":"main.layoutMs","label":"layout","color":"#c39be0"},{"path":"main.paintMs","label":"paint","color":"#2e9e5b"}],"stack":true,"unit":"ms","title":"Main thread over 2 s, by kind of work"}'></div>
+  <table class="mtable" data-rows="x-stream-worker-100,x-stream-remote-100,x-stream-worker-1000,x-stream-remote-1000" data-names="worker 100/s,Node 100/s,worker 1000/s,Node 1000/s" data-head="2 s of updates"
+    data-cols="marks.psp draw|draws,frames.all|frames presented,threads.mainUtilPct|main busy|%,main.scriptMs|script|ms,main.forcedMs|forced style + layout|ms,threads.workerBusyMs|worker busy|ms" data-hi="x-stream-remote-1000:threads.mainUtilPct"></table>
+  <table>
+    <tr><th>Counted in these recordings</th><th>worker 100/s</th><th>Node 100/s</th><th>worker 1000/s</th><th>Node 1000/s</th></tr>
+    <tr><td>updates applied by the engine</td><td class="num">200</td><td class="num">200</td><td class="num">2,002</td><td class="num">2,002</td></tr>
+    <tr><td>change notifications reaching the page</td><td class="num">200</td><td class="num">200</td><td class="num">501</td><td class="num">1,601</td></tr>
+    <tr><td>requests from the page (without the page's own updates)</td><td class="num">1,200</td><td class="num">1,203</td><td class="num">3,001</td><td class="num">4,547</td></tr>
+    <tr><td>message tasks on the main thread</td><td class="num">1,600</td><td class="num">1,407</td><td class="num">5,504</td><td class="num">6,162</td></tr>
+    <tr><td>their total time, ms</td><td class="num">211.5</td><td class="num">290.8</td><td class="num">542.6</td><td class="num">972.2</td></tr>
+    <tr><td>time outside JavaScript per task, µs</td><td class="num">4</td><td class="num">18</td><td class="num">4</td><td class="num">15</td></tr>
+  </table>
+  <p class="note">Message tasks are the main thread's tasks of type <code>POSTED_MESSAGE</code> (worker) or <code>NETWORKING</code> (socket). In the worker columns 200 and 2,002 of them are the cheap answers to the page's own <code>update()</code> calls, which the Node columns do not have.</p>
+  <div class="tracelink" data-trace="x-stream-remote-1000">The <code>Backend (node)</code> process: <code>table.update</code> and <code>handle_request</code> spans on the thread <code>perspective session</code>.</div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>At 100 a second the cycle is the same.</b> Same notifications, same six requests per update, same draws. The socket path costs more per message: 291 ms for 1,407 messages against about 205 ms for the comparable 1,400 in the worker trace. Of that difference, the part outside JavaScript (receiving the message from the network service) is small, 18 µs against 4 µs per task; the rest is inside the JavaScript tasks, where this trace cannot split it further.</p>
+    <p><b>At 1,000 a second the page gets three times the notifications:</b> 1,601 instead of 501, for the same 2,002 updates. The Node engine has no deferred poll: it applies pending updates right after each request, so nearly every <code>update()</code> becomes its own notification, and the server's timer is not clamped to 4 ms. Each notification costs the page a dimensions round trip and an <code>offsetParent</code> read, and those are not conflated by anything. Now the viewer's lock does work: 1,601 notifications become <b data-m="x-stream-remote-1000/marks.psp draw"></b> draws. The request count fits the rule of step 6 to within three: 1,601 + 5 × 589 = 4,546.</p>
+    <p>The result is a main thread <b data-m="x-stream-remote-1000/threads.mainUtilPct"></b>% busy against <b data-m="x-stream-worker-1000/threads.mainUtilPct"></b>%, with frames still all presented.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-js/src/ts/wasm/engine.ts#L174-L182">rust/perspective-js/src/ts/wasm/engine.ts:178–182</a>
+      <p>After every request the engine host either asks for a deferred poll or polls now. Which one depends on how the server was constructed.</p>
+<pre><span class="n">178</span>        if (this.on_poll_request) {
+<span class="n">179</span>            await this.on_poll_request();     <span class="c">// browser worker: the 0 ms timer of step 8</span>
+<span class="n">180</span>        } else {
+<span class="n">181</span>            <mark>await this.poll();</mark>                <span class="c">// Node: apply and notify immediately</span>
+<span class="n">182</span>        }</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-js/src/ts/perspective.node.ts#L300-L307">rust/perspective-js/src/ts/perspective.node.ts:300–304</a>
+      <p>The Node build constructs its server without the deferred poll; the alternative is in the file, commented out.</p>
+<pre><span class="n">300</span><mark>const SYNC_SERVER = new engine.PerspectiveServer(SYNC_MODULE);</mark>
+<span class="n">302</span>// const SYNC_SERVER = new engine.PerspectiveServer(SYNC_MODULE, {
+<span class="n">303</span>//     on_poll_request: () =&gt; SYNC_POLL_HANDLE.on_poll_request(),
+<span class="n">304</span>// });</pre>
+      <span class="path">lab/server/psp.mjs:43–59, 62, 74–83</span>
+      <p>The lab's server: updates from a 1 ms timer in the same process (<code>table.update(batch)</code>, no transport), one session per socket, <code>perMessageDeflate: true</code> as in Perspective's own remote example, and a <code>handle_request</code> span around each request.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Where conflation happens</dt><dd>Three places could merge updates: the engine before it notifies, the viewer before it requests, the viewer before it draws. In the worker build the first one merges (by a timer), in the Node build it does not; the second never merges; the third merges only under pressure.</dd>
+      <dt>What I cannot split</dt><dd>The sampled profile attributes most of these short tasks to <code>(program)</code>, so "the socket path costs more JavaScript time per message" is a measured total with an unknown inside. Sending (<code>ws.send</code> against <code>postMessage</code>) and more forced layout are candidates, not findings.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on localhost the two placements run the same cycle; the server placement loads the main thread more because more notifications reach the page and each message costs somewhat more to handle.</p>
+    <p><b>No:</b> that a server engine is inherently chattier: the difference in notifications comes from one constructor option and from where the producer's timer runs. And these servers are 0.1 ms away.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A proposal: conflate on the engine's side of the pipe, on the engine's own tick, for every transport alike. Whatever is merged only after crossing the pipe has already cost a message and a task on the thread that draws.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-stream-remote-1000 slices 'psp send 32 B' 0 2002</code> → <code>1602 events</code> (the notifications; one lies just outside the measured window); <code>… slices handle_request 0 2002</code> → <code>4548 events</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Localhost server against worker at 100 updates/s: same notifications, requests and draws; about 40% more main-thread time in message tasks.</li>
+    <li data-kind="measured">At 1,000 updates/s the Node engine sent 1,601 notifications where the worker sent 501; the viewer's lock then conflated them to 589 draws, and requests followed "1 per notification + 5 per draw".</li>
+    <li data-kind="read">The browser worker defers applying updates to a 0 ms timer; the Node build polls after every request (engine.ts:178–182; perspective.node.ts:300).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Four serial round trips per draw and a throttle that sleeps as long as a draw took. What do they do when one round trip is 100 ms?</p>
+</section>
+
+<section class="step" data-part="D · Placement and latency" data-title="50 ms away: three draws in two and a half seconds" data-node="pipe engine viewer present method">
+  <p class="holding"><span class="label">Question I hold</span><span>100 updates a second on a server 50 ms away in each direction. How often does the grid redraw, how old is what it shows, and where does the time go?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Round trip 100 ms, server answers each request in under 0.1 ms, 100 updates a second. The grid redraws about…</p>
+    <div class="opts"><button data-k="a">10 times a second: one round trip per draw</button><button data-k="b">2.5 times a second: four serial round trips per draw</button><button data-k="c">1.2 times a second</button></div>
+    <div class="reveal"><p><b>1.2 times a second.</b> Four serial round trips make a draw take 400 ms. The adaptive throttle then sleeps for the mean duration of the last five draws, another 400 ms, before starting the next one.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div><p><code>x-stream-remote-lat50</code> is step 10's 100-a-second server stream through the lab's delay proxy. I list one draw cycle on both processes, then change one input: <code>x-probe-lat50-throttle0</code> is the same with <code>viewer.setThrottle(0)</code>.</p></div></div>
+  <div class="tracelink" data-trace="x-stream-remote-lat50">Search <code>TimerInstall</code> on <code>CrRendererMain</code>: there are exactly three in the trace, with <code>timeout</code> 422, 423 and 402.</div>
+  <div class="lanes" data-lanes='{"traces":["x-stream-remote-lat50","x-probe-lat50-throttle0"],"titles":["x-stream-remote-lat50 · adaptive throttle (default)","x-probe-lat50-throttle0 · setThrottle(0)"],"from":0,"to":2500,"rows":["frames","main","marks","psp"],"pins":[[1,170.6,"marks",0],[2,592.9,"main.js",0],[3,800,"psp",0],[4,995,"marks",0],[5,753.7,"marks",1]]}'></div>
+<pre>   ms      where    event                                              waiting for
+ 170.6    page     draw <span class="cp">1</span>
+ 170.8    page     TimerInstall, timeout 422 ms                        ← the adaptive throttle
+ 592.9    page     TimerFire <span class="cp">2</span> → request: schema (31 B)
+ 643.4    server   handle_request 0.05 ms → 97 B                       50 ms there
+ 694.1    page     answer → request: row count                         50 ms back
+ 744.3    server   handle_request 0.05 ms → 43 B
+ 794.6    page     answer → request: dimension probe
+ 844.5    server   handle_request 0.04 ms → 43 B
+ 894.4    page     answer → requests: window (44 B) + column count
+ 944.5    server   handle_request 0.06 ms → 1,158 B
+ 994.2    page     answer → parse, format, write cells
+ 995.0    page     draw <span class="cp">4</span>;  TimerInstall, timeout 423 ms</pre>
+  <ol class="pins">
+    <li><i>1</i>A draw. The next one may not start for 422 ms.</li>
+    <li><i>2</i>The throttle timer fires; the four serial round trips of step 6 begin.</li>
+    <li><i>3</i>The server's lane all along: a <code>table.update</code> span every 10 ms and a 0.03 ms <code>handle_request</code> for each notification's dimensions request. At most one request is ever in flight on the server, and all its spans together total 14 ms of the 2.5 s.</li>
+    <li><i>4</i>The next draw, 824 ms after the first.</li>
+    <li><i>5</i>The probe: with a constant throttle of 0 the same page draws every 407 ms, the four round trips and nothing else.</li>
+  </ol>
+  <table class="mtable" data-rows="x-stream-remote-100,x-stream-remote-lat50,x-probe-lat50-throttle0" data-names="localhost (2 s),50 ms each way · adaptive throttle (2.5 s),50 ms each way · setThrottle(0) (2.5 s)" data-head="100 updates a second on the server"
+    data-cols="marks.psp draw|draws,frames.all|frames presented,main.timers|timers fired on main,threads.mainUtilPct|main busy|%" data-hi="x-stream-remote-lat50:marks.psp draw"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="x-stream-remote-lat50/marks.psp draw"></b> draws in 2.5 seconds, at 170.6, 995.0 and 1,823.9 ms. Each cycle is two equal halves: a sleep of about 420 ms, then 402 ms in which the page waits four times for 100 ms and works for under 2 ms. The server's total work for a draw is 0.2 ms.</p>
+    <p>During the same 2.5 seconds 250 notifications arrive and the page answers each with a dimensions request: 266 requests in total for 3 draws. The notifications are handled promptly; they just do not lead to drawing.</p>
+    <p>How old is the data on screen? From the server's <code>table.update</code> spans and the draw marks: an update reaches the DOM between a little over 50 ms (the one-way delay) and 880 ms after the server applied it, 440 ms at the median. The same stream on localhost: 3.5 ms at the median.</p>
+    <p>The probe confirms the split by removing one half: with <code>setThrottle(0)</code> the draws come every 407 ms (<b data-m="x-probe-lat50-throttle0/marks.psp draw"></b> in the window instead of <b data-m="x-stream-remote-lat50/marks.psp draw"></b>).</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Nothing here is slow. The network adds 100 ms per round trip, which is its job in this scenario; the server answers in microseconds; the page is 4% busy. The 824 ms comes from sequencing: four awaits in a row where one would do, and a throttle that measures the wall-clock duration of a draw and takes waiting for work. A throttle meant to protect a busy main thread doubles the staleness of an idle one.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/renderer/render_timer.rs#L58-L83">rust/perspective-viewer/src/rust/renderer/render_timer.rs:62–71</a>
+      <p>What a "render time" sample is: the clock before and after an awaited future that contains every round trip of the draw.</p>
+<pre><span class="n">62</span>  RenderTimerType::Moving(_, timings) =&gt; (<mark>perf.now()</mark>, …),
+<span class="n">65</span>  <mark>let result = f.await;</mark>
+<span class="n">70</span>      let now = perf.now();
+<span class="n">71</span>      <mark>stats.render_times.push_back(now - start);</mark></pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/renderer/render_timer.rs#L37-L44">render_timer.rs:37–43</a>
+      <p>The authors met the same hazard for a hidden tab and guard that one case:</p>
+<pre><span class="n">38</span>/// capture_time`] whose awaited render spans a
+    /// visibility flip measured
+<span class="n">39</span>/// <mark>the hidden gap, not the render</mark> — it compares …
+<span class="n">42</span>/// so its giant sample would land in the
+    /// freshly-cleared window and pin
+<span class="n">43</span>/// the throttle at its cap.</pre>
+      <span class="path">lab/server/netem.mjs</span>
+      <p>The delay: a TCP proxy that holds every chunk for <code>latencyMs</code> in each direction and keeps order. It adds delay only; no loss, no bandwidth limit here.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Work or waiting</dt><dd>The standing question, answered three ways in one cycle: 420 ms of deliberate waiting (a timer), 400 ms of waiting for the wire, 2 ms of work.</dd>
+      <dt>Data age</dt><dd>Time from when a value existed at the source to when it is on screen. With a pull every 824 ms it sweeps between one-way delay and one-way delay plus the period. <a href="streaming.html">Module 7</a> defines it for the lab's own stream.</dd>
+      <dt>Perspective's own counters agree</dt><dd><code>viewer.getRenderStats()</code> returns the five samples. In a live session of this configuration (not a recording) I read <code>render_times</code> of 402–413 ms, <code>virtual_fps</code> 2.45 (what the draw time alone would allow) and <code>actual_fps</code> 1.31.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> at 100 ms round trip Perspective's datagrid in server-only mode refreshes every 0.8 s by default: half from four serial round trips per draw, half from the adaptive throttle. The frame records (<b data-m="x-stream-remote-lat50/frames.all"></b> presented, <b data-m="x-stream-remote-lat50/frames.dropped"></b> dropped) describe three healthy frames.</p>
+    <p><b>No:</b> that this is how Perspective is meant to be used far from a server: its documentation recommends keeping a copy of the table in a worker and syncing it, which this module did not record. And a caution about the lab: on a freshly started lab server, the delayed link sometimes produced protobuf decode errors in the page (I suspect the delay proxy, unproven). The two traces used here logged none.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected the cost of latency to be latency: 100 ms round trip, so data about 100 ms old, perhaps 400 ms with four round trips. The trace shows 440 ms at the median and 880 ms at worst, and half of it is a sleep the page chose. Rule: any mechanism that adapts to "how long the last draw took" must time work, not elapsed time; otherwise waiting feeds back into more waiting. And count serial awaits before putting distance into a pipe: each one is a round trip.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposals. One round trip per draw, by making the window answer complete (step 3). No request per notification. If draws are throttled, throttle by frame and by "one pull in flight", which adapts to latency without measuring it: a pull that takes 100 ms simply yields 10 draws a second. Report data age with its tail beside draws per second; here the median hides an 880 ms worst case.</p></div>
+  <div class="try"><span class="label">Try it</span>From the trace: <code>node lab/harness/q.mjs x-stream-remote-lat50 slices TimerInstall main</code> prints three lines with <code>"timeout":422</code>, <code>423</code>, <code>402</code>. Live: <code>cd lab &amp;&amp; node server/main.mjs --psp --port 5199</code>, then <code>curl -X POST http://127.0.0.1:5199/__netem -d '{"latencyMs":50}'</code>, open <code>http://127.0.0.1:5199/psp.html?engine=remote&amp;hz=100&amp;net=1</code>, wait a few seconds and run <code>await __lab.stats()</code> in the console: five <code>render_times</code> near 400 and an <code>actual_fps</code> near half of <code>virtual_fps</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">100 updates/s, 100 ms round trip, default settings: 3 draws in 2.5 s (period 824 ms); 266 requests; update-to-DOM age 50–880 ms, median 440 ms; server idle, one request in flight at most.</li>
+    <li data-kind="measured">The period is a 420 ms throttle sleep plus four serial 100 ms round trips; with setThrottle(0) the same page draws every 407 ms.</li>
+    <li data-kind="read">The throttle's samples are wall-clock times around the awaited draw, round trips included (render_timer.rs:62–71).</li>
+    <li data-kind="rejected">"A 100 ms round trip makes the data about 100 ms old."</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The throttle counts waiting as work. Is there waiting without a network? What happens to updates while the user scrolls?</p>
+</section>
+
+<section class="step" data-part="D · Placement and latency" data-title="Scrolling under a stream, and the second after" data-node="input rt viewer present method">
+  <p class="holding"><span class="label">Question I hold</span><span>Scroll draws and update draws use the same regular-table. Who goes first while the wheel turns, and when do update draws come back after it stops?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>Two worker-placement traces: <code>x-scroll-stream-worker</code> (500 updates a second across 5,000 rows, a 2-second scroll, 0.6 s of rest) and my probe <code>x-probe-scroll-tail</code> (50 updates a second to the top rows, the same scroll, 1.8 s of rest). I look at when draws happen and at the viewer's throttle timers.</p></div></div>
+  <div class="tracelink" data-trace="x-probe-scroll-tail">Search <code>TimerInstall</code> on the main thread and look at <code>args.data.timeout</code> after 2,000 ms.</div>
+  <div class="lanes" data-lanes='{"traces":["x-probe-scroll-tail"],"from":-350,"to":3900,"rows":["frames","app","marks","worker"],"pins":[[1,-150,"marks"],[2,1000,"app"],[3,2072.4,"marks"],[4,2824.9,"marks"],[5,3790,"marks"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Before the scroll: one draw per update, 50 a second (each line in "our marks" is a draw).</li>
+    <li><i>2</i>During the scroll: 60 draws a second, all scroll draws (◆). The last update draw started at 19.5 ms and is still waiting. The scenario's scroll is two one-second gestures with a pause of about 67 ms between them; near 1,000 ms the scroll loop therefore ends, the waiting update draw completes at 1,022 ms, and the viewer installs a throttle timer of <b>201 ms</b>.</li>
+    <li><i>3</i><b>2,072 ms:</b> the scroll has ended (last scroll draw at 2,067.9 ms). The update draw that started at 1,223.5 ms completes. The viewer installs a throttle timer of <b>371 ms</b>.</li>
+    <li><i>4</i>Update draws at 2,449, 2,825, 3,201 and 3,578 ms: four more timers of 371, 371, 371 and 171 ms, while 50 updates a second keep arriving.</li>
+    <li><i>5</i><b>3,753 ms:</b> back to one draw per update, 1.7 s after the scroll ended.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>While the wheel turns, update draws do not run. regular-table has one lock per table; the scroll loop holds it across all its iterations, and an update's <code>draw()</code> waits for it. That is harmless for freshness, because every scroll draw fetches the current window anyway. Notifications are still answered one by one with a dimensions request.</p>
+    <p>The cost comes afterwards. The update draw that waited through the scroll was timed by the viewer as a draw that took about a second. Two such samples (about 1,000 and 850 ms) enter the five-sample window, the mean becomes 371 ms, and the viewer sleeps that long before each of the next four draws, then 171 ms, until both samples have left the window. In <code>x-scroll-stream-worker</code> the same numbers appear (timers of 200, 373 and 373 ms) before the trace ends.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/scroll_panel.ts#L113-L121">regular-table src/ts/scroll_panel.ts:113–119</a>
+      <p>A plain <code>draw()</code> takes the same lock as the scroll loop of step 2 (<code>events.ts:74</code>):</p>
+<pre><span class="n">113</span>    async draw(options: DrawOptions = {}): Promise&lt;void&gt; {
+<span class="n">117</span>            return await <mark>throttle_tag(this, () =&gt;</mark>
+<span class="n">118</span>                internal_draw.call(this, options),
+<span class="n">119</span>            );</pre>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/utils.ts#L57-L77">regular-table src/ts/utils.ts:61–67</a>
+      <p>The lock: wait for the holder; if someone else took it meanwhile, wait again and give up.</p>
+<pre><span class="n">61</span>    if (TAGS.has(tag)) {
+<span class="n">62</span>        <mark>await TAGS.get(tag)?.promise;</mark>
+<span class="n">63</span>        if (TAGS.has(tag)) {
+<span class="n">64</span>            await TAGS.get(tag)?.promise;
+<span class="n">65</span>            return;
+<span class="n">66</span>        }
+<span class="n">67</span>    }</pre>
+      <p>The viewer's timer wraps the whole <code>plugin.update()</code>, including this wait (step 11's <code>render_timer.rs:62–71</code>; step 8's <code>dispatch.rs:507–509</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Drain behaviour</dt><dd>What a system does after the pressure stops. Here the pressure (a scroll) lasts 2 s and the after-effect 1.7 s, in which the grid shows data up to 370 ms old on a machine that is nearly idle.</dd>
+      <dt>A moving window remembers</dt><dd>A mean over the last five samples keeps one bad sample for five draws. If the bad sample also lengthens the time between draws, it stays for longer in wall-clock terms: the slower the draws, the slower the recovery.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> during a scroll, updates reach the screen through the scroll's own fetches and update draws wait; after a scroll, Perspective's default throttle holds update draws to about 2.7 a second for a time comparable to the scroll's length.</p>
+    <p><b>No:</b> that the wait during the scroll is a defect; coalescing an update into a scroll draw is the right outcome. The defect is only in what the timer concludes from it. One scroll length was recorded.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I assumed an adaptive throttle could only be confused by something slow, such as a network. It was confused by a lock on an idle machine: a draw that waited a second behind scrolling counted as a one-second draw. This is step 11's mechanism without any network. Rule: time spent queued behind someone else's work must never enter a measure of one's own cost.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A proposal: treat "scroll wants a window" and "data changed" as two reasons to mark the same view dirty, served by one loop that pulls the newest window once per frame. Then there is nothing to queue, nothing to time, and no memory of the scroll afterwards. If any adaptive control is added later, test its drain: stop the load and plot when the output rate recovers.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-probe-scroll-tail slices TimerInstall main 1000 4000 | grep -v '"timeout":[012],'</code> prints six lines: the throttle timers, with timeouts 201, 371, 371, 371, 371 and 171.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">During a scroll no update draw runs (regular-table's lock is held by the scroll loop); updates appear through scroll draws.</li>
+    <li data-kind="measured">After a 2 s scroll the viewer's throttle timers were 371, 371, 371, 371 and 171 ms: 5 update draws in 1.7 s while 50 updates/s arrived.</li>
+    <li data-kind="inferred">The throttle's samples included the time the update draw waited behind the scroll loop (same clock as step 11), so two samples near one second kept the mean at 371 ms for four draws.</li>
+    <li data-kind="rejected">"Only slow work or a slow network can raise an adaptive throttle."</li>
+  </ul>
+  <p class="next" data-answer="pace"><b>Next question →</b> So far the view never changed. What does a sort or a group-by cost, and where does it run?</p>
+</section>
+
+<section class="step" data-part="D · Placement and latency" data-title="A config change: where the sort runs" data-node="viewer client pipe engine method">
+  <p class="holding"><span class="label">Question I hold</span><span>The user sorts 100,000 rows by price. Which thread or process does the sorting, what does the main thread do meanwhile, and how many requests is a config change?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>Three traces that each call <code>viewer.restore({…})</code> once at the start mark: sort in the worker, group-by in the worker, and my probe of the sort on the server with nothing else running.</p></div></div>
+  <table class="mtable" data-rows="x-sort-worker,x-group-worker,x-probe-sort-remote" data-names="sort by price · worker,group by region · worker,sort by price · Node (localhost)" data-head="One restore()"
+    data-cols="content.firstCompleteMs|new rows in the DOM after|ms,content.lastCompleteOnScreenMs|on screen after|ms,threads.workerBusyMs|worker busy|ms,threads.mainBusyMs|main busy|ms,marks.psp draw|draws"></table>
+  <div class="lanes" data-lanes='{"traces":["x-sort-worker","x-probe-sort-remote"],"titles":["x-sort-worker · engine in the worker","x-probe-sort-remote · engine in Node"],"from":-5,"to":115,"rows":["frames","main","marks","worker","psp"],"pins":[[1,1.5,"main.js",0],[2,40,"worker",0],[3,86,"main.js",0],[4,88.4,"marks",0],[5,45,"psp",1],[6,99.9,"marks",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>1.8 ms:</b> the first request leaves: the new configuration is checked against the table (worker: 3.5 ms).</li>
+    <li><i>2</i><b>5.7 – 83.3 ms, worker:</b> one task of 77.6 ms: the second request builds the new sorted view. The main thread has nothing to do; its lanes are empty.</li>
+    <li><i>3</i><b>82.8 – 88.4 ms:</b> the answer arrives and 16 short requests follow in 5 ms: subscribe to the new view, dimensions, delete the old view, schema, and the first draw's own requests.</li>
+    <li><i>4</i><b>88.4 ms:</b> the sorted rows are in the DOM; on screen one frame later.</li>
+    <li><i>5</i>The same on the server: one <code>handle_request</code> span of 86.8 ms for a 203-byte request.</li>
+    <li><i>6</i><b>99.9 ms:</b> drawn.</li>
+    <li style="padding-left:0">Two things in the upper chart are not part of the sort. The red box is one vsync recorded as dropped while the 7.8 ms main frame that carries the new rows was being produced; the next vsync presents it (<a href="frames.html">Module 2</a> explains the states). The ticks in its backend row are the lab's server applying updates nobody asked this page for; the Hard learning below is about them.</li>
+  </ol>
+  <div class="tracelink" data-trace="x-sort-worker"></div>
+  <div class="tracelink" data-trace="x-probe-sort-remote"></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Each config change is 18 requests in every placement, one of which carries all the cost: about 80 ms to sort, 86 ms to group, on whichever thread or process holds the engine. The main thread is busy <b data-m="x-sort-worker/threads.mainBusyMs"></b> ms out of the 1.5 s recorded and stays free for input during the sort.</p>
+    <p>Free for input does not mean able to draw new rows: a scroll during those 80 ms would send its window request to the same single engine thread, behind the sort (step 7 measured that kind of wait at small scale). The sticky table would show the old order until the sort ends.</p>
+    <p>The 16 follow-up requests leave in about ten waves, each after an earlier answer. That is invisible at 0.1 ms per round trip.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/session.rs#L1571-L1589">rust/perspective-viewer/src/rust/session.rs:1571, 1588–1589</a>
+      <p>A sort is a new view, built by the engine in one awaited call; the old view is deleted afterwards, without waiting.</p>
+<pre><span class="n">1571</span>        <mark>let view = table.view(Some(view_config.into())).await?;</mark>
+<span class="n">1588</span>        let old = self.borrow_mut().view_sub.take();
+<span class="n">1589</span>        ApiFuture::spawn(old.delete());</pre>
+      <span class="path">lab/server/psp.mjs:37–60 · lab/pages/src/psp.ts:96</span>
+      <p>Why I recorded a probe instead of using <code>x-sort-remote</code>: the server's update rate is one setting for the whole process, and the page sets it only when its own <code>hz</code> is above zero. See the box below.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Where each part runs</dt><dd>Engine (worker or server): checking the config, building the view (the sort itself), serializing windows. Main thread: comparing configs, protobuf, parse, format, DOM. Only the first group grows with the table.</dd>
+      <dt>One engine thread</dt><dd>The WebAssembly engine handles one request at a time, in arrival order. A long request is a queue for everything else, as with the one-at-a-time backend of <a href="backend.html">Module 6</a>.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> sort and group-by run entirely where the engine is; the page pays about 15 ms of main-thread time and 18 requests either way. On localhost the two placements finish within a few milliseconds of each other.</p>
+    <p><b>No:</b> how a sort feels 100 ms from the server: not recorded. From the roughly ten waves of requests I would expect on the order of a second (inferred). Nor how the engine's time grows with rows: one table size.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>My control was not a control. <code>x-sort-remote</code> shows <b data-m="x-sort-remote/marks.psp draw"></b> draws and <b data-m="x-sort-remote/frames.noUpdate"></b> vsyncs with nothing to show after one sort. The trace's backend lane explains it: <code>table.update</code> spans every 10 ms. The lab's server was still producing the 100 updates a second that an earlier scenario had asked for. The draws are step 7's off-screen updates, met by accident. Rule: before comparing two traces, list what else was running in each process of each; shared servers carry state between scenarios.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-sort-worker slices '^HandlePostMessage$' DedicatedWorker</code> → 18 lines, the second one 77.58 ms. <code>node lab/harness/q.mjs x-sort-remote slices table.update</code> → 267 events in a trace that was supposed to have none.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">A sort or group-by of 100,000 rows is 18 requests; one of them (building the view) takes about 80–90 ms in the engine, on the worker or the server; the main thread is idle meanwhile.</li>
+    <li data-kind="inferred">Window requests during a sort queue behind it on the single engine thread; the grid would show the old rows until it ends (not recorded).</li>
+    <li data-kind="rejected">"x-sort-remote is the clean server-side counterpart of x-sort-worker": the server's update stream from an earlier scenario was still running.</li>
+  </ul>
+  <p class="next" data-answer="place"><b>Next question →</b> Put the three designs of this course side by side. What should a table engine keep from Perspective, and what should it do differently?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · What to carry" data-title="Three designs side by side" data-node="rt client pipe engine viewer present method">
+  <p class="holding"><span class="label">Question I hold</span><span>TanStack Virtual with a source I wrote, raw regular-table, and Perspective: on the points this module measured, how do they differ, and what follows for Tablelab?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>I fill one table from this module and from the lab's own code for the other two columns (<code>lab/pages/src/source.ts</code>, <code>regular.ts</code>, <code>ticks.ts</code>; Modules 1, 6 and 7 trace them). The first two columns describe the lab's implementations, which are one choice among many; the third describes shipped Perspective 5.9.2.</p></div></div>
+  <div class="scroll"><table>
+    <tr><th></th><th>TanStack Virtual + your own source<br><small>lab: <code>lib=tanstack&amp;source=ws</code></small></th><th>raw regular-table + your own listener<br><small>lab: <code>lib=regular&amp;source=ws</code></small></th><th>Perspective 5.9.2 datagrid</th></tr>
+    <tr><td><b>Who asks for a window</b></td><td>Your render code, for the range the virtualizer reports</td><td>regular-table calls your data listener</td><td>regular-table calls the datagrid's listener</td></tr>
+    <tr><td><b>Requests per scroll draw</b></td><td>Your policy: every missing range, one in flight, or cancel (Module 6). Rows are cached on the page; a cached range costs none</td><td>One listener call; the lab's listener sends one request, or none if cached</td><td>2 in parallel (window + dimensions), one pair in flight, no row cache: <b data-m="x-scroll-worker/marks.psp draw"></b> draws → 242 requests</td></tr>
+    <tr><td><b>Requests per update draw</b></td><td>0: pushed messages carry the values; cells are patched</td><td>0: values come from the pushed overlay; a whole draw is requested</td><td>1 per notification + 5 per draw, as 4 serial round trips</td></tr>
+    <tr><td><b>Where values become text</b></td><td>Your render, main thread</td><td>Your listener, main thread</td><td>Engine → JSON text → <code>JSON.parse</code> + <code>Intl</code> per cell on the main thread</td></tr>
+    <tr><td><b>What is conflated</b></td><td>What you write: per message, per frame, or in a worker (Module 7)</td><td>Scroll positions (dirty flag); overlapping <code>draw()</code> calls (one lock)</td><td>Scroll positions (same flag). Updates: in the worker engine per 0 ms poll, in the Node engine barely; draws: one running + one parked. Never: the request per notification</td></tr>
+    <tr><td><b>What paces update draws</b></td><td>Your choice (the lab offers <code>apply=raf</code>)</td><td>Each <code>draw()</code> call, serialized</td><td>A sleep equal to the mean wall-clock time of the last 5 draws; no frame alignment (4 draws per frame at 250 notifications/s)</td></tr>
+    <tr><td><b>Screen while rows are late</b></td><td>Placeholders or blank rows that scroll (your choice)</td><td>The sticky table keeps the old rows; frames stay "presented"</td><td>The same sticky old rows; at 100 ms round trip 12 rows behind, <b data-m="x-scroll-remote-lat50/frames.dropped"></b> dropped frames</td></tr>
+    <tr><td><b>Cost when the pipe is 100 ms long</b></td><td>One round trip per uncached range (Module 8)</td><td>One round trip per draw (Module 8)</td><td>Scroll: one round trip per draw. Update: 0.8 s between draws by default, 0.4 s with <code>setThrottle(0)</code></td></tr>
+  </table></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Perspective is the only one of the three that is a finished product, and the worker placement hides nearly all of what this module found: 7 requests in 1.2 ms, a sort that never touches the main thread, a scroll one frame behind. Its request pattern was shaped where a round trip is free. The same pattern is what the server placement inherits, and there each habit has a price in round trips.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span>
+    <p>Proposals for Tablelab, each from a step of this module. None is a decision.</p>
+    <p><b>1. One draw, one request.</b> The window answer carries rows, counts and a version (steps 3, 6, 11). Measure requests per draw as a first-class number; the target is 1 for scroll and for update.</p>
+    <p><b>2. Notifications with scope and version, coalesced before any request.</b> The engine knows each view's window and says nothing, or only "count changed", for changes outside it (step 7). The page keeps one dirty flag per view, not one request per notification (steps 8, 10, 11).</p>
+    <p><b>3. One loop paces drawing: frame-aligned, one pull in flight, newest wins.</b> Scroll and data change both mark the view dirty (steps 5, 8, 12). No throttle that learns from elapsed time; if something adaptive is ever needed, it times work only and its drain is tested (steps 11, 12).</p>
+    <p><b>4. Conflate on the engine's side of the pipe, on the engine's tick</b>, identically for IPC and WebSocket (step 10). Batching rows per publication is the cheap win (step 9).</p>
+    <p><b>5. Keep reads from queueing behind writes and rebuilds</b> in the engine: versioned windows read from the last published state while an apply or a sort runs (steps 7, 13).</p>
+    <p><b>6. Rows near the viewport stay on the page</b> (overscan or a small cache), so short scrolls do not depend on the round trip (step 5).</p>
+    <p><b>7. Do not move formatting off the main thread yet.</b> At 138 cells, parse and format were lost inside a 0.13 ms task while style and layout took 1.6 ms per draw (steps 3, 4). Revisit with the window sizes of Modules 4 and 5.</p>
+    <p><b>8. Report content, not only frames:</b> draws per presented frame, distance between drawn rows and scroll position, data age with its maximum, and the recovery time after load stops (steps 5, 8, 11, 12).</p>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the pull-window, push-notification shape works, and regular-table's scroll loop is a sound request policy. The costs this module found are in what surrounds it: serial requests, unscoped notifications, a wall-clock throttle.</p>
+    <p><b>No:</b> a ranking of the three. The first two columns are lab code written to be simple to trace; Perspective does far more (pivots, expressions, editing, charts) through the same path.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Perspective's request pattern costs nothing where a round trip is 0.05 ms and multiplies delay where it is not; the design consequence is to count serial requests per draw before choosing a transport.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Can you answer these without scrolling back?</p>
+</section>
+
+<section class="step" data-part="E · What to carry" data-title="Check yourself" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>What should I now be able to say, and show in a trace, without looking anything up?</span></p>
+  <div class="exercise"><span class="label">1 · Requests</span>
+    <p>How many requests does Perspective's datagrid send for one scroll draw, and for one update that leads to one draw? Which of them wait for one another?</p>
+    <details><summary>Answer</summary><p>Scroll: 2, sent together (window and dimensions): one round trip. Update: 1 dimensions request when the notification arrives, then schema, row count, a dimension probe, and the window pair: 6 requests, of which the last five form 4 serial round trips (7 if the page itself sent the update). Evidence: 242 messages for 121 scroll draws; 1,400 for 200 updates.</p></details>
+  </div>
+  <div class="exercise"><span class="label">2 · One frame late</span>
+    <p>The worker answers a window request in 0.15 ms. Why are the rows not in the DOM in the same frame?</p>
+    <details><summary>Answer</summary><p>The answer is a message task that runs after the current frame's style, layout and paint (2.5 ms later in the traced frame), and regular-table writes cells only in a <code>requestAnimationFrame</code> callback, which for this frame has already run. The write happens in the next frame.</p></details>
+  </div>
+  <div class="exercise"><span class="label">3 · Green frames</span>
+    <p>A trace of a 2-second scroll shows 123 frames presented with the main thread's update and none dropped. Name one thing this does not tell you, and how to find it out.</p>
+    <details><summary>Answer</summary><p>Whether the rows shown matched the scroll position. In <code>x-scroll-remote-lat50</code> they were 12 rows behind and changed 19 times in 2 s. Compare the drawn first row with the scroll position at each draw (here from the marks' details), or count draws against frames.</p></details>
+  </div>
+  <div class="exercise"><span class="label">4 · Pacing</span>
+    <p>What decides how often Perspective redraws under a steady stream of updates? Give the two mechanisms and what each one limits.</p>
+    <details><summary>Answer</summary><p>A draw lock that allows one running and one parked draw (limits overlap, conflates only when notifications outrun draws), and a sleep before each update draw equal to the mean wall-clock time of the last five draws (limits duty cycle to about half). Neither waits for a frame: at 250 notifications a second the DOM was drawn 4 times per frame.</p></details>
+  </div>
+  <div class="exercise"><span class="label">5 · 100 ms away</span>
+    <p>With a 100 ms round trip and 100 updates a second, the grid redrew every 824 ms. Decompose the 824.</p>
+    <details><summary>Answer</summary><p>About 420 ms of throttle sleep (the mean of the last five draw times), then 4 serial round trips of 100 ms (schema, row count, dimension probe, window), then about 1 ms of work. With <code>setThrottle(0)</code> the period was 407 ms.</p></details>
+  </div>
+  <div class="exercise"><span class="label">6 · After the scroll</span>
+    <p>On an idle machine with the engine in a worker, update draws came about every 370 ms for 1.5 s after a scroll ended. Why?</p>
+    <details><summary>Answer</summary><p>During the scroll an update draw waited for regular-table's lock, held by the scroll loop. The viewer timed that wait as draw time: two samples near one second entered its five-sample window, and the mean (371 ms) became the sleep before each following draw until those samples left the window.</p></details>
+  </div>
+  <div class="exercise"><span class="label">7 · Design</span>
+    <p>You may change one thing in the protocol between page and engine to make the 100 ms case better. What, and what would you measure to show it worked?</p>
+    <details><summary>Answer</summary><p>One good answer: a window response that is complete (rows, counts, version), requested once per frame at most with one in flight, triggered by a coalesced dirty flag. Measure requests per draw (target 1), draws per second (target near 10 at 100 ms round trip), and update-to-DOM age with its maximum (target near one round trip plus one-way delay), in a trace with the backend's spans on the same clock.</p></details>
+  </div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">A trace-based review of a table product: count requests per draw, find what paces draws, compare draws with frames, then repeat with the pipe 100 ms long.</li>
+  </ul>
+  <p class="next"><b>Next →</b> <a href="showcases.html">Module 10</a> traces the libraries' own examples and benchmarks; <a href="clinic.html">Module 11</a> hands you unlabelled traces to diagnose.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>
