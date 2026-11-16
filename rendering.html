@@ -1,0 +1,955 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Style, layout, paint, compositing · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">5 · Style, layout, paint, compositing</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="input">input</span><span class="sep">→</span><span data-node="compositor">compositor</span><span class="sep">→</span>
+    <span data-node="js">JavaScript</span><span class="sep">→</span><span data-node="style">style</span><span class="sep">→</span>
+    <span data-node="layout">layout</span><span class="sep">→</span><span data-node="paint">pre-paint, paint, layerize</span><span class="sep">→</span>
+    <span data-node="commit">commit</span><span class="sep">→</span><span data-node="raster">raster</span><span class="sep">→</span>
+    <span data-node="present">activate, draw, screen</span>
+    <span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 5 · recorded 2026-11-16</p>
+  <h1>The JavaScript has finished. What does the browser still have to do, and what decides its price?</h1>
+  <p class="lede">A table's script writes text into cells, creates rows, sets a class. Everything after that is the browser's: recalculate style, lay out, pre-paint, paint, layerize, commit, raster on worker threads, activate, draw. In the large-table traces of this course that second half is two to four times the script time. This module reads it stage by stage, in the same scrolls recorded for three table designs, and ties each stage to a decision the table made.</p>
+  <p><b>Why this matters for Tablelab.</b> This is the "Pass 2" question of the study plan: <em>which browser rendering work does the table require, and which can it avoid?</em> The answers here are counts first (elements restyled, layout objects dirty, paint layers repainted, tiles rastered), because counts survive a faster machine and times do not.</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>) for the trace vocabulary; its steps 21, 25 and 26 introduced the non-composited scroller, the forced reflow and heavy paint at small scale, and this module builds on them. Frame outcomes (green, amber, red boxes) are Module 2's (<a href="frames.html">frames.html</a>); the libraries' draw pipelines are Module 3's (<a href="anatomy.html">anatomy.html</a>); script cost is Module 4's (<a href="javascript.html">javascript.html</a>).</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57 (software raster and compositing, a synthetic 60 Hz vsync), device scale factor 1.75, one traced run per scenario unless a table says otherwise. A scroll scenario is a constant-speed wheel gesture that the harness plays twice back to back, so "the scroll" lasts about two seconds. The machine was shared while recording and its load changed between sessions: the same configuration recorded half an hour apart differs by 10–20 % in every time. So this page compares <b>counts</b> freely, and <b>times</b> only between traces recorded back to back or in tables of repeated runs. Source lines are at Chromium <code>73c14f6</code> (M154), virtual-core 3.19.11 (<code>11b48e4</code>), regular-table 0.9.2 (<code>52e86bf</code>).</p>
+  <div class="foot"><button class="primary" data-start>Start: 17 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · The rendering half of a frame" data-title="One frame, after the JavaScript" data-node="js style layout paint commit raster present"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>regular-table has just written 561 cell texts. Before those pixels are on the screen, which named pieces of work run, on which thread, and how long is each?</span></p>
+
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>One frame of the large regular-table scroll (17 columns × 33 rows on screen, every cell's text rewritten) takes about 8 ms on the main thread. Which piece is the largest?</p>
+    <div class="opts"><button data-k="a">The JavaScript that writes the cells</button><button data-k="b">Recalculating style</button><button data-k="c">Layout</button><button data-k="d">Paint</button></div>
+    <div class="reveal"><p>Layout, 2.9 ms. The script is 1.2 ms. Style, layout and the three paint stages together are 6 ms: five times the script that caused them.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I take the frame that begins at 316.5 ms in <code>j-cells-L-regular</code> (the baseline large regular-table scroll) and list its slices in order: <code>node lab/harness/q.mjs j-cells-L-regular tree 317 325 main 300</code>, then the compositor thread and the raster workers for the same frame.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-cells-L-regular">In Perfetto: pin <code>CrRendererMain</code>, <code>Compositor</code> and the four busy <code>ThreadPoolForegroundWorker</code> threads of the Renderer process, and zoom to one <code>ProxyMain::BeginMainFrame</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["j-cells-L-regular"],"from":316,"to":335,"rows":["frames","mainFrames","main","raster","compositor"],"pins":[[1,318.0,"main.js"],[2,319.3,"main.layout"],[3,321.4,"main.layout"],[4,323.1,"main.paint"],[5,323.8,"main.paint"],[6,324.5,"main.paint"],[7,325.04,"compositor"],[8,325.4,"raster"],[9,325.8,"compositor"],[10,333.54,"compositor"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>Script</b>, 1.17 ms: the animation-frame callback in which regular-table writes the cell texts. Everything to its right exists because of it.</li>
+    <li><i>2</i><b>Recalculate style</b> (trace name <code>UpdateLayoutTree</code>), 1.29 ms. Its argument <code>elementCount</code> says <b>616</b> elements got a new computed style.</li>
+    <li><i>3</i><b>Layout</b>, 2.88 ms. Its arguments say <b>1123 of 1228</b> layout objects were dirty.</li>
+    <li><i>4</i><b>Pre-paint</b>, 0.54 ms: walk the changed part of the tree, update transforms, clips and what must be repainted.</li>
+    <li><i>5</i><b>Paint</b>, 0.70 ms: record drawing commands (text runs, borders). No pixels yet.</li>
+    <li><i>6</i><b>Layerize</b>, 0.63 ms, then <b>Commit</b>, 0.14 ms: decide which recorded content goes into which compositor layer, and hand the result to the compositor thread while the main thread waits.</li>
+    <li><i>7</i>Compositor thread: the commit arrives in a <em>pending</em> tree, and <code>TileManager::PrepareTiles</code> schedules raster tasks for the tiles that changed.</li>
+    <li><i>8</i><b>Raster</b>: 20 tasks on four worker threads, each at most 0.21 ms, all done within 0.5 ms. This is where commands become pixels.</li>
+    <li><i>9</i><b>Activate</b>: once the tiles needed are ready, the pending tree becomes the active tree, 0.75 ms after the commit.</li>
+    <li><i>10</i><b>Draw</b>, at the next vsync: the compositor builds a frame from the active tree and submits it to the display compositor (Viz). The frame record says it was presented 18.2 ms after the vsync that started it.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Three numbers in that list are not times. They are the trace telling me <em>how much</em> each stage was asked to do: 616 elements, 1123 of 1228 objects, 20 raster tasks. A time changes with the machine; these change only when the table does something else.</p>
+    <p>The stages run in a fixed order and each one consumes the previous one's output. Style decides what each element looks like, layout where each box is, pre-paint and paint what to draw, layerize which layer it lands in. Only raster touches pixels, and it does so on other threads.</p>
+  </div></div>
+
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/inspector/inspector_trace_events.cc#L631-L643">third_party/blink/renderer/core/inspector/inspector_trace_events.cc:637–643</a>
+      <p>Where the two numbers on a Layout slice come from. They are counted when layout <em>begins</em>:</p>
+<pre><span class="n">637</span>  frame.View()-&gt;<mark>CountObjectsNeedingLayout</mark>(needs_layout_objects, total_objects,
+<span class="n">638</span>                                          is_partial);
+<span class="n">641</span>  dict.Add("<mark>dirtyObjects</mark>", needs_layout_objects);
+<span class="n">642</span>  dict.Add("<mark>totalObjects</mark>", total_objects);
+<span class="n">643</span>  dict.Add("partialLayout", is_partial);</pre>
+      <p>Step 6 reads what "total" is the total of. It is not the whole document.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Layout object</dt><dd>Blink's box for something that takes part in layout: one per element that generates a box, and one per text node. A cell holding a text is two.</dd>
+      <dt>Dirty</dt><dd>Marked as needing work. Writing to the DOM does no layout; it sets marks. The stage that runs later does the work, for what is marked.</dd>
+      <dt>Recording versus raster</dt><dd>Main-thread Paint writes a list of drawing commands. Raster executes them into tiles (bitmaps here, GPU textures on a real display).</dd>
+      <dt>Pending and active tree</dt><dd>The compositor keeps the frame being prepared (pending) apart from the one it can draw at any moment (active). Activation swaps them and waits for raster; drawing never does.</dd>
+    </dl></div>
+  </div>
+
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the order and the thread of every stage in this frame, and its duration in this recording.</p>
+    <p><b>No:</b> that these proportions are the table's. They belong to this workload (every cell rewritten). The next step changes the workload and keeps the table size.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Run <code>node lab/harness/q.mjs j-cells-L-regular tree 317 325 main 300</code>. You should see <code>UpdateLayoutTree {… "elementCount":616}</code> at 318.65 ms and <code>Layout {"beginData":{"dirtyObjects":1123, … "totalObjects":1228}}</code> at 319.95 ms, nested under <code>WebFrameWidgetImpl::UpdateLifecycle</code>. In DevTools, click the purple Layout bar: the Summary shows the same two numbers as "nodes that need layout".</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One large regular-table frame: script 1.2 ms, style 1.3 ms (616 elements), layout 2.9 ms (1123 of 1228 objects), pre-paint 0.5, paint 0.7, layerize 0.6, commit 0.1; raster 20 tasks in 0.5 ms on workers; activation 0.75 ms after commit; drawn at the next vsync.</li>
+    <li data-kind="read">A Layout slice's dirtyObjects and totalObjects are counted before layout starts (inspector_trace_events.cc:637–643).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The same table size, the same scroll, another way of reusing elements: which stages shrink, and which do not move at all?</p>
+</section>
+
+<section class="step" data-part="A · The rendering half of a frame" data-title="Three designs, one scroll: who pays what" data-node="style layout paint method"
+  data-ask="dirty|What decides the price of a layout: how big the table is, or what was written into it?">
+  <p class="holding"><span class="label">Question I hold</span><span>Three tables show the same 17 × 33 cells and take the same two-second scroll. How does the browser's half differ, and does it follow the table's structure (<code>&lt;table&gt;</code> or positioned <code>&lt;div&gt;</code>s) or its writes?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Four recordings of Module 4, all 100 columns wide in a 1560 × 792 scroller. <b>Keyed</b>: TanStack Virtual with one row element per row index; a row that stays is not touched, about two rows enter per frame. <b>Positional</b>: the same library and CSS, but a fixed set of row elements whose every cell text is rewritten each frame. <b>regular-table</b>: a <code>&lt;table&gt;</code> whose every cell text is rewritten each frame. And the keyed table again at 38,400 px/s, where every row on screen is new in every frame.</p>
+  </div></div>
+  <div class="bars" data-bars='{"ids":["j-cells-L-tanstack","j-speed-2400-positional","j-cells-L-regular","j-speed-38400-keyed"],"labels":["keyed, 2 rows enter","positional, all rewritten","regular-table, all rewritten","keyed, all rows enter"],"series":[{"path":"main.scriptMs","label":"script","color":"#d9a800"},{"path":"main.styleMs","label":"style","color":"#c9a3ea"},{"path":"main.layoutMs","label":"layout","color":"#9b59d0"},{"path":"main.paintMs","label":"pre-paint, paint, layerize","color":"#2e9e5b"},{"path":"main.commitMs","label":"commit","color":"#8a63d2"}],"stack":true,"unit":"ms","title":"Main-thread time by stage over the whole scroll (about 122 frames)"}'></div>
+  <table class="mtable" data-rows="j-cells-L-tanstack,j-speed-2400-positional,j-cells-L-regular,j-speed-38400-keyed" data-names="keyed · 2 rows enter per frame,positional · all rewritten,regular-table · all rewritten,keyed · all rows enter" data-head="Design and workload" data-cols="state.cellsInDom|cells in DOM,main.styleElements|elements restyled,main.styleMs|style|ms,main.layouts|layouts,main.layoutDirty|objects dirty (sum),main.layoutMs|layout|ms,main.paintMs|paint stages|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Layout follows the writes, not the tag.</b> Positional rows are flex containers of <code>&lt;div&gt;</code>s; regular-table is a real <code>&lt;table&gt;</code>. Both rewrite every cell and both pay the same layout: <b data-m="j-speed-2400-positional/main.layoutMs"></b> ms against <b data-m="j-cells-L-regular/main.layoutMs"></b> ms. The keyed table pays <b data-m="j-cells-L-tanstack/main.layoutMs"></b> ms at this speed, and the same order as the other two (<b data-m="j-speed-38400-keyed/main.layoutMs"></b> ms) once every row is new.</p>
+    <p>Divide layout time by objects dirty in the three heavy rows: each comes out near 2 µs per dirty object. The light keyed row comes out three times higher per object, because 123 layouts of 72 objects each are mostly per-layout overhead.</p>
+    <p><b>Style is different.</b> regular-table restyles <b data-m="j-cells-L-regular/main.styleElements"></b> elements, the positional table <b data-m="j-speed-2400-positional/main.styleElements"></b>, for the same visible cells and the same kind of write. That is not the text: step 8 finds what it is.</p>
+    <p><b>Paint is different again</b>, and in the other direction: the positional table spends more in the paint stages than regular-table. Step 10.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>"The table is slow to lay out" is two claims mixed together. One is about <em>how many objects are dirty per frame</em>, which the reuse policy sets. The other would be about <em>what one dirty object costs</em> in a table compared with a flex row, and in this comparison that is the same. I keep both open and separate them in Part C.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> at 561–595 visible cells, layout time in these four recordings tracks the number of dirty layout objects, across two different CSS structures.</p>
+    <p><b>No:</b> that a <code>&lt;table&gt;</code> never costs more than positioned rows. All four rows here dirty either nearly everything or two rows. The case in between, one cell, is step 7, and there the answer changes.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: make "layout objects dirtied per frame" a number the DOM painter reports and the test suite bounds, next to "cells written". It is the quantity the browser bills for, and it can be read from any trace without a profiler.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-speed-2400-positional slices '^Layout$' main 300 340</code> prints three layouts with 1227 of 1262 objects dirty (1262 of 1297 on a frame with one more row); the same command on <code>j-cells-L-tanstack</code> prints 37 or 72 of 1262, for one or two entering rows.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Rewriting every cell costs the same layout in flex rows (positional pool) as in a table (regular-table): about 2 µs per dirty layout object, about 280 ms over the scroll.</li>
+    <li data-kind="measured">The keyed pool dirties 72 objects per frame at 2,400 px/s and pays a seventh of that; when every row enters it pays the same as the others.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Before asking what a layout costs: who decides <em>when</em> it runs? In the keyed trace every one of the layouts is drawn red, "forced by JavaScript".</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · When layout runs" data-title="A layout inside the scroll event" data-node="js layout method"
+  data-ask="forced|Is a forced layout extra work, or the same work at another moment?">
+  <p class="holding"><span class="label">Question I hold</span><span>With two virtualizers on one scroller, a style recalculation and a layout run <em>inside</em> the scroll event. With one virtualizer they do not. What forces them, and what does it cost?</span></p>
+
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Both traces scroll the same 12-column table. <code>r-two-virtualizers</code> has one forced style-and-layout per scroll event; <code>r-one-virtualizer</code> has none. How do their total layout counts and layout times compare?</p>
+    <div class="opts"><button data-k="a">Twice the layouts and about twice the time with two virtualizers</button><button data-k="b">Same count, but each forced layout is slower</button><button data-k="c">Same count, same size, same time</button></div>
+    <div class="reveal"><p>The same. <b data-m="r-two-virtualizers/main.layouts"></b> layouts against <b data-m="r-one-virtualizer/main.layouts"></b>, each of 52 dirty objects out of 927. The forced layout is the frame's one layout, run 0.5 ms earlier.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div><p>The same vsync in both recordings (they were made back to back): the main frame that starts at 300.2 ms.</p></div></div>
+  <div class="tracelink" data-trace="r-two-virtualizers">Search for <code>Blink.ForcedStyleAndLayout.UpdateTime</code> on <code>CrRendererMain</code>.</div>
+  <div class="tracelink" data-trace="r-one-virtualizer"></div>
+  <div class="lanes" data-lanes='{"traces":["r-two-virtualizers","r-one-virtualizer"],"titles":["r-two-virtualizers: rows and columns virtualized","r-one-virtualizer: rows only"],"from":300.1,"to":302.4,"rows":["mainFrames","main","app"],"pins":[[1,300.62,"app",0],[2,300.84,"main.layout",0],[3,301.04,"main.layout",0],[4,300.94,"main.layout",1],[5,301.13,"main.layout",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The row virtualizer's handler runs first and calls our <code>render()</code>: two rows enter, 24 cells are written (<code>app: draw</code>).</li>
+    <li><i>2</i>Still inside <code>Event: scroll</code>, the column virtualizer's handler runs. Its first statement reads the scroll position, and Blink recalculates style for 26 elements (0.11 ms)…</li>
+    <li><i>3</i>… and lays out 52 of 927 objects (0.28 ms). Red: JavaScript is above these slices on the stack. The event lasts 0.80 ms.</li>
+    <li><i>4</i>One virtualizer: the event ends after 0.36 ms. The same style recalculation, 26 elements, 0.11 ms, runs right after it in the frame's own lifecycle update…</li>
+    <li><i>5</i>… and the same layout, 52 of 927, 0.27 ms. Both main frames take 2.0 ms.</li>
+  </ol>
+
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/packages/virtual-core/src/index.ts#L217-L248">virtual-core src/index.ts:217–221, 245–248</a>
+      <p>Every virtualizer registers its own scroll listener, and the listener's first act is a read:</p>
+<pre><span class="n">217</span>  const createHandler = (isScrolling: boolean) =&gt; () =&gt; {
+<span class="n">218</span>    <mark>offset = readOffset(element)</mark>
+<span class="n">220</span>    cb(offset, isScrolling)
+<span class="n">221</span>  }
+<span class="n">245</span>  observeOffset(instance, cb, (el) =&gt; {
+<span class="n">247</span>    return horizontal ? <mark>el.scrollLeft</mark> * ((isRtl &amp;&amp; -1) || 1) : <mark>el.scrollTop</mark>
+<span class="n">248</span>  })</pre>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/dom/element.cc#L2652-L2662">third_party/blink/renderer/core/dom/element.cc:2652–2662</a>
+      <p>Why reading a scroll offset touches layout at all: the answer depends on the scroller's current size and content, so Blink first makes them current.</p>
+<pre><span class="n">2652</span> double Element::scrollLeft() {
+<span class="n">2661</span>  GetDocument().<mark>UpdateStyleAndLayoutForNode</mark>(this,
+<span class="n">2662</span>                                            DocumentUpdateReason::kJavaScript);</pre>
+      <p>The row virtualizer was created first, so its handler runs first: it reads <code>scrollTop</code> on a clean document (a 10 µs <code>Document::UpdateStyleAndLayout</code> slice with nothing under it) and then writes. The column virtualizer's <code>scrollLeft</code> read comes after that write.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Forced (synchronous) layout</dt><dd>Style and layout normally run once per frame, after scripts. A script that reads a geometry property while marks are pending makes them run at once, inside the script.</dd>
+      <dt>How this course's analysis decides "forced"</dt><dd><code>analyze-lib.mjs</code> marks a <code>Layout</code> or <code>UpdateLayoutTree</code> slice as forced when a scripting slice (<code>EventDispatch</code>, <code>FunctionCall</code>, …) is above it on the same thread. Chrome's own marker is the wrapper slice <code>Blink.ForcedStyleAndLayout.UpdateTime</code>; they agree here.</dd>
+      <dt>The frame's lifecycle update</dt><dd>After events and animation-frame callbacks, <code>WebFrameWidgetImpl::UpdateLifecycle</code> runs style, layout, pre-paint and paint for whatever is still dirty. If a forced layout already cleaned everything, this pass finds nothing to lay out.</dd>
+    </dl></div>
+  </div>
+
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these two recordings the forced layout adds no layout work. <b data-m="r-two-virtualizers/main.forcedLayouts"></b> of <b data-m="r-two-virtualizers/main.layouts"></b> layouts are forced, and layout time is <b data-m="r-two-virtualizers/main.layoutMs"></b> ms against <b data-m="r-one-virtualizer/main.layoutMs"></b> ms without any.</p>
+    <p><b>No:</b> that it is always free. It is free here because nothing is written after the read. If the second handler also renders (a diagonal scroll, where the column range changes too), its writes need a second layout in the same frame: Module 3's <code>a-diag-tanstack</code> has <b data-m="a-diag-tanstack/main.layouts"></b> layouts for <b data-m="a-diag-tanstack/main.scrollEvents"></b> scroll events.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read every red bar as waste. A forced layout is a layout that runs <em>early</em>; whether it is also an <em>extra</em> one depends on what is written after it. The rule I keep: count layouts per frame and compare with a control. One per frame, forced or not, is the frame's layout. What a forced layout does change is where its time is reported: here it doubles the length of "Event: scroll", and a profile sorted by event handlers would blame the library.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-two-virtualizers slices 'Blink.ForcedStyleAndLayout' main 300 303</code> prints six entries; five are 0.00 ms or instants (reads that found nothing to do) and one is 0.42 ms at 300.78 ms. The same command on <code>r-one-virtualizer</code> prints only the empty ones.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">Each TanStack virtualizer's scroll handler starts by reading scrollTop or scrollLeft (index.ts:218, 247); Blink updates style and layout before answering (element.cc:2661).</li>
+    <li data-kind="measured">Two virtualizers: one forced style+layout per scroll event (52 of 927 objects, 0.4 ms), and no other layout in the frame. One virtualizer: the same layout in the lifecycle update. Totals equal.</li>
+    <li data-kind="rejected">"A forced layout is an extra layout." It is the frame's layout run early, unless something is written after it.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> So the price of a read is whatever is dirty when it happens. How far does that rule stretch: 561 reads in a row? A read after every class change?</p>
+</section>
+
+<section class="step" data-part="B · When layout runs" data-title="What a read costs: nothing, one element, one row, everything" data-node="js style layout">
+  <p class="holding"><span class="label">Question I hold</span><span>The lab's <code>thrash=1</code> reads a layout property after every write, the textbook mistake. How many layouts does that really cause in each table, and how big is each?</span></p>
+
+  <div class="predict" data-right="a"><span class="label">Predict first</span>
+    <p>With <code>thrash=1</code>, regular-table's style listener reads <code>offsetWidth</code> on each of the 561 body cells after every draw. How many layouts per draw?</p>
+    <div class="opts"><button data-k="a">One</button><button data-k="b">About 17, one per column</button><button data-k="c">561, one per read</button></div>
+    <div class="reveal"><p>One. The draw wrote all the text before the listener ran; the first read pays for all of it, and the other 560 find nothing dirty.</p></div>
+  </div>
+
+  <div class="tracelink" data-trace="r-thrash-regular"></div>
+  <div class="lanes" data-lanes='{"traces":["r-thrash-regular"],"from":316.9,"to":324.5,"rows":["main","app"],"pins":[[1,317.9,"main.js"],[2,318.75,"main.layout"],[3,320.3,"main.layout"],[4,321.9,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The animation-frame callback: regular-table writes the cells, then calls our style listener.</li>
+    <li><i>2</i>The listener's first <code>offsetWidth</code> read: style for 616 elements, 1.0 ms, forced…</li>
+    <li><i>3</i>… and the whole layout, 1123 of 1228 objects, 2.1 ms, forced. The same work as pin 2 and 3 of step 1, moved into the callback.</li>
+    <li><i>4</i>The remaining 560 reads: one more millisecond of the listener, and the layout row above it is empty.</li>
+  </ol>
+  <div class="beat"><span class="label">What I do next</span><div>
+    <p>Four recordings, each read against its baseline. In the last column, "updates asked" counts <code>Document::UpdateStyleAndLayout</code> slices of at least 1 µs (shorter ones are written as instants; see step 6), read once from each trace with <code>q.mjs &lt;id&gt; names</code>.</p>
+  </div></div>
+  <table>
+    <tr><th>Recording</th><th>What is written before each read</th><th>Layouts</th><th>Style recalcs</th><th>Updates asked</th><th>What one read found dirty</th></tr>
+    <tr><td><code>j-cells-L-regular</code> (baseline)</td><td>no reads</td><td class="num"><b data-m="j-cells-L-regular/main.layouts"></b></td><td class="num"><b data-m="j-cells-L-regular/main.styleRecalcs"></b></td><td class="num">750</td><td>—</td></tr>
+    <tr><td><code>r-thrash-regular</code></td><td>nothing (all text was written earlier)</td><td class="num"><b data-m="r-thrash-regular/main.layouts"></b></td><td class="num"><b data-m="r-thrash-regular/main.styleRecalcs"></b></td><td class="num">69,113</td><td>first read: everything. The rest: nothing.</td></tr>
+    <tr><td><code>r-thrash-cls-regular</code></td><td>the cell's class (changes on about 9 cells per draw)</td><td class="num"><b data-m="r-thrash-cls-regular/main.layouts"></b></td><td class="num"><b data-m="r-thrash-cls-regular/main.styleRecalcs"></b></td><td class="num">68,427</td><td>after a real class change: the style of 1 element, about 10 µs, and no layout</td></tr>
+    <tr><td><code>j-cells-L-tanstack</code> (baseline)</td><td>no extra reads</td><td class="num"><b data-m="j-cells-L-tanstack/main.layouts"></b></td><td class="num"><b data-m="j-cells-L-tanstack/main.styleRecalcs"></b></td><td class="num">740</td><td>—</td></tr>
+    <tr><td><code>r-thrash-tanstack</code></td><td>a new row, when one enters</td><td class="num"><b data-m="r-thrash-tanstack/main.layouts"></b></td><td class="num"><b data-m="r-thrash-tanstack/main.styleRecalcs"></b></td><td class="num">9,638</td><td>after an entering row: 18 elements and 37 objects, about 0.3 ms. After a staying row: nothing.</td></tr>
+  </table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>regular-table, reads only.</b> 69,113 updates asked, which is 561 cells × 123 draws, and <b data-m="r-thrash-regular/main.layouts"></b> layouts: one per draw. Layout time is the baseline's (<b data-m="r-thrash-regular/main.layoutMs"></b> ms against <b data-m="j-cells-L-regular/main.layoutMs"></b> ms). What the reads do cost is script: <b data-m="r-thrash-regular/main.scriptMs"></b> ms against <b data-m="j-cells-L-regular/main.scriptMs"></b> ms, about 2 µs per read for the loop, the call into Blink and the check that finds nothing dirty.</p>
+    <p><b>regular-table, a class write before each read.</b> Still one layout per draw. Ten style recalculations per draw instead of one: the first for 616 elements, the others for 1 element each. Two reasons, both in the lab's own code. Assigning <code>className</code> the value it already has dirties nothing, and the data is smooth, so only the few cells at the edge of a "big" band change class in a draw. And in regular-table the class changes paint only: <code>.big</code> sets <code>font-weight</code> and a background, but <code>style.css:17</code> sets the <code>font</code> shorthand on <code>.scroller td</code> with higher specificity, so the weight never applies to a <code>&lt;td&gt;</code> and no box changes size.</p>
+    <p><b>TanStack keyed.</b> <code>offsetTop</code> is read after every row, 35 per render. Rows that stay were not written, so their reads are free. A row that enters was just created: its read lays out that row, 37 objects. The count goes from <b data-m="j-cells-L-tanstack/main.layouts"></b> to <b data-m="r-thrash-tanstack/main.layouts"></b> layouts while the objects laid out stay almost the same (<b data-m="j-cells-L-tanstack/main.layoutDirty"></b> and <b data-m="r-thrash-tanstack/main.layoutDirty"></b>): the same work cut into more pieces, plus a fixed cost per piece.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/regular.ts:83–88 · tanstack.ts:126–130</span>
+      <p>To see exactly what precedes each read:</p>
+<pre><span class="c">// regular.ts, in the style listener, after the whole draw</span>
+<span class="n"> 87</span> if (config.cls) td.className = cellClass(…);
+<span class="n"> 88</span> if (config.thrash) <mark>void (td as HTMLElement).offsetWidth;</mark>
+<span class="c">// tanstack.ts, per row; 126–127 only for a new row</span>
+<span class="n">126</span>   el.style.transform = `translateY(…px)`;
+<span class="n">127</span>   fill(el, item.index, x0, x1, row);
+<span class="n">130</span> if (config.thrash) <mark>void el.offsetTop;</mark></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Thrashing</dt><dd>Write, read, write, read, where every write dirties layout: each read then pays a layout. The damage is the number of <em>dirtying</em> writes that are separated by reads, not the number of reads.</dd>
+      <dt>Batching</dt><dd>All writes, then all reads. regular-table's style listener gets this for free: it runs after the draw has written every cell.</dd>
+      <dt>Three kinds of dirty</dt><dd>Nothing (the read is a check), style only (one small <code>UpdateLayoutTree</code>, no <code>Layout</code>), layout (a <code>Layout</code> sized by what was marked).</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a read costs what is dirty at that moment. In these traces that ranged from under a microsecond of Blink time to a full 2 ms layout, for the same line of JavaScript.</p>
+    <p><b>No:</b> that per-cell thrashing is harmless in a table. No recording here has a layout-changing write before each cell's read; the lab's class knob turned out not to change layout in regular-table. The next step has the case where writes and reads really alternate.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-thrash-regular slices '^Layout$' main 300 400</code> prints six layouts in 100 ms, one per frame, each 1123–1158 of 1228 objects and about 2 ms. Then count the reads: <code>node lab/harness/q.mjs r-thrash-regular names | grep UpdateStyleAndLayout</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">regular-table with 561 offsetWidth reads after each draw: one forced layout per draw, the same size and time as the unforced one; the reads cost about 2 µs of script each.</li>
+    <li data-kind="measured">A read after a class change that only affects paint forces a 1-element style recalculation (about 10 µs) and no layout.</li>
+    <li data-kind="measured">TanStack keyed with offsetTop after each row: one extra small layout per entering row (37 objects); 321 layouts instead of 123 for the same total of dirty objects.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Where is the real thing: a library that writes, reads, writes, reads, on purpose?</p>
+</section>
+
+<section class="step" data-part="B · When layout runs" data-title="The cold path: one layout per column" data-node="js layout present">
+  <p class="holding"><span class="label">Question I hold</span><span>regular-table told to forget its column widths on every scroll event, as its own <code>file_browser</code> example does: which reads force layout now, how many, and why is each one more expensive than its size suggests?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>The cold recording above the warm baseline, the same 12 ms: one scroll step in each.</p></div></div>
+  <div class="tracelink" data-trace="r-autosize-reset"></div>
+  <div class="lanes" data-lanes='{"traces":["r-autosize-reset","j-cells-L-regular"],"titles":["r-autosize-reset: widths forgotten on every scroll event","j-cells-L-regular: widths known (the baseline)"],"from":300,"to":312,"rows":["mainFrames","main"],"pins":[[1,300.68,"main.layout",0],[2,301.4,"main.layout",0],[3,304.6,"main.layout",0],[4,308.7,"main.layout",0],[5,305.0,"main.layout",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The row height is unknown again, so regular-table appends a probe cell and reads its <code>offsetHeight</code>: a small layout, 13 objects.</li>
+    <li><i>2</i>The first column is written (33 cells) and its header's <code>offsetWidth</code> is read: a forced layout of 99 objects, 0.65 ms.</li>
+    <li><i>3</i>The same for each further column: 16 more forced layouts of 99 objects, 0.35–0.38 ms each. 18 layouts in this one scroll event, 6.3 ms together. The whole draw now runs inside <code>Event: scroll</code> (8.8 ms) instead of in an animation-frame callback.</li>
+    <li><i>4</i>After the last column, one style recalculation of 580 elements.</li>
+    <li><i>5</i>The warm path, same table: all columns written first, then one layout of 1158 objects, 2.85 ms.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="r-autosize-reset/main.layouts"></b> layouts in the recording against <b data-m="j-cells-L-regular/main.layouts"></b>, every one forced, and <b data-m="r-autosize-reset/main.layoutMs"></b> ms of layout against <b data-m="j-cells-L-regular/main.layoutMs"></b> ms (recorded minutes apart, so the ratio is good to perhaps 20 %). <b data-m="r-autosize-reset/frames.partial"></b> frames were presented without the main thread's update, against <b data-m="j-cells-L-regular/frames.partial"></b>.</p>
+    <p>The interesting number is the price of one piece. A column's layout marks 99 objects and takes 0.37 ms: about 11 µs per cell. The warm layout marks 1158 and takes 2.85 ms: about 5 µs per cell. Cutting the work into 17 pieces did not only add 17 fixed overheads; each piece is a layout of the <em>table</em>. A column's cells sit one in every row, so every row is dirty and the table has to run its row and column pass 17 times.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/table.ts#L900-L1004">regular-table src/ts/table.ts:900, 991–996</a>
+      <p>The read, and the condition that makes it per column:</p>
+<pre><span class="n">900</span> const <mark>warm</mark> = this._column_sizes.indices.some(Boolean);
+<span class="n">991</span>   let col_width =
+<span class="n">992</span>     this._column_sizes.indices[_virtual_x + Math.floor(x0)] ||
+<span class="n">993</span>     (<mark>warm ? unmeasured_col_width : 0</mark>);
+<span class="n">995</span>   if (!col_width) {
+<span class="n">996</span>     col_width = cont_head?.th?.<mark>offsetWidth</mark> || 0;</pre>
+      <p>When at least one width is known (<code>warm</code>), one measured column stands in for the other new ones. When none is, every column is measured right after it is drawn, because the loop needs each width to know whether the viewport is full.</p>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/regular-table.ts#L86-L102">src/ts/regular-table.ts:86–101</a> · <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/examples/file_browser/file_browser.js#L198-L200">examples/file_browser/file_browser.js:198–200</a>
+<pre><span class="n"> 96</span> this._column_sizes.indices = [];           <span class="c">// no width known</span>
+<span class="n">100</span> this._column_sizes.row_height = undefined; <span class="c">// the probe runs again</span>
+<span class="n">198</span> regularTable.addEventListener("scroll", () =&gt; {
+<span class="n">199</span>    <mark>regularTable.resetAutoSize();</mark></pre>
+      <p>The lab's <code>rtReset=1</code> does exactly what that example does.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Measure, then cache</dt><dd>Auto-sizing needs the browser's answer once per column. regular-table keeps it in <code>_column_sizes.indices</code>; a steady vertical scroll then reads no layout between writes at all (Module 3 lists every read).</dd>
+      <dt>Why a table makes small layouts expensive</dt><dd>In a table, a cell's box depends on its row and its column. Chrome will not start a layout below the table (step 6 quotes the line), so any dirty cell means the table's layout runs, over rows that did not change too.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the cold path is real thrashing: 17 dirtying writes separated by 17 reads, in the library's own loop, and it costs about three times the warm layout time per scroll step in this recording.</p>
+    <p><b>No:</b> that regular-table thrashes when scrolling. It does so only while no width is known: the first draw, and any draw after <code>resetAutoSize()</code>. And the per-cell figures are from one frame of one run.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: column widths and the row height come from the engine's own model (measured once, or given), never from a read placed between writes of the same draw. If a measurement pass is needed, it is its own phase: write all, read all. The cold path shows what the alternative costs in the best implementation I know of.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-autosize-reset slices '^Layout$' main 300 312</code> prints 18 layouts: one of 13 objects, then 17 of 99. <code>node lab/harness/q.mjs r-autosize-reset stack 303.2</code> names <code>_render_pass</code> under <code>draw</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">With no column width known, regular-table reads th.offsetWidth after drawing each column (table.ts:900, 991–996); resetAutoSize() creates that state (regular-table.ts:96, 100).</li>
+    <li data-kind="measured">rtReset=1: 18 forced layouts per scroll event (a probe, then 99 objects per column), 6.3 ms in one event; about 1,800 layouts and 2.7 times the baseline's layout time over the scroll.</li>
+    <li data-kind="inferred">A column-sized layout in a table costs about twice as much per cell as the full layout, because each one re-runs the table's pass over every row.</li>
+  </ul>
+  <p class="next" data-answer="forced"><b>Next question →</b> "Chrome will not start a layout below the table." Where does a layout start, then, and what are the two numbers on a Layout slice counting?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · What layout and style cost, and why" data-title="Where a layout starts, and what 2 ms of it is made of" data-node="layout method"
+  data-ask="boundary|Where does a layout start, and can CSS containment move that point?">
+  <p class="holding"><span class="label">Question I hold</span><span>"1123 of 1228 objects dirty." 1228 of what? The page has more boxes than that. And inside the 2 ms, how much is shaping text?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Two source reads and one count. First, how a dirty mark travels up the tree. Second, what the Layout slice counts. Third, the only finer-grained event Blink writes inside layout in these traces, <code>InlineNode::ShapeTextIncludingFirstLine</code>, counted per layout.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/layout/layout_object.cc#L1634-L1700">third_party/blink/renderer/core/layout/layout_object.cc:1690–1695</a>
+      <p>A changed text marks its container, which marks its container, and so on upward. The walk stops at the first box that can be laid out on its own:</p>
+<pre><span class="n">1690</span>    if (allow_subtree_layout_root &amp;&amp; <mark>ObjectIsRelayoutBoundary(last)</mark> &amp;&amp;
+<span class="n">1691</span>        last-&gt;IsRooted()) {
+<span class="n">1692</span>      GetFrameView()-&gt;<mark>ScheduleRelayoutOfSubtree(*last)</mark>;
+<span class="n">1693</span>      return;
+<span class="n">1694</span>    }
+<span class="n">1695</span>    object = container;</pre>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/layout/layout_object.cc#L1415-L1565">layout_object.cc:1415–1565, <code>ObjectIsRelayoutBoundary</code></a>
+      <p>Which boxes qualify. The conditions that matter for a table, in order:</p>
+<pre><span class="n">1422</span>  // We need a previous layout result to begin layout at a subtree root.
+<span class="n">1424</span>  if (!layout_result) { return false; }
+<span class="n">1472</span>  // <mark>Table parts can't be relayout roots</mark> since the table is responsible for
+<span class="n">1473</span>  // layouting all the parts.
+<span class="n">1474</span>  if (box-&gt;IsTablePart()) { return false; }
+<span class="n">1493</span>  if (box-&gt;<mark>IsFlexItem()</mark>) { return false; }
+<span class="n">1511</span>  if (box-&gt;<mark>ShouldApplyLayoutContainment() &amp;&amp;</mark>
+<span class="n">1512</span>      <mark>box-&gt;ShouldApplySizeContainment()</mark>) { return true; }
+<span class="n">1526</span>  if (!style.Width().IsFixed() || !style.Height().IsFixed()) { return false; }
+<span class="n">1534</span>  if (!box-&gt;ShouldClipOverflowAlongBothAxis()) { return false; }</pre>
+      <p>(Braces joined onto one line here; a box must also be a formatting-context root with its own paint layer, lines 1460 and 1469.) So a box with a fixed width and height that clips its overflow is a boundary, and so is one with <code>contain: strict</code>; a table row or cell never is, and a flex item never is.</p>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/frame/layout_subtree_root_list.cc#L17-L41">third_party/blink/renderer/core/frame/layout_subtree_root_list.cc:21–26, 38–40</a>
+<pre><span class="n">21</span>  for (const LayoutObject* o = object; o;) {
+<span class="n">22</span>    ++total_objects;
+<span class="n">24</span>    if (o-&gt;SelfNeedsFullLayout() || (!display_locked &amp;&amp; o-&gt;NeedsLayout())) {
+<span class="n">25</span>      ++needs_layout_objects;
+<span class="n">38</span>  // TODO(leviw): <mark>This will double-count nested roots</mark> crbug.com/509141
+<span class="n">39</span>  for (const auto&amp; root : Unordered())
+<span class="n">40</span>    CountObjectsNeedingLayoutInRoot(root, needs_layout_objects, total_objects);</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Relayout boundary</dt><dd>A box whose size cannot depend on its content and whose content cannot affect anything outside. Layout can start there and stop there.</dd>
+      <dt><code>partialLayout: true</code></dt><dd>The layout started at such boundaries, not at the document root. Every Layout slice in this module's scroll traces has it.</dd>
+      <dt><code>totalObjects</code></dt><dd>All layout objects <em>under the boundaries where this layout starts</em>, counted before it runs. <code>dirtyObjects</code>: those among them that carry a mark, including boxes that are only on the path to a dirty descendant.</dd>
+    </dl></div>
+  </div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Both lab tables sit under a boundary.</b> The lab's scroller has a fixed width and height, <code>overflow: auto</code> and <code>position: relative</code>, which meets lines 1526 and 1534. regular-table adds one of its own inside: its shadow DOM wraps the table in <code>div.rt-scroll-table-clip { position: sticky; contain: strict; }</code> (<code>src/less/container.less:35–37</code>), which meets line 1511. That is why the totals are about the table's own size (1228 and 1262) and stay the same whatever else is on the page. Which box exactly was the root, the Layout slice does not say.</p>
+    <p><b>1123 of 1228 is 561 cells.</b> Each rewritten cell is a cell box and a new text box, 2 × 561 = 1122, plus the path above them. The 105 clean objects are the header and the rows' own boxes on a frame where the row count did not change.</p>
+    <p><b>The double count shows up once per cold draw.</b> In step 5 the probe layout reported "13 of 2328" for a table of 1158 objects: the probe is appended to the regular-table element, so the outer scroller and the inner clip were both roots, and 1158 was counted under each (line 38).</p>
+    <p><b>Shaping is a small part.</b> In <code>j-cells-L-regular</code> Blink wrote 66,465 <code>ShapeTextIncludingFirstLine</code> events in <b data-m="j-cells-L-regular/main.layouts"></b> layouts: 545 per layout, one per rewritten cell. Their durations sum to 38.8 ms of <b data-m="j-cells-L-regular/main.layoutMs"></b> ms. About half of them are too short to have a duration at all.</p>
+  </div></div>
+  <table>
+    <tr><th>Recording</th><th>Layout, ms</th><th>Shape events</th><th>per layout</th><th>Sum of shape durations, ms</th><th>Layout per shaped cell</th></tr>
+    <tr><td>regular-table, all rewritten (<code>j-cells-L-regular</code>)</td><td class="num"><b data-m="j-cells-L-regular/main.layoutMs"></b></td><td class="num">66,465</td><td class="num">545</td><td class="num">38.8</td><td class="num">4.1 µs</td></tr>
+    <tr><td>positional flex rows, all rewritten (<code>j-speed-2400-positional</code>)</td><td class="num"><b data-m="j-speed-2400-positional/main.layoutMs"></b></td><td class="num">71,561</td><td class="num">591</td><td class="num">44.9</td><td class="num">4.0 µs</td></tr>
+    <tr><td>keyed, all rows enter (<code>j-speed-38400-keyed</code>)</td><td class="num"><b data-m="j-speed-38400-keyed/main.layoutMs"></b></td><td class="num">54,522</td><td class="num">447</td><td class="num">61.2</td><td class="num">4.2 µs</td></tr>
+    <tr><td>keyed, 2 rows enter (<code>j-cells-L-tanstack</code>)</td><td class="num"><b data-m="j-cells-L-tanstack/main.layoutMs"></b></td><td class="num">3,523</td><td class="num">29</td><td class="num">5.5</td><td class="num">9.3 µs</td></tr>
+    <tr><td>regular-table, cold path (<code>r-autosize-reset</code>)</td><td class="num"><b data-m="r-autosize-reset/main.layoutMs"></b></td><td class="num">52,942</td><td class="num">29 (per column)</td><td class="num">41.2</td><td class="num">14 µs</td></tr>
+  </table>
+  <p class="note">A limit on every time in this step: the shape events exist because the <code>blink</code> trace category is on, as it is in all of this course's traces, and writing 500 events inside a 2 ms layout is not free. Module 2 (<a href="frames.html">frames.html</a>) measured that this category inflates layout time by about 15 %; read "4 µs" as an upper figure. Shape events and their durations are read once from each trace (<code>q.mjs &lt;id&gt; names</code>, the line <code>InlineNode::ShapeTextIncludingFirstLine</code>, which counts slices and instants together). The last column is layout time divided by shape events, computed with the Layout slices' own total.</p>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Here is the precise statement the lead asked for. <b>regular-table's layout is the largest main-thread cost in these scrolls because every draw rewrites the text of every visible cell, and a rewritten cell costs about 4 µs of layout wherever it lives.</b> 561 cells × 4 µs is the 2.2 ms per frame. A flex-row table that rewrites every cell pays the same; a keyed table whose rows all enter pays the same. Of those 4 µs, shaping the new text accounts for roughly 0.6 to 1.2 µs (the measured durations, plus less than a microsecond for each event too short to measure). The rest is one opaque block, <code>LocalFrameView::performLayout</code>: building line boxes and fragments for each cell and walking the rows.</p>
+    <p>What reduces it, on the evidence so far: fewer cells whose text changes per frame. Nothing else in this table has been shown to. Steps 7 and 9 test two candidates, fixed table layout and containment.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>My first count of shape events was 34,336, "about half the cells", and I started explaining why half the cells kept their text. They did not. A slice whose begin and end fall in the same microsecond is exported to JSON as an instant (<code>"ph":"I"</code>) with no duration, and a counter that looks for <code>"ph":"X"</code> misses it: 32,129 more events. The rule I keep: when I count a very short event, I count every phase of that name, and I check the count against something I know (cells written) before I explain it.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these recordings layout time per rewritten cell is about 4 µs in a table cell and in a flex item alike, and text shaping is at most a quarter of it. The text is 5 to 9 characters of one monospace font.</p>
+    <p><b>No:</b> anything about long strings, mixed fonts, wrapping text or complex scripts: none was recorded. And nothing finer than "about three quarters is not shaping": Blink writes no other event inside <code>performLayout</code> in these categories.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-L-regular names | grep ShapeText</code> prints <code>38.80 ms  66465 × XI InlineNode::ShapeTextIncludingFirstLine</code>: the <code>XI</code> says both phases occur. In Perfetto, the instants appear as markers between the 1 µs slices under each Layout.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">A dirty mark climbs to the nearest relayout boundary (layout_object.cc:1690–1692): fixed-size clipping boxes and contain: strict qualify; table parts (1474) and flex items (1493) never do.</li>
+    <li data-kind="read">totalObjects counts objects under the layout's start points; nested start points are counted twice (layout_subtree_root_list.cc:38).</li>
+    <li data-kind="measured">One shape event per rewritten cell; shaping sums to about 14 % of layout time in the table and 16 % in flex rows; layout per rewritten cell is about 4 µs in both.</li>
+    <li data-kind="rejected">"Only half the cells are re-shaped": zero-length slices are exported as instants and must be counted too.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> If a table cannot be entered below the table, what happens when only one cell changes?</p>
+</section>
+
+<section class="step" data-part="C · What layout and style cost, and why" data-title="One cell changes: a table against positioned rows" data-node="layout paint method">
+  <p class="holding"><span class="label">Question I hold</span><span>A live table mostly changes one cell at a time. For one changed cell, what does layout redo in a <code>&lt;table&gt;</code>, in absolutely positioned flex rows, and in rows with <code>contain: strict</code>? And does <code>table-layout: fixed</code> help the table?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>A 15 × 32 table, all on screen, about 1,057 layout objects. One cell's text changes. A table and a set of flex rows both report five or six dirty objects. How do their layout times compare?</p>
+    <div class="opts"><button data-k="a">About equal: same number of dirty objects</button><button data-k="b">The table takes about three times as long</button><button data-k="c">The flex rows take longer: 32 separate containers</button></div>
+    <div class="reveal"><p>About three times, in every one of five runs. Equal dirty counts hide what the layout has to walk to get to them.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Four scenarios added for this module, recorded back to back, five runs each: the server pushes one cell value 60 times a second into a table of 15 columns that is not scrolling. regular-table; regular-table with <code>colw=fixed</code>; TanStack keyed rows; the same with <code>contain=1</code>. The chart shows the rendering of one update in three of them.</p>
+  </div></div>
+  <div class="tracelink" data-trace="r-tick-regular"></div>
+  <div class="tracelink" data-trace="r-tick-tanstack"></div>
+  <div class="tracelink" data-trace="r-tick-contain-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["r-tick-regular","r-tick-tanstack","r-tick-contain-tanstack"],"titles":["r-tick-regular: one cell of a <table>","r-tick-tanstack: one cell of a positioned flex row","r-tick-contain-tanstack: the same, each row contain: strict"],"from":617.5,"to":627,"rows":["main"],"axis":"ms after the start mark","pins":[[1,624.4,"main.layout",0],[2,625.5,"main.paint",0],[3,618.44,"main.layout",1],[4,620.78,"main.layout",2],[5,621.5,"main.paint",2]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Table: <code>Layout (6 of 1057 objects dirty)</code>, 0.66 ms.</li>
+    <li><i>2</i>Table: Paint, 0.72 ms, for one changed text.</li>
+    <li><i>3</i>Flex rows: <code>Layout (5 of 1056 objects dirty)</code>, 0.17 ms; its Paint is 0.14 ms.</li>
+    <li><i>4</i>Contained rows: <code>Layout (3 of 31 objects dirty)</code>, 0.08 ms. The total is now one row.</li>
+    <li><i>5</i>Contained rows: Layerize, 0.54 ms, against 0.30 ms without containment.</li>
+  </ol>
+  <table class="mtable runs" data-runs="r-tick-regular" data-cols="main.layoutMs|layout · table|ms,main.paintMs|paint stages · table|ms"></table>
+  <table class="mtable runs" data-runs="r-tick-fixed-regular" data-cols="main.layoutMs|layout · table with colw=fixed|ms,main.paintMs|paint stages · table with colw=fixed|ms"></table>
+  <table class="mtable runs" data-runs="r-tick-tanstack" data-cols="main.layoutMs|layout · flex rows|ms,main.paintMs|paint stages · flex rows|ms"></table>
+  <table class="mtable runs" data-runs="r-tick-contain-tanstack" data-cols="main.layoutMs|layout · contained rows|ms,main.paintMs|paint stages · contained rows|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Each table is five runs of about 120 updates; the numbers are totals over a run. The counts on the slices do not vary: 6 of 1057, 5 of 1056, 3 of 31.</p>
+    <p><b>Table against flex rows.</b> The dirty path has the same length in both: text, cell, row, the row's container, the root. But the table's layout takes about three times as long in every run. Line 1474 of the previous step is why the path matters more than its length: the layout has to pass <em>through the table</em>, and a table's layout visits every row and re-derives the columns even when 31 rows are clean. The flex rows are independent absolutely positioned boxes; their parent only has to place them.</p>
+    <p><b>Containment.</b> With <code>contain: strict</code> an existing row meets line 1511, so the mark stops at the row: 3 of 31. Layout time drops by about 40 %. The paint stages rise by about 30 %, and the pin shows where: Layerize. In this lab <code>contain=1</code> also puts <code>contain: content</code> on every cell, so I cannot say which of the two adds that cost. Net, in these runs, rendering one update is not cheaper with containment.</p>
+    <p><b>Paint.</b> The table spends about twice as long in the paint stages as the flex rows. One table is one paint layer; step 10 reads why that makes a one-cell repaint proportional to the table.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/style/computed_style.h#L2079-L2087">third_party/blink/renderer/core/style/computed_style.h:2079–2087</a>
+      <p>Because <code>colw=fixed</code> changed nothing, and I wanted to know whether that was the browser's answer or mine:</p>
+<pre><span class="n">2079</span>  bool IsFixedTableLayout() const {
+<span class="n">2084</span>    // https://www.w3.org/TR/css-tables-3/#table-layout-property
+<span class="n">2085</span>    return TableLayout() == ETableLayout::kFixed &amp;&amp;
+<span class="n">2086</span>           (<mark>!LogicalWidth().HasAuto()</mark> &amp;&amp; !LogicalWidth().HasMaxContent());
+<span class="n">2087</span>  }</pre>
+      <span class="path">lab/pages/src/style.css:34</span>
+<pre><span class="n">34</span> regular-table.fixed-columns table { <mark>table-layout: fixed;</mark> }   <span class="c">/* and no width */</span></pre>
+      <p><code>table-layout: fixed</code> only counts on a table whose width is not <code>auto</code>. The lab sets the property and no width, and regular-table sets none either, so Chrome still uses automatic table layout.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>A/A control</dt><dd>Two recordings of what is, for the browser, the same configuration. Their difference is the noise floor for every other comparison made the same way.</dd>
+      <dt>Repeated runs</dt><dd>The harness records a scenario N times, keeps the first trace and every run's metrics. "max ÷ min" is how far one configuration moved by itself.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I recorded <code>colw=fixed</code> to test whether fixed table layout makes the table's single-cell layout cheaper. My first pair of single runs (since replaced by the five-run recordings above) showed the "fixed" table 50 % <em>more expensive</em> at the median, and I began to explain that. Both halves were wrong. The knob does nothing (the source above), so the pair is an A/A test; and in the tables above the same configuration moves by 1.2 to 1.3 times from run to run by itself, while within one trace a single table layout takes from 0.55 to 0.84 ms (10th to 90th percentile 0.62 to 0.84). The rule I keep: before reading a trace as "with X", check that X reached the computed state; and when a difference is under 2×, record it more than once. Whether fixed table layout helps is <b>not tested</b> by this lab.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> for a single changed cell in a 480-cell grid, layout through a <code>&lt;table&gt;</code> costs about three times layout through independent positioned rows, with the same number of dirty objects, in five runs of each. A contained row cuts the reported total from 1056 objects to 31.</p>
+    <p><b>No:</b> that containment pays for itself (it did not here, with the lab's combined row and cell containment); that the ratio holds at other table sizes (one size recorded); or anything about <code>table-layout: fixed</code>.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: for the DOM painter, rows as independent positioned boxes rather than rows of one <code>&lt;table&gt;</code>, if live single-cell updates are the common write: the table's layout pass is the floor under every small update. Evidence: this step. What it would cost elsewhere (more paint layers when everything changes, step 10) has to be weighed against it.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-tick-contain-tanstack slices '^Layout$' main 600 640</code> prints three layouts, each <code>"dirtyObjects":3 … "totalObjects":31</code>; without <code>contain</code> in the id, 5 of 1056.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One changed cell: 6 of 1057 objects dirty in a table, 5 of 1056 in flex rows, 3 of 31 in a contained row; layout time about 3 : 1 : 0.6 over five runs each.</li>
+    <li data-kind="read">table-layout: fixed is ignored on a table of auto width (computed_style.h:2085–2086); the lab's colw=fixed is therefore a no-op.</li>
+    <li data-kind="measured">Row and cell containment lowered layout by about 40 % and raised layerize; the paint stages grew by about 30 %.</li>
+    <li data-kind="rejected">"The fixed-layout table is slower": the two recordings are the same configuration, and their difference is run-to-run spread.</li>
+  </ul>
+  <p class="next" data-answer="dirty"><b>Next question →</b> Layout is settled. Step 2 left a second gap: regular-table restyles fifteen times as many elements as the positional table for the same writes. What is restyling them?</p>
+</section>
+
+<section class="step" data-part="C · What layout and style cost, and why" data-title="Style: 616 elements a draw, and it is not the classes" data-node="style js">
+  <p class="holding"><span class="label">Question I hold</span><span>Conditional classes on every cell (<code>cls=1</code>): what do they add to style recalculation? And what is regular-table's baseline style cost made of?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The class recordings against their baselines, by <code>UpdateLayoutTree</code>'s <code>elementCount</code>. Then a control with no scrolling: <code>r-tick-regular</code> of the previous step, where regular-table draws 120 times in place.</p>
+  </div></div>
+  <table class="mtable" data-rows="j-cells-L-tanstack,r-cls-tanstack,j-cells-L-regular,r-cls-regular,r-tick-regular" data-names="keyed · baseline,keyed · classes,regular-table · baseline,regular-table · classes,regular-table · draws without scrolling" data-head="Recording" data-cols="main.styleRecalcs|style recalcs,main.styleElements|elements restyled,main.styleMs|style|ms,state.cellsInDom|cells in DOM"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Classes add no elements.</b> The keyed table restyles 36 elements per frame with or without classes: the two entering rows and their 34 cells, which are new and need a style anyway. regular-table restyles 616 per draw with or without classes. A class on an element that is being restyled anyway costs a few more selector matches; in these recordings that is inside the noise.</p>
+    <p><b>616 is every element of the table</b>: 561 cells, 33 rows, the header cells and their spans. And it happens only when the table scrolls. In <code>r-tick-regular</code>, 120 draws restyle <b data-m="r-tick-regular/main.styleElements"></b> elements in total.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/scroll_panel.ts#L742-L759">regular-table src/ts/scroll_panel.ts:742–758</a>
+      <p>What regular-table writes on a scroll step besides text:</p>
+<pre><span class="n">742</span>     * Write the sub-cell offset CSS custom properties to the slotted
+<span class="n">743</span>     * `&lt;table&gt;`'s inline style, <mark>from where they inherit into every cell</mark>.
+<span class="n">753</span>    protected _set_sub_cell_offset(x_offset: number, y_offset: number): void {
+<span class="n">754</span>        const style = this.table_model.table.style;
+<span class="n">755</span>        style.setProperty(CLIP_X, `${x_offset}px`);
+<span class="n">756</span>        style.setProperty(CLIP_Y, `${y_offset}px`);
+<span class="n">757</span>        style.setProperty(TRANSFORM_X, `${-x_offset}px`);
+<span class="n">758</span>        style.setProperty(TRANSFORM_Y, `${-y_offset}px`);</pre>
+      <p>Four custom properties (<code>--regular-table--clip-y</code> and three more) on the <code>&lt;table&gt;</code>. Custom properties inherit, so when their value changes every descendant's computed style changes. At 2,400 px/s the offset within a 24 px row is different in every frame.</p>
+      <p>The rules that consume these properties are in <code>src/less/sub-cell-scrolling.less</code>, which its header calls "Optional CSS to implement micro-offset". The lab page does not load it. The properties are written and inherited all the same.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt><code>elementCount</code></dt><dd>Elements whose computed style was recalculated in this pass. It does not say why.</dd>
+      <dt>Inherited change</dt><dd>Changing an inherited property on an ancestor (colour, font, any custom property by default) restyles the whole subtree. Changing a non-inherited one (a transform, a width) restyles one element.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> regular-table's style cost in a scroll (<b data-m="j-cells-L-regular/main.styleMs"></b> ms, about a tenth of the main thread's busy time in that recording) is the whole table restyled once per draw, and it is absent when the table draws without moving.</p>
+    <p><b>Inferred, not seen:</b> that the four custom properties are the cause. The trace has no invalidation tracking; the evidence is the source comment, the count equal to the table's element count at two table sizes, and the control. Recording with <code>disabled-by-default-devtools.timeline.invalidationTracking</code> would settle it.</p>
+    <p><b>No:</b> that classes are free in general. A class toggled on an element that is <em>not</em> otherwise restyled costs one element's recalculation each (step 4 measured about 10 µs).</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: per-frame values that many cells need (a sub-row offset, a theme switch) go on one element as a non-inherited property, a transform on the body or the scroller, not into an inherited custom property read by every cell. Evidence: 616 restyled elements per scroll frame against 36, for the same visible cells.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-L-regular slices UpdateLayoutTree main 300 340</code> prints <code>"elementCount":616</code> or 617 on each frame; on <code>r-tick-regular</code> the same command (window 600 to 640) prints <code>"elementCount":0</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Conditional classes add no restyled elements in either table: 36 per frame keyed, 616 per draw in regular-table, with and without.</li>
+    <li data-kind="read">regular-table writes four inherited custom properties on the table on every scroll step (scroll_panel.ts:742–758); the lab does not load the stylesheet that uses them.</li>
+    <li data-kind="inferred">Those properties are why every element of the table is restyled per scroll draw; draws without scrolling restyle none.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Containment made a row a layout boundary in step 7. What does it do in the scroll traces, where the lead found it changed nothing?</p>
+</section>
+
+<section class="step" data-part="C · What layout and style cost, and why" data-title="Containment: what it can save, and what it added" data-node="layout paint">
+  <p class="holding"><span class="label">Question I hold</span><span><code>contain=1</code> puts <code>contain: strict</code> on TanStack rows and <code>contain: content</code> on every cell of both tables. In the scroll recordings layout did not get cheaper. Is that a failed experiment or the right answer?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three scroll recordings with containment against their baselines. I read the Layout slices' counts first, because they do not depend on how busy the machine was.</p>
+  </div></div>
+  <table class="mtable" data-rows="j-cells-L-tanstack,r-contain-tanstack,j-cells-L-regular,r-contain-regular,j-speed-2400-positional,r-contain-positional" data-names="keyed · baseline,keyed · contain,regular-table · baseline,regular-table · contain,positional · baseline,positional · contain" data-head="Recording" data-cols="main.layoutDirty|objects dirty (sum),main.layoutTotalMax|largest total,main.layoutMs|layout|ms,main.paints|Paint slices,main.paintMs|paint stages|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Keyed rows:</b> the same dirty objects and the same total, with and without. Step 6 already said why. The rows that need layout are the ones that just entered, and a box with no previous layout result cannot be a boundary (line 1422). Their cells are flex items (line 1493). So the mark from a new row climbs to the scroller exactly as before.</p>
+    <p><b>regular-table:</b> the same again. The only contained boxes are table cells, and a table part is never a boundary (line 1474). What did change is paint: <b data-m="r-contain-regular/main.paints"></b> Paint slices against <b data-m="j-cells-L-regular/main.paints"></b>. <code>contain: content</code> includes paint containment, and a paint-contained cell is painted as its own unit; the next step reads where that slice is written.</p>
+    <p><b>Positional rows:</b> here the rows exist and are contained, so they do become boundaries, and the slices show it. Of the 123 layouts, 42 report <b>1225 of 1225</b>: 35 rows of 35 objects each, every one a start point of its own, and nothing above them visited. The other 81 report 2452 of 2487 or 2487 of 2522: the 1225 again, plus the scroller's whole subtree (1262 or 1297 objects, one row apart), in which the rows are counted a second time (step 6, line 38). My reading of those frames, from the totals alone: the number of rows had just changed by one, and adding or removing a row element dirties the rows' parent, so the scroller is a start point too.</p>
+    <p>The useful part is that both kinds of layout are in one trace. Rows only: 1.84 ms at the median. Scroller as well: 1.91 and 1.96 ms. With containment doing exactly what it is for, the layout is 5 % shorter.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Containment does one thing for layout: it stops a mark from climbing, so that ancestors and siblings are not revisited. In a scroll step of these tables there is nothing above to save. The tables already sit under a boundary (the scroller; regular-table's own <code>contain: strict</code> clip), and what is dirty is the cells themselves, all of them or all of the new rows. The single-cell update of step 7 is the case containment is for, and there it did cut the layout.</p>
+    <p>The times in the table were recorded in different sessions, so I do not read small differences in them. The counts, and the two kinds of layout inside the one positional trace, need no such caution.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these scrolls containment left the amount of layout unchanged where it could not apply (new rows, table cells), saved about 5 % of a layout where it did apply (existing rows), and on table cells multiplied the units of paint by about two hundred.</p>
+    <p><b>No:</b> "containment does not work". It did what the source says it does. The negative result is about where the dirt is, and it would turn positive for a page with expensive content around the table that the table's changes currently reach.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected <code>contain</code> to be a free hint: at worst no effect. Two things were wrong with that. A hint only applies where the engine can use it (not on a table cell, not on a flex item, not on a box laid out for the first time), and <code>contain: content</code> is not only a hint: it changes what gets its own paint unit. The rule I keep: before adding containment, name the ancestor work it is supposed to prevent and find it in a trace; afterwards, check paint and layerize, not just layout.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-contain-regular names | grep ' X Paint '</code> prints <code>53906 × X Paint</code>; on <code>j-cells-L-regular</code>, 249. Then <code>node lab/harness/q.mjs r-contain-positional slices '^Layout$' main 300 340</code>: one layout of 2452 of 2487 objects and two of 1225 of 1225.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Scroll with contain=1: dirty objects and layout totals unchanged for keyed rows and for regular-table; Paint slices in regular-table rise from 249 to 53,906.</li>
+    <li data-kind="read">Why: a new row has no layout result (1422), cells are flex items (1493) or table parts (1474); none can be a boundary.</li>
+    <li data-kind="measured">Existing contained rows do become layout start points (42 layouts of 1225 of 1225 objects); those layouts are about 5 % shorter than the ones in the same trace that also start at the scroller.</li>
+  </ul>
+  <p class="next" data-answer="boundary"><b>Next question →</b> Two steps have now ended in the paint stages. What do pre-paint, paint and layerize each scale with?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · Pixels" data-title="Main-thread paint: rows created, rewritten, or one cell" data-node="paint"
+  data-ask="pixels|When pixels are expensive, which thread pays, and what does the user lose?">
+  <p class="holding"><span class="label">Question I hold</span><span>"Paint" in a summary is three stages. Which of them grows when rows are created, when their text is rewritten, and when one cell changes? Does the table's structure matter here?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The four recordings of step 2, split by slice name (<code>q.mjs &lt;id&gt; names</code>: <code>PrePaint</code>, <code>Blink.Paint.UpdateTime</code>, <code>Layerize</code>), with the number of <code>Paint</code> slices. Values read once from these recordings; about 125 frames each.</p>
+  </div></div>
+  <table>
+    <tr><th>Recording</th><th>What changes per frame</th><th>Pre-paint, ms</th><th>Paint, ms</th><th>Layerize, ms</th><th>Paint slices</th></tr>
+    <tr><td>keyed (<code>j-cells-L-tanstack</code>)</td><td>about 2 rows created</td><td class="num">17.2</td><td class="num">37.4</td><td class="num">61.1</td><td class="num">499</td></tr>
+    <tr><td>keyed, fast (<code>j-speed-38400-keyed</code>)</td><td>all 35 rows created</td><td class="num">82.7</td><td class="num">281.1</td><td class="num">69.8</td><td class="num">3,872</td></tr>
+    <tr><td>positional (<code>j-speed-2400-positional</code>)</td><td>35 existing rows: new transform, new text</td><td class="num">94.7</td><td class="num">163.4</td><td class="num">72.8</td><td class="num">4,335</td></tr>
+    <tr><td>regular-table (<code>j-cells-L-regular</code>)</td><td>561 texts in one table</td><td class="num">76.8</td><td class="num">87.1</td><td class="num">60.1</td><td class="num">249</td></tr>
+  </table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Layerize does not care.</b> About 0.5 ms per frame in all four, whether two rows changed or all of them. For the keyed table at this speed it is the largest single rendering stage, larger than its layout.</p>
+    <p><b>Pre-paint follows how much of the tree changed</b>: small for two rows, about the same for the three that touch everything.</p>
+    <p><b>Paint follows the number of paint layers repainted.</b> The Paint slices give the count: 4 per frame keyed, 31 to 35 per frame when every row is created or rewritten, 2 per frame in regular-table. Creating every row costs most; rewriting 35 separate rows costs about twice what rewriting the same cells inside one table costs.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/paint/paint_layer_painter.cc#L51-L96">third_party/blink/renderer/core/paint/paint_layer_painter.cc:60–61, 82–96</a>
+      <p>What one <code>Paint</code> slice stands for:</p>
+<pre><span class="n">60</span>      TRACE_EVENT_BEGIN(
+<span class="n">61</span>          kDevToolsTimelineCategory, "<mark>Paint</mark>", "data",
+<span class="n">86</span>    // Always report for the top layer to cover the cost of tree walk and
+<span class="n">87</span>    // cache copying of non-repainted contents.
+<span class="n">88</span>    if (!current_reporting_) { return true; }
+<span class="n">94</span>    if (!layer_.<mark>SelfNeedsRepaint()</mark>) { return false; }</pre>
+      <p>One slice for the whole walk, and one more for each paint layer that needs repainting. A positioned, transformed row is a paint layer; a table row is not.</p>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/core/paint/paint_layer_painter.cc#L413-L422">paint_layer_painter.cc:416–420</a>
+<pre><span class="n">416</span>  if (should_create_subsequence) {
+<span class="n">417</span>    if (!paint_layer_.SelfOrDescendantNeedsRepaint() &amp;&amp;
+<span class="n">418</span>        SubsequenceRecorder::<mark>UseCachedSubsequenceIfPossible</mark>(context,
+<span class="n">419</span>                                                            paint_layer_)) {
+<span class="n">420</span>      return paint_layer_.PreviousPaintResult();</pre>
+      <p>A layer that does not need repainting is not walked at all: its recorded commands are reused as a block. The layer is the unit of paint caching.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Paint layer</dt><dd>Blink's unit for painting in the right order: created by positioning, transforms, opacity, clips, paint containment. Not the same as a compositor layer; many paint layers can end up in one.</dd>
+      <dt>Layerize</dt><dd><code>PaintArtifactCompositor::Update</code>: turn the list of painted chunks into compositor layers and property trees. It has a fast path when only content inside existing layers changed; a scroll with rows entering or transforms changing does not take it.</dd>
+    </dl></div>
+  </div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Rows as separate paint layers are a trade. When one row changes, only that row is painted again and the others are reused: that is step 7's result, where the table's paint for one changed cell took five times the flex rows' (0.72 ms against 0.14 ms in the frames shown). When every row changes, 35 layers cost more to paint than one. regular-table's single table is the cheap shape for "everything changes every frame", which is exactly how regular-table draws.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these recordings layerize is a per-frame cost of about half a millisecond that no table design changed; paint time follows the number of paint layers repainted; a single-layer table repaints in proportion to its size even for one cell.</p>
+    <p><b>No:</b> that 0.5 ms of layerize is a constant of Chrome. It is this page (about 35 row layers, or one table, at this viewport) on this machine; step 9 saw it rise with containment.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-speed-2400-positional names | grep -E ' X Paint |PrePaint|Layerize|Blink.Paint'</code> prints the row of the table above. In DevTools, the green bars under a frame are these three, in this order.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Layerize is about 0.5 ms per frame in all four designs; paint is 0.3 ms per frame for two new rows, 0.7 ms for one table rewritten, 1.3 ms for 35 rows rewritten, 2.2 ms for 35 rows created.</li>
+    <li data-kind="read">A Paint slice is written per repainted paint layer (paint_layer_painter.cc:60–96); unchanged layers are reused as cached subsequences (416–420).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> All of this was recording commands. What happens when the commands themselves are expensive to turn into pixels?</p>
+</section>
+
+<section class="step" data-part="D · Pixels" data-title="Expensive pixels: raster is late, and the main thread is told to wait" data-node="raster present commit">
+  <p class="holding"><span class="label">Question I hold</span><span>Blurred shadows on every cell, scrolled at 9,600 px/s. Main-thread paint barely grows, yet half the frames lose the main thread's update. What is late, and why does it halve the main thread's frame rate?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>With heavy cells, rastering one commit's tiles takes four worker threads about 20 ms. A frame is 16.7 ms. What does the frames track look like?</p>
+    <div class="opts"><button data-k="a">Every frame dropped: nothing is ready in time</button><button data-k="b">Alternating: one frame with new content, one without</button><button data-k="c">Every frame presented, with blank tiles where raster is unfinished</button></div>
+    <div class="reveal"><p>Alternating, like a metronome: <b data-m="r-paint-heavy-tanstack/frames.all"></b> frames with the main thread's content and <b data-m="r-paint-heavy-tanstack/frames.partial"></b> without. No frame is dropped, and none is drawn with a missing tile.</p></div>
+  </div>
+
+  <div class="tracelink" data-trace="r-paint-plain-fast"></div>
+  <div class="tracelink" data-trace="r-paint-heavy-tanstack">In Perfetto, open a <code>PipelineReporter</code> slice of the Compositor thread and compare its child <code>EndCommitToActivation</code> between the two traces.</div>
+  <div class="lanes" data-lanes='{"traces":["r-paint-plain-fast","r-paint-heavy-tanstack"],"titles":["r-paint-plain-fast: plain cells at 9,600 px/s","r-paint-heavy-tanstack: shadows and gradients on every cell"],"from":314,"to":372,"rows":["frames","mainFrames","raster","compositor"],"pins":[[1,320.9,"raster",0],[2,320.0,"mainFrames",1],[3,323.3,"compositor",1],[4,333.0,"raster",1],[5,333.6,"compositor",1],[6,343.97,"compositor",1],[7,350.2,"compositor",1],[8,353,"mainFrames",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Plain cells: the commit lands at 320.4 ms, raster takes a few tenths of a millisecond, activation is at 321.2 ms. Every vsync gets a main frame.</li>
+    <li><i>2</i>Heavy cells: the main frame takes 6.2 ms, about twice the plain one.</li>
+    <li><i>3</i>Its commit reaches the compositor at 323.2 ms.</li>
+    <li><i>4</i>Raster: 28 tasks of 1.4 to 4.6 ms on four workers, from 323.4 to 343.6 ms. About 78 ms of work in 20 ms of wall time.</li>
+    <li><i>5</i>The vsync at 333.3 ms arrives in the middle of it. The compositor draws what it has: the old content at the new scroll position. An amber frame.</li>
+    <li><i>6</i>Activation at 343.7 ms, 20.6 ms after the commit.</li>
+    <li><i>7</i>The next vsync draws the new content: green, presented 35 ms after the vsync that started it, against 18 ms for plain cells.</li>
+    <li><i>8</i>Only now is the next BeginMainFrame sent. No main frame started at the 333 ms vsync.</li>
+  </ol>
+  <table class="mtable" data-rows="r-paint-plain-fast,r-paint-heavy-tanstack,r-paint-heavy-regular" data-names="plain cells (TanStack keyed),heavy cells · TanStack keyed,heavy cells · regular-table" data-head="At 9,600 px/s" data-cols="main.paintMs|main paint stages|ms,raster.tasks|raster tasks,raster.ms|raster on workers|ms,main.mainFrames|main frames,frames.all|frames with main,frames.partial|frames without,frames.dropped|dropped"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>The cost is on the workers.</b> Raster goes from <b data-m="r-paint-plain-fast/raster.ms"></b> ms to <b data-m="r-paint-heavy-tanstack/raster.ms"></b> ms over the two-second scroll: more than two worker-seconds per second of scrolling, while the main thread's paint stages hardly move. The median raster task goes from 0.06 ms to 2.6 ms.</p>
+    <p><b>What is late is activation.</b> Over the whole recording the median of the <code>PipelineReporter</code> stage <code>EndCommitToActivation</code> is 0.8 ms with plain cells and 19.5 ms with heavy ones (17.9 ms in regular-table). 6 ms of main frame plus 20 ms of raster misses the first vsync and makes the second.</p>
+    <p><b>And the main thread runs at half rate.</b> <b data-m="r-paint-heavy-tanstack/main.mainFrames"></b> main frames against <b data-m="r-paint-plain-fast/main.mainFrames"></b>, and half the scroll events. The main thread is not busy: it was not asked.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/cc/tiles/picture_layer_tiling.h#L291-L312">cc/tiles/picture_layer_tiling.h:294–309</a> · <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/cc/tiles/tile_manager.cc#L1827-L1832">cc/tiles/tile_manager.cc:1827–1831</a>
+      <p>Why activation waits for raster, and for which tiles:</p>
+<pre><span class="n">294</span>    if (tree_ == PENDING_TREE) {
+<span class="n">295</span>      if (!can_require_tiles_for_activation_ ||
+<span class="n">296</span>          resolution_ != HIGH_RESOLUTION || is_tile_occluded) {
+<span class="n">297</span>        return false;
+<span class="n">308</span>      if (<mark>!is_visible(tile)</mark>)
+<span class="n">309</span>        return false;
+<span class="n">1827</span> bool TileManager::<mark>IsReadyToActivate</mark>() const {
+<span class="n">1829</span>  return pending_required_for_activation_callback_id_ == 0 &amp;&amp;
+<span class="n">1830</span>         AreRequiredTilesReadyToDraw(
+<span class="n">1831</span>             RasterTilePriorityQueue::Type::REQUIRED_FOR_ACTIVATION);</pre>
+      <p>The visible high-resolution tiles of the pending tree must all be rastered before it may replace the active one. That is what keeps half-drawn content off the screen.</p>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/cc/scheduler/scheduler_state_machine.cc#L544-L637">cc/scheduler/scheduler_state_machine.cc:571–577, 585–592</a>
+      <p>Why no BeginMainFrame is sent meanwhile (inside <code>ShouldSendBeginMainFrame</code>):</p>
+<pre><span class="n">571</span>  // MFBA is disabled and we are waiting for previous activation, or the current
+<span class="n">572</span>  // pending tree is impl-side.
+<span class="n">576</span>  if (<mark>has_pending_tree_</mark> &amp;&amp; !can_send_main_frame_with_pending_tree)
+<span class="n">577</span>    return false;
+<span class="n">585</span>  // Don't send BeginMainFrame early if we are prioritizing a committed
+<span class="n">586</span>  // active tree because of ImplLatencyTakesPriority.
+<span class="n">587</span>  if (ImplLatencyTakesPriority() &amp;&amp;
+<span class="n">588</span>      ((has_pending_tree_ &amp;&amp; !current_pending_tree_is_impl_side_) ||
+<span class="n">589</span>       (<mark>active_tree_needs_first_draw_</mark> &amp;&amp;
+<span class="n">590</span>        !previous_pending_tree_was_impl_side_))) {
+<span class="n">591</span>    return false;</pre>
+      <p>While a committed tree waits for activation, and (during a compositor scroll) until the activated tree has been drawn once, the compositor does not ask the main thread for another frame.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>One commit in flight</dt><dd>The same shape as Tablelab's "one pull in flight": the producer (main thread) is not asked for the next frame until the consumer (raster, activation, first draw) has taken the previous one. Backpressure, built into the scheduler.</dd>
+      <dt>Quantized lateness</dt><dd>Being 4 ms late for a vsync costs a whole interval. 26 ms of pipeline is a 33 ms cadence, exactly; 15 ms would have been 16.7.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> expensive pixels show up as raster time on worker threads and a long <code>EndCommitToActivation</code>; the compositor answers by drawing old content at the new scroll position and by pacing the main thread to the rate raster can sustain. Read in the trace order: commit 323.2, activation 343.7, draw 350.1, next BeginMainFrame 350.3.</p>
+    <p><b>Inferred:</b> which of the two source conditions held the BeginMainFrame back at each moment. The scheduler's state is not in these trace categories (<code>disabled-by-default-cc.debug.scheduler</code> would show it).</p>
+    <p><b>No:</b> that blurred shadows cost 2 ms per tile on a real screen. This is software raster on CPU threads. With GPU raster the same CSS costs a different amount, on a different thread and process; the mechanism (activation waits for visible tiles, main frames wait for activation) is the same code.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-paint-heavy-tanstack frames 280 420</code> prints the alternation, with "presented-after" of about 35 ms on the <code>all</code> lines and 2 ms on the <code>partial</code> ones. <code>node lab/harness/q.mjs r-paint-heavy-tanstack slices 'CommitComplete|ActivateSyncTree|ScheduledActionDraw' Compositor 316 352</code> prints pins 3, 5, 6 and 7.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Heavy cells at 9,600 px/s: raster 4.5 worker-seconds over a 2 s scroll (plain: 0.2); commit-to-activation median 19.5 ms (plain: 0.8); frames alternate with/without main content; main frames at half rate; no drops.</li>
+    <li data-kind="read">Activation requires every visible high-res tile of the pending tree (picture_layer_tiling.h:294–309, tile_manager.cc:1827); no BeginMainFrame is sent while a tree is pending or undrawn during a scroll (scheduler_state_machine.cc:576, 587–591).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The scenario asked whether the scroll shows unpainted tiles. It does not. So what does the user see in an amber frame?</p>
+</section>
+
+<section class="step" data-part="D · Pixels" data-title="Not checkerboard: old rows, further behind" data-node="raster present method">
+  <p class="holding"><span class="label">Question I hold</span><span>Raster is 20 ms late on every commit and yet not one frame reports missing content. What is on the screen, then, and how do I say so without a screenshot?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the compositor's own flags, then do the arithmetic of what each kind of frame shows. These traces were recorded with the screenshot category requested, but headless Chrome wrote no <code>Screenshot</code> event into any of them, so there is no filmstrip to look at. I say what is measured and what is worked out.</p>
+  </div></div>
+  <table class="mtable" data-rows="r-paint-plain-fast,r-paint-heavy-tanstack,r-paint-heavy-regular" data-names="plain cells,heavy · TanStack keyed,heavy · regular-table" data-head="At 9,600 px/s" data-cols="frames.missingContent|frames with missing content,frames.checkerboarded|checkerboarded,frames.partial|frames without main update,main.mainFrames|main frames"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Measured.</b> No frame has <code>has_missing_content</code> or a checkerboard flag in any of the three. In <code>r-paint-heavy-tanstack</code> every one of the 124 <code>LayerTreeHostImpl::CalculateRenderPasses</code> slices ends with <code>"missing tiles":0</code>. The compositor never drew a hole.</p>
+    <p><b>Why not.</b> A hole appears when the <em>active</em> tree is scrolled to a place whose tiles are not rastered. Here the unrastered tiles belong to the <em>pending</em> tree, and a pending tree is not drawn until it is whole (the previous step). The price of that guarantee is paid in age, not in holes.</p>
+    <p><b>Worked out.</b> At 9,600 px/s the compositor moves the content 160 px per vsync, 6.7 rows. A main frame renders the rows for the scroll position it was told at its vsync. With plain cells that content is drawn one vsync later: the screen shows rows computed for a position 160 px back. With heavy cells it is first drawn two vsyncs later, 320 px or 13 rows back, and then shown once more in the amber frame, 480 px or 20 rows back. The viewport is 32 rows tall.</p>
+    <p>What "rows behind" means for the layer the compositor moves depends on the table, and this part is read from the lab's code, not seen. The TanStack panel keeps row elements only for the visible range plus one (<code>overscan: 1</code>), and the compositor scrolls that layer: for the last 13 to 20 rows' height of the viewport the layer holds no row elements. regular-table's <code>&lt;table&gt;</code> is <code>position: sticky</code>: it stays in the viewport with the rows of the older position until the new ones activate. Module 2 covers late main frames in each design; what this step adds is that heavy pixels double the lateness and halve the update rate without any thread being "slow" on the main-thread flame chart.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Checkerboarding</dt><dd>Drawing a frame in which some visible tile has no rastered content. <code>PipelineReporter</code> flags it as <code>checkerboarded_needs_raster</code> (tile exists, not rastered) or <code>checkerboarded_needs_record</code> (the main thread never painted that area).</dd>
+      <dt>Why these flags stay clear for a virtualized table</dt><dd>An area with no rows in it is not missing content to the compositor. It was painted: as empty background. The table's "blank" is invisible to every checkerboard metric; only a content mark of our own, or a screenshot, sees it.</dd>
+    </dl></div>
+    <div class="box"><span class="label">What I could not do</span>
+      <p>Show it. The lab has no screencast or screenshot output in this recording setup, and I did not add one. The row arithmetic uses the constant gesture speed and the frame times of step 11; it is not a measurement of pixels.</p>
+    </div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these recordings expensive raster never produced a frame with missing tiles; it produced main-thread content that is one vsync older when first shown and is shown for two vsyncs.</p>
+    <p><b>No:</b> that heavy paint cannot checkerboard. A scroll that outruns the rastered area of the <em>active</em> tree does (Module 4's keyed and positional recordings at 38,400 px/s have <b data-m="j-speed-38400-keyed/frames.missingContent"></b> and <b data-m="j-speed-38400-positional/frames.missingContent"></b> such frame). And nothing here is seen on a screen.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: treat per-cell decoration (shadows, gradients, rounded corners, blurred text) as a budgeted resource and test it at the fastest scroll the product allows, on the slowest raster path it must support. The symptom to look for is not a long task and not a dropped frame: it is <code>EndCommitToActivation</code> approaching a frame, and the count of main frames per second falling.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-paint-heavy-tanstack slices CalculateRenderPasses Compositor 300 400</code> lists the draws; open one in Perfetto to read its end arguments <code>draw_result</code> and <code>missing tiles</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">No frame with missing content or missing tiles in the heavy-paint scrolls; the pending tree is never drawn incomplete.</li>
+    <li data-kind="inferred">Heavy raster makes main content 320 px (13 rows) stale when first shown and 480 px in the following frame, at 9,600 px/s; plain cells: 160 px.</li>
+    <li data-kind="measured">The traces contain no Screenshot events although the category was requested; nothing in this step is seen.</li>
+  </ul>
+  <p class="next" data-answer="pixels"><b>Next question →</b> In all of this the compositor kept scrolling by itself. What can take that away from it?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · Who is allowed to scroll" data-title="A wheel listener: three answers from the compositor" data-node="input compositor js"
+  data-ask="owner|What can take a scroll away from the compositor thread, and how do I see it in a trace?">
+  <p class="holding"><span class="label">Question I hold</span><span>The main thread is busy 100 ms out of every 150. The wheel turns 30 notches. With no wheel listener, a passive one, and a non-passive one: who has to wait for whom?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>With a <em>passive</em> wheel listener and a busy main thread, what happens to a wheel event?</p>
+    <div class="opts"><button data-k="a">It stays on the compositor thread; the listener is called later with a copy</button><button data-k="b">It is sent to the main thread, but the scroll does not wait for it</button><button data-k="c">The scroll waits until the listener has run, because it might call preventDefault</button></div>
+    <div class="reveal"><p>Sent and not waited for. The compositor acknowledges the wheel at once and scrolls; the event queues on the main thread and the listener runs when the long task ends, tens of milliseconds after the pixels moved.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>One wheel notch that arrives during a long task, in the recording without a listener and in the one with a non-passive listener. Then I count how the compositor disposed of every wheel event in all three.</p>
+  </div></div>
+  <div class="tracelink" data-trace="r-wheel-none"></div>
+  <div class="tracelink" data-trace="r-wheel-passive"></div>
+  <div class="tracelink" data-trace="r-wheel-blocking">Search for <code>WidgetInputHandlerManager::DidHandleInputEventSentToCompositor</code> and read its <code>Disposition</code> argument.</div>
+  <div class="lanes" data-lanes='{"traces":["r-wheel-blocking","r-wheel-none"],"titles":["r-wheel-blocking: a wheel listener that is not passive","r-wheel-none: no wheel listener"],"from":60,"to":240,"rows":["browser","compositor","tasks","marks","frames"],"pins":[[1,105.6,"browser",0],[2,150,"tasks",0],[3,199.7,"marks",0],[4,200.5,"compositor",0],[5,85.3,"browser",1],[6,86.2,"compositor",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Listener, not passive: the browser process forwards a wheel event at 105.6 ms. The compositor thread looks at it and answers "not handled": it must go to the main thread, and the browser must wait for the result.</li>
+    <li><i>2</i>The main thread is 6 ms into a 100 ms task.</li>
+    <li><i>3</i>199.7 ms: the task ends, the wheel event is dispatched, our listener runs (the mark). It does not call <code>preventDefault</code>.</li>
+    <li><i>4</i>199.8 ms: the acknowledgement reaches the browser, which only now creates the scroll; the compositor applies it at 199.9 ms and draws at 200.1 ms. 94 ms after the wheel event arrived.</li>
+    <li><i>5</i>No listener: the browser forwards a wheel event at 85.3 ms…</li>
+    <li><i>6</i>… and the compositor applies the scroll at 85.5 ms, 0.2 ms later.</li>
+  </ol>
+  <table>
+    <tr><th>Recording</th><th>Compositor's disposition of each wheel event</th><th>Wheel sent → acknowledged to the browser</th><th>Frames' <code>scroll_state</code></th></tr>
+    <tr><td><code>r-wheel-none</code></td><td>47 × <code>DROP_EVENT</code> (4): nobody on the main thread wants it</td><td>0.1 ms median, 0.4 ms at most</td><td>compositor thread</td></tr>
+    <tr><td><code>r-wheel-passive</code></td><td>48 × <code>DID_NOT_HANDLE_NON_BLOCKING</code> (3): send to main, do not wait</td><td>0.1 ms median, 0.2 ms at most</td><td>compositor thread</td></tr>
+    <tr><td><code>r-wheel-blocking</code></td><td>38 × <code>DID_NOT_HANDLE</code> (1): send to main and wait</td><td>of 23 real notches sent: 6 under 2.5 ms, 10 between 14 and 23 ms, 7 between 94 and 117 ms</td><td>main thread, on 61 frame records</td></tr>
+  </table>
+  <p class="note">Read once from each trace: dispositions from the <code>Disposition</code> argument; the wait from <code>InputRouterImpl::FilterAndSendWebInputEvent</code> (type <code>MouseWheel</code>) to the next <code>MouseWheelEventQueue::ProcessMouseWheelAck</code> on the browser's main thread. Fewer wheels are sent with the blocking listener because the browser coalesces the ones that arrive while it waits.</p>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/platform/widget/input/input_handler_proxy.cc#L1094-L1158">third_party/blink/renderer/platform/widget/input/input_handler_proxy.cc:1136–1156</a>
+      <p>The decision, made on the compositor thread for every wheel event:</p>
+<pre><span class="n">1136</span>  if (is_pointer_locked_ ||
+<span class="n">1137</span>      input_handler_-&gt;<mark>HasBlockingWheelEventHandlerAt</mark>(
+<span class="n">1138</span>          gfx::Point(position_in_widget.x(), position_in_widget.y()))) {
+<span class="n">1139</span>    result = <mark>DID_NOT_HANDLE</mark>;
+<span class="n">1140</span>  } else {
+<span class="n">1144</span>    switch (properties) {
+<span class="n">1145</span>      case cc::EventListenerProperties::kBlockingAndPassive:
+<span class="n">1146</span>      case cc::EventListenerProperties::kPassive:
+<span class="n">1147</span>        result = <mark>DID_NOT_HANDLE_NON_BLOCKING</mark>;
+<span class="n">1149</span>      case cc::EventListenerProperties::kNone:
+<span class="n">1150</span>        result = <mark>DROP_EVENT</mark>;</pre>
+      <p>Blocking only when the pointer is over an element with a non-passive wheel listener: the compositor keeps a region for that. Where the three kinds come from: <code>core/frame/event_handler_registry.cc:67</code>, <code>*result = options-&gt;passive() ? kWheelEventPassive : kWheelEventBlocking;</code>.</p>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/components/input/mouse_wheel_event_queue.cc#L126-L147">components/input/mouse_wheel_event_queue.cc:142–146</a>
+      <p>Why a blocking wheel delays the scroll. A wheel event does not scroll; the browser turns it into a gesture scroll <em>when it is acknowledged</em>:</p>
+<pre><span class="n">142</span>  // If event wasn't consumed then generate a gesture scroll for it.
+<span class="n">143</span>  if (<mark>CanGenerateGestureScroll(ack_result)</mark>) {
+<span class="n">144</span>    WebGestureEvent scroll_update(
+<span class="n">145</span>        WebInputEvent::Type::kGestureScrollUpdate, WebInputEvent::kNoModifiers,</pre>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/third_party/blink/renderer/platform/widget/input/main_thread_event_queue.cc#L861-L870">platform/widget/input/main_thread_event_queue.cc:861–869</a>
+<pre><span class="n">861</span> bool MainThreadEventQueue::<mark>IsRafAlignedEvent</mark>(
+<span class="n">868</span>    case WebInputEvent::Type::kMouseMove:
+<span class="n">869</span>    case WebInputEvent::Type::<mark>kMouseWheel</mark>:</pre>
+      <p>And why even an idle main thread costs up to a frame: wheel events are delivered with the next main frame, not as soon as possible. That is the group of 14–23 ms waits in the table.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Passive listener</dt><dd><code>addEventListener(type, fn, {passive: true})</code>: a promise not to call <code>preventDefault</code>. It lets the browser act on the event before the listener has run.</dd>
+      <dt>Disposition</dt><dd>The compositor thread's verdict on an input event (<code>input_handler_proxy.h:121–155</code>): handled here (0), must go to main and be waited for (1), go to main without waiting (3), nobody wants it (4).</dd>
+      <dt>regular-table has one</dt><dd><code>src/ts/events.ts:106–108</code> registers a <code>mousewheel</code> listener with <code>passive: true</code>. Every regular-table scroll in this course therefore sends its wheel events to the main thread without waiting; step 1's frame has an <code>Event: wheel</code> in it.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a non-passive wheel listener under the pointer puts the main thread between every wheel notch and its scroll: about a frame when the main thread is idle, the rest of the running task when it is not. A passive listener and no listener are indistinguishable for the scroll.</p>
+    <p><b>No:</b> how often a real user would hit the long waits. One run, 30 notches against a periodic 100 ms task, and (next step) the harness itself decides when a notch reaches the browser.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-wheel-blocking slices 'DidHandleInputEventSentToCompositor' Compositor 100 110</code> prints one event with <code>{"Disposition":1}</code> at 105.70 ms. The same on <code>r-wheel-none</code> (window 80 to 90) prints <code>{"Disposition":4}</code> for the wheel and 0 for the scroll that follows.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">The compositor thread answers each wheel event from the listener properties: blocking → DID_NOT_HANDLE, passive → DID_NOT_HANDLE_NON_BLOCKING, none → DROP_EVENT (input_handler_proxy.cc:1136–1156); the browser creates the scroll on the acknowledgement (mouse_wheel_event_queue.cc:143).</li>
+    <li data-kind="measured">Wheel sent → acknowledged: at most 0.4 ms with no or a passive listener; with a non-passive one 14–23 ms on an idle main thread (rAF-aligned delivery) and 94–117 ms behind a 100 ms task.</li>
+    <li data-kind="read">regular-table registers a passive mousewheel listener (events.ts:106–108).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The lead for this step quoted a different number: wheel latency of 20 ms with no listener, more with a passive one. Why 20 ms for an event the compositor handles in 0.2 ms?</p>
+</section>
+
+<section class="step" data-part="E · Who is allowed to scroll" data-title="The latency that measured the harness" data-node="input method">
+  <p class="holding"><span class="label">Question I hold</span><span><code>EventLatency</code> for <code>MOUSE_WHEEL</code> has a median of about 20 ms with no listener at all, and a 95th percentile of 100 ms. The compositor never waited for anything. Where is that time?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I open the stages inside each <code>EventLatency</code> slice. The first stage, <code>GenerationToBrowserMain</code>, runs from the event's timestamp to the moment the browser's main thread forwards it. Then I look at what the browser was waiting for.</p>
+  </div></div>
+  <table class="mtable" data-rows="r-wheel-none,r-wheel-passive,r-wheel-blocking" data-names="no listener,passive listener,non-passive listener" data-head="EventLatency, ms" data-cols="eventLatency.MOUSE_WHEEL.p50|wheel · median,eventLatency.MOUSE_WHEEL.p95|wheel · p95,eventLatency.FIRST_GESTURE_SCROLL_UPDATE.p50|first scroll update · median,eventLatency.FIRST_GESTURE_SCROLL_UPDATE.p95|first scroll update · p95"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>No listener.</b> Of the 19.6 ms median, 19.4 ms is <code>GenerationToBrowserMain</code>. Everything after the browser forwards the event is 0.2 ms. The 100 ms at the 95th percentile is the same stage, and it coincides with the page's long tasks: a wheel event generated at 98.9 ms, just as a 100 ms task starts, is forwarded by the browser at 199.7 ms, just as it ends.</p>
+    <p><b>The browser was waiting for the page.</b> On <code>CrBrowserMain</code> the slice that forwards the wheel event is inside <code>Receive mojo reply</code>: the reply to a request the browser sent to the renderer when the harness's command arrived.</p>
+    <p><b>Passive listener.</b> The wheel's median is higher (third column aside), but its extra time is a stage named <code>RendererCompositorToMain</code>, median 6 ms and 109 ms at the 95th percentile: the event waiting in the main thread's queue for the listener. The scroll's own latency is the same as with no listener, within what one run can show.</p>
+    <p><b>Non-passive listener.</b> Here the scroll's latency rises, and it also hides inside <code>GenerationToBrowserMain</code>: a scroll update inherits its wheel's timestamp and is not created until the acknowledgement.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/content/browser/devtools/protocol/input_handler.cc#L1395-L1434">content/browser/devtools/protocol/input_handler.cc:1426–1431</a>
+      <p>The DevTools protocol's <code>Input.dispatchMouseEvent</code>, which the harness uses for wheel notches:</p>
+<pre><span class="n">1426</span>  // We make sure the compositor is up to date before sending a wheel event.
+<span class="n">1427</span>  // Otherwise it wont be picked up by newly added event listeners on the main
+<span class="n">1428</span>  // thread.
+<span class="n">1429</span>  if (is_wheel_event) {
+<span class="n">1430</span>    widget_host-&gt;<mark>InsertVisualStateCallback</mark>(
+<span class="n">1431</span>        std::move(findWidgetAndDispatchEvent));</pre>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/content/browser/renderer_host/render_widget_host_impl.cc#L2180-L2196">content/browser/renderer_host/render_widget_host_impl.cc:2193</a>
+<pre><span class="n">2193</span>  widget_compositor_-&gt;<mark>VisualStateRequest</mark>(base::BindOnce(</pre>
+      <p>A wheel event injected through the protocol is held until the renderer has answered a visual-state request. In the trace that answer comes after the renderer's main thread has run a frame, so it waits behind whatever the main thread is doing. A wheel event from a real mouse does not take this path.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt><code>EventLatency</code></dt><dd>The compositor's own record per input event, from the event's timestamp to the presentation of the frame it affected, with named stages. Its first stage ends where the browser's main thread hands the event on.</dd>
+      <dt>Synthetic input</dt><dd>Input injected by a test harness enters the browser through its own door. Everything after the door is the real path. The door has its own rules.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>The lead said: 20 ms with no listener, 50 with a passive one, 115 with a blocking one, a tidy staircase, and I was ready to explain each stair as a property of Chrome's input pipeline. The first stair is the harness: the protocol makes each injected wheel wait for a main-thread frame, in all three recordings. The second is a listener's queueing time counted into an event latency while the scroll went ahead. Only the third is a scroll that waited. The rule I keep: before I explain a latency, I open its stages and find the first one that is not the thing I am studying. For wheel input through the DevTools protocol, compare from the browser's forward onward, as step 13 does.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these three recordings the wheel's <code>EventLatency</code> is dominated by the injection path's wait for the renderer; the ordering none &lt; passive &lt; blocking is real, but only the blocking step delays pixels.</p>
+    <p><b>No:</b> any absolute wheel-to-pixels latency for a real device. This lab cannot measure it with protocol-injected wheel notches. (The constant-speed gestures of the other scenarios use <code>Input.synthesizeScrollGesture</code>, a different path; I did not read it.)</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>In Perfetto, open <code>r-wheel-none</code>, find an <code>EventLatency</code> slice on the Compositor thread's async tracks with <code>event_type: MOUSE_WHEEL</code>, and read its first child, <code>GenerationToBrowserMain</code>. Then <code>node lab/harness/q.mjs r-wheel-none tree 49.9 50.4 CrBrowserMain 0</code>: <code>RenderWidgetHostImpl::ForwardWheelEvent</code> sits under <code>Receive mojo reply</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">With no wheel listener, 19.4 of the 19.6 ms median wheel latency is GenerationToBrowserMain; the p95 of 100 ms is the page's long task.</li>
+    <li data-kind="read">Input.dispatchMouseEvent holds a wheel event until a visual-state request to the renderer is answered (input_handler.cc:1426–1431).</li>
+    <li data-kind="rejected">"A passive wheel listener makes the scroll 30 ms slower": its event waits for the main thread; the scroll does not.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> One more way to lose the compositor, from Module 1: at device scale factor 1 a scroller did not move at all during a long task. Does the fix proposed there hold?</p>
+</section>
+
+<section class="step" data-part="E · Who is allowed to scroll" data-title="Scale factor 1, opaque background: the compositor keeps scrolling" data-node="compositor raster present">
+  <p class="holding"><span class="label">Question I hold</span><span>Module 1, step 21: on a scale-1 screen, a scroller without an opaque background was not composited, and a scrollbar click during a 250 ms task moved nothing until the task ended. The lab's scroller now has <code>background: #fff</code>. Same click, same task, scale 1: does it move?</span></p>
+  <div class="tracelink" data-trace="r-dsf1"></div>
+  <div class="lanes" data-lanes='{"traces":["r-dsf1"],"from":-60,"to":260,"rows":["inputs","compositor","frames","mainFrames","tasks"],"pins":[[1,75,"tasks"],[2,12.6,"compositor"],[3,96.9,"frames"],[4,205,"mainFrames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The 250 ms task, from −50 ms to 200 ms. The click on the scrollbar track comes at 0.</li>
+    <li><i>2</i>The compositor draws at 12.5 ms and then at every vsync: ten <code>ProxyImpl::ScheduledActionDraw</code> slices up to 163 ms, all while the main thread is inside the task.</li>
+    <li><i>3</i>Nine frame records in a row, from the vsync at 13.6 ms to the one at 146.9 ms, each presented about 17 ms after its vsync. Amber: presented without the main thread's update, which here is the new rows. The two vsyncs after them are recorded as dropped, in both recordings of the table below.</li>
+    <li><i>4</i>The main thread's first frame after the task: it waited 200.9 ms in the queue, then took 2.5 ms.</li>
+  </ol>
+  <table class="mtable" data-rows="r-dsf1,f-longtask-tanstack" data-names="scale factor 1 (this step),scale factor 1.75 (Module 2's recording)" data-head="Scrollbar click during a 250 ms task" data-cols="frames.partial|frames presented without main,frames.dropped|dropped,raster.tasks|raster tasks,raster.ms|raster|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The two scale factors behave the same: the same frame records (the table), and the same handful of raster tasks. If the compositor had to re-raster the scroller's content for every step of the scroll, the raster count would grow with the frames. It does not: the scroller's content is its own layer, and the compositor moves it.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/chromium/chromium/blob/73c14f6228d7cd537c855007e8f88678969cc0eb/cc/input/main_thread_scrolling_reason.h#L26-L36">cc/input/main_thread_scrolling_reason.h:32–34</a>
+<pre><span class="n">32</span>  // Subpixel (LCD) text rendering requires blending glyphs with an opaque
+<span class="n">33</span>  // background.
+<span class="n">34</span>  <mark>kNotOpaqueForTextAndLCDText</mark>,</pre>
+      <span class="path">lab/pages/src/style.css:16</span>
+<pre><span class="n">16</span> .scroller { …; overflow: auto; …; <mark>background: #fff;</mark> }</pre>
+      <p>The reason a scale-1 scroller could need the main thread to repaint, and the one declaration that removes it.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Why scale matters</dt><dd>On low-density screens Chrome keeps subpixel-antialiased text, which can only be drawn onto a known opaque colour. A scroller's text can go into its own layer only if that layer has one.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with an opaque background the lab's scroller scrolls on the compositor at scale factor 1 during a long task, as it does at 1.75.</p>
+    <p><b>No:</b> that the background is what made the difference <em>in this lab</em>. The failing case is Module 1's recording, with its older page; this lab has no knob for a transparent scroller, so the before-and-after pair is across two labs. And the frames show no <code>scroll_state</code> here (a scrollbar-click animation is not recorded as a scroll), so "composited" rests on the draws and the raster count.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: the scroller of the DOM painter always has an opaque background, and a trace at device scale factor 1 is part of the test matrix. It costs one CSS declaration; its absence costs the compositor scroll on every ordinary monitor.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-dsf1 frames</code>: nine <code>partial</code> lines at 16.7 ms spacing from 13.6 to 146.9 ms, each presented about 17 ms after its vsync, and a main frame with a queue wait of 200.9 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">At device scale factor 1 with an opaque scroller, the compositor draws ten times and nine consecutive frames are presented during a 250 ms task, with the same raster count as at 1.75.</li>
+    <li data-kind="inferred">Module 1's proposed fix (opaque background) holds; the transparent control was not re-recorded in this lab.</li>
+  </ul>
+  <p class="next" data-answer="owner"><b>Next question →</b> Put it together: of everything the browser did in these traces, what must a table make it do, and what can it avoid?</p>
+</section>
+
+<!-- ═════════════════════════ PART F ═════════════════════════ -->
+
+<section class="step" data-part="F · What a table must pay for" data-title="Required work and avoidable work" data-node="style layout paint raster compositor method">
+  <p class="holding"><span class="label">Question I hold</span><span>Tablelab's Pass 2: which rendering work does a table require, and which can it avoid? One line per stage, each with the trace that supports it.</span></p>
+  <table>
+    <tr><th>Stage</th><th>What a table cannot avoid</th><th>What these traces show it can avoid</th><th>Evidence</th></tr>
+    <tr><td><b>Style</b></td><td>A style for each element that is new.</td><td>Restyling elements that did not change: an inherited value written on an ancestor every frame restyles the whole table (616 against 36 elements per frame).</td><td>step 8</td></tr>
+    <tr><td><b>Layout</b></td><td>About 4 µs for each cell whose text changes, in a table cell or a flex item.</td><td>Changing the text of cells that show the same value as before (keyed reuse: a seventh of the layout at 2,400 px/s). Reading layout between writes of one draw (three times the layout in the cold path). For single-cell updates, a layout that has to pass through a <code>&lt;table&gt;</code> (three times independent rows).</td><td>steps 2, 5, 6, 7</td></tr>
+    <tr><td><b>Forced layout</b></td><td>Nothing: a table that knows its own geometry needs no read.</td><td>It is not a cost by itself. One forced layout per frame replaces the frame's layout. It costs when a dirtying write follows it.</td><td>steps 3, 4</td></tr>
+    <tr><td><b>Containment</b></td><td>—</td><td>Expecting it to help a scroll: the dirt is inside the cells, and cells of a table or of a flex row cannot be boundaries. It helped a one-cell update (layout −40 %, more layerize) and saved about 5 % of a layout when existing rows were rewritten.</td><td>steps 7, 9</td></tr>
+    <tr><td><b>Paint</b></td><td>Recording each changed paint layer; about half a millisecond of layerize per frame on this page.</td><td>A choice, not a saving: many row layers make one-row changes cheap and all-row changes dear; one table layer does the reverse.</td><td>step 10</td></tr>
+    <tr><td><b>Raster</b></td><td>Pixels for every tile that changed, on workers.</td><td>Per-cell effects whose raster exceeds a frame: they do not drop frames, they halve the rate of content and double its age.</td><td>steps 11, 12</td></tr>
+    <tr><td><b>Scrolling</b></td><td>The compositor moving a layer.</td><td>A non-passive wheel listener (a frame to a whole task of delay per notch); a non-opaque scroller at scale 1.</td><td>steps 13, 15</td></tr>
+  </table>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The common shape of the avoidable rows: the browser's cost is set by <em>marks</em>, and a mark is cheap to set and invisible when set. An inherited custom property, a text assignment with the same string in a different element, a read in the middle of a loop, a containment declaration on 561 cells: each is one innocent line. The stage that pays runs later, sometimes on another thread, and reports a count. So the engineering move is to make the counts visible: elements restyled, objects dirty, layers repainted, raster milliseconds and commit-to-activation, per frame, from every trace.</p>
+    <p>The required rows are small. A keyed table at a reading-speed scroll spends about 2 ms of main thread per frame in these recordings, of which layerize is the largest part. The designs differ by what they add to that floor when everything changes, and regular-table and a positional pool add the same.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposals for the DOM painter, each to be confirmed in Tablelab's own traces before it is a decision. (1) The view core tells the painter which cells changed value, and the painter writes only those: the 4 µs per cell is then paid per change, not per visible cell. (2) Rows are independent positioned boxes, so a one-cell update does not run a table layout. (3) Geometry comes from the engine's model; no layout read inside a draw. (4) Per-frame offsets are a transform on one element, not an inherited property. (5) Every wheel and touch listener is passive, the scroller is opaque, and both are checked by a test that reads <code>Disposition</code> and frame records from a trace. (6) A fixed budget for per-cell paint effects, verified at the fastest scroll on software raster. What is <b>not</b> decided by this module: whether fixed table layout rescues a <code>&lt;table&gt;</code> (untested), and what any of this costs with GPU raster (not recorded).</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> which rendering work each of these tables asked for, in counts, and how the time followed the counts on this machine.</p>
+    <p><b>No:</b> a ranking of the libraries. regular-table's choices (one table, positional reuse, everything rewritten per draw) are the right ones for its own goal, a table whose every cell may change on every scroll step; they are expensive where a keyed design can skip work, and cheap where it cannot.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Avoidable rendering work in these traces is always a mark set by one cheap line (inherited property, rewritten text, mid-loop read, per-cell containment); the proposal is to report the browser's own counts per frame.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Can you read these stages in a trace you have not seen? Seven questions.</p>
+</section>
+
+<section class="step" data-part="F · What a table must pay for" data-title="Check yourself" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>Answer without scrolling back. Each answer names the step that has the evidence.</span></p>
+  <div class="exercise"><span class="label">1</span>
+    <p>A Layout slice says <code>dirtyObjects: 1123, totalObjects: 1228, partialLayout: true</code>. What is 1228 the total of, and why can a later slice in a related trace say 2487 for a table of the same size?</p>
+    <details><summary>Answer</summary><p>The layout objects under the boundaries where this layout starts (the nearest boxes that can be laid out on their own), not the document. When one such boundary is nested inside another and both are start points, the inner one's objects are counted twice. Step 6, <code>layout_subtree_root_list.cc:38</code>; step 9 for the 2487.</p></details>
+  </div>
+  <div class="exercise"><span class="label">2</span>
+    <p>A trace shows a red (forced) layout in every scroll event. What two numbers do you need before you call it a problem?</p>
+    <details><summary>Answer</summary><p>Layouts per frame, and the same count in a control without the read. One layout per frame, forced or not, is the frame's layout. It is a problem when a second layout appears in the same frame, which needs a dirtying write after the read. Step 3.</p></details>
+  </div>
+  <div class="exercise"><span class="label">3</span>
+    <p>A style listener reads <code>offsetWidth</code> on 561 cells after each draw. How many layouts does that add, and what does it cost instead?</p>
+    <details><summary>Answer</summary><p>None: the first read runs the frame's one layout early, the others find nothing dirty. It costs script time, about 2 µs per read here, and it moves the layout's time into the callback. Step 4.</p></details>
+  </div>
+  <div class="exercise"><span class="label">4</span>
+    <p>Why did <code>contain: content</code> on every table cell not reduce layout, and what did it change?</p>
+    <details><summary>Answer</summary><p>A table part cannot be a relayout boundary, so the dirty mark climbs to the table as before, and the dirt is in the cells anyway. Paint containment made each cell its own paint unit: Paint slices went from 249 to about 54,000. Steps 6 and 9.</p></details>
+  </div>
+  <div class="exercise"><span class="label">5</span>
+    <p>Frames alternate green and amber at 60 Hz, no long task on the main thread, no dropped frame. Name the stage to look at and the reason the main thread runs at 30 Hz.</p>
+    <details><summary>Answer</summary><p><code>EndCommitToActivation</code> in <code>PipelineReporter</code>: raster of the visible tiles takes longer than the rest of the frame, so activation misses a vsync. The scheduler sends no BeginMainFrame while a committed tree is pending or not yet drawn. Step 11.</p></details>
+  </div>
+  <div class="exercise"><span class="label">6</span>
+    <p>One cell of a 480-cell grid changes. The table and the flex rows both report about five dirty objects. Why is the table's layout three times as long?</p>
+    <details><summary>Answer</summary><p>The dirty path passes through the table, and a table's layout runs over all its rows and re-derives its columns; independent positioned rows only need their one row laid out and placed. Dirty counts say how much is marked, not what must be walked to reach it. Step 7.</p></details>
+  </div>
+  <div class="exercise"><span class="label">7</span>
+    <p>A wheel latency metric reads 20 ms with no listener registered. What do you check first, and what did it turn out to be here?</p>
+    <details><summary>Answer</summary><p>The stages inside the latency. Here nearly all of it was <code>GenerationToBrowserMain</code>: the DevTools protocol holds an injected wheel event until the renderer has answered a visual-state request, which waits for the main thread. From the browser's forward to the compositor's scroll was 0.2 ms. Step 14.</p></details>
+  </div>
+  <div class="beat conclude"><span class="label">What this module leaves open</span><div>
+    <p>Fixed table layout (the lab's knob does not reach the computed style). GPU raster and a real display. Which of row and cell containment raises layerize. Longer and mixed text. Each is one recording away, and each is named in the step where it came up.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Open after this module: fixed table layout, GPU raster, the cause of the layerize increase under containment.</li>
+  </ul>
+  <p class="next"><b>Next →</b> Module 6, <a href="backend.html">One trace, two processes</a>: the rows now come from a backend, and a draw can wait for something that is not the browser.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>
