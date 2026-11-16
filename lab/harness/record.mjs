@@ -97,8 +97,8 @@ async function run(browser, srv, s) {
           if (i + 1 < (a.n ?? 1)) await sleep(a.every ?? 16);
         }
         break;
-      case "gesture": // a touch-style scroll gesture at a constant speed (px/s), synthesized by the browser
-        await cdp.send("Input.synthesizeScrollGesture", { x: at.x, y: at.y, yDistance: -(a.distance ?? 2000), xDistance: -(a.xDistance ?? 0), speed: a.speed ?? 2000, gestureSourceType: a.source ?? "touch", repeatCount: a.repeat ?? 1, repeatDelayMs: a.repeatDelayMs ?? 0 });
+      case "gesture": // a scroll gesture at a constant speed (px/s), synthesized by the browser; `repeat: 1` plays it a second time
+        await cdp.send("Input.synthesizeScrollGesture", { x: at.x, y: at.y, yDistance: -(a.distance ?? 2000), xDistance: -(a.xDistance ?? 0), speed: a.speed ?? 2000, gestureSourceType: a.source ?? "touch", repeatCount: a.repeat ?? 0, repeatDelayMs: a.repeatDelayMs ?? 0 });
         break;
       case "click-track":
         mouse("mousePressed", at.bar, at.track, { button: "left", clickCount: 1 });

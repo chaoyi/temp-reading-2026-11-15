@@ -115,6 +115,12 @@ protocol's Input domain. `lab/AUTHORING.md` describes the page format.
   otherwise. Tracing itself costs time (Module 2 measures how much). The
   recordings explain mechanisms and compare a control with a treatment made
   the same way; they are not a benchmark of the libraries.
+- The traces of Modules 2–11 carry no screenshots (the harness starts tracing
+  from the browser target, and Chrome only captures frames for a page target).
+  What was on screen is established from the compositor's frame records and
+  from marks the page writes when the right rows are in the DOM; a few modules
+  add pictures from a separate, untraced run and say so. Module 1's traces
+  (`traces/m1/`) do have a filmstrip.
 - The backend runs on the same machine; the network is loopback, shaped only
   by the user-space proxy, which models delay and throughput but not loss or
   congestion-window dynamics.

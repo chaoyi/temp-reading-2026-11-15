@@ -7,15 +7,20 @@
 
 const L = { viewport: { width: 1640, height: 860 } }; // large table: about 15 × 32 cells visible
 const big = { w: 1560, h: 792 };
-/** A constant-speed scroll: `speed` px/s for `seconds`, synthesized by the browser as wheel input. */
-const scroll = (speed, seconds = 1) => ["gesture", { distance: Math.round(speed * seconds), speed, source: "mouse" }];
+/**
+ * A constant-speed scroll, synthesized by the browser as wheel input: `speed`
+ * px/s for `seconds`, played twice back to back (repeat: 1), with a pause of
+ * about 70 ms between the two gestures. So scroll(2400) is about two seconds
+ * and 4,800 px of scrolling.
+ */
+const scroll = (speed, seconds = 1) => ["gesture", { distance: Math.round(speed * seconds), speed, source: "mouse", repeat: 1 }];
 const S = [];
 const add = (id, asks, spec) => S.push({ id, asks, module: id.split("-")[0], ...spec });
 const grid = (query, actions, more = {}) => ({ page: "grid.html", query, actions, ...more });
 
 // ── f: frames ────────────────────────────────────────────────────────────
 for (const lib of ["tanstack", "regular", "react"])
-  add(`f-scroll-${lib}`, "A steady one-second scroll with nothing wrong: what does every frame look like?", grid({ lib }, [scroll(2400), ["wait", 500]]));
+  add(`f-scroll-${lib}`, "A steady scroll with nothing wrong (two one-second gestures back to back): what does every frame look like?", grid({ lib }, [scroll(2400), ["wait", 500]]));
 add("f-click-tanstack", "A scrollbar click animates on the compositor: which frames carry a main-thread update?", grid({ lib: "tanstack" }, [["click-track"], ["wait", 700]]));
 for (const us of [0, 50, 150, 250, 600])
   add(`f-budget-${us}`, `Each visible cell costs ${us} µs to format: what happens to frames as a draw crosses 16.7 ms?`, grid({ lib: "regular", formatUs: us }, [scroll(2400), ["wait", 700]], { shots: us === 250 || us === 600 }));
@@ -122,7 +127,7 @@ add("n-jitter-ticks", "60 messages a second over a link with 80 ± 60 ms delay: 
 const up = (path, scroller, ready, actions, more = {}) => ({ url: "$ORIGIN/upstream/" + path, scroller, ready, actions, snapshot: false, ...L, ...more });
 add("u-rt-2b-scroll", "regular-table's two_billion_rows example (2,000,000,000 × 1,000 cells, generated per draw, Intl-formatted): a steady scroll.", up("regular-table/examples/two_billion_rows/index.html", "regular-table", "regular-table tbody td", [scroll(2400), ["wait", 500]]));
 add("u-rt-2b-drag", "The same example: the thumb dragged a third of the way down two billion rows.", up("regular-table/examples/two_billion_rows/index.html", "regular-table", "regular-table tbody td", [["drag", { dy: 280, ms: 900 }], ["wait", 700]]));
-add("u-rt-2b-diagonal", "The same example scrolled diagonally: rows and columns change together.", up("regular-table/examples/two_billion_rows/index.html", "regular-table", "regular-table tbody td", [["gesture", { distance: 2400, xDistance: 2400, speed: 2400, source: "mouse" }], ["wait", 600]]));
+add("u-rt-2b-diagonal", "The same example scrolled diagonally: rows and columns change together.", up("regular-table/examples/two_billion_rows/index.html", "regular-table", "regular-table tbody td", [["gesture", { distance: 2400, xDistance: 2400, speed: 2400, source: "mouse", repeat: 1 }], ["wait", 600]]));
 // regular-table's benchmark drives the table like this (benchmarks/benchmark.mjs: "Scroll Down" → benchmark.html scrollFn):
 const RT_BENCH_STEP = "(async () => { const table = document.getElementById('table'); for (let i = 0; i < 60; i++) { table.scrollTop += 100; await table.draw(); } })()";
 add("u-rt-bench-loop", "regular-table's own benchmark step, as its runner drives it: set scrollTop, await draw(), sixty times. What is one 'frame' here?", up("regular-table/benchmarks/benchmark.html?rows=100000&columns=1000&headerDepth=3", "regular-table", "regular-table tbody td", [["eval", RT_BENCH_STEP], ["wait", 500]], { zero: "start" }));
@@ -130,7 +135,7 @@ add("u-rt-bench-wheel", "The benchmark's page under real wheel input at about th
 add("u-tv-fixed-rows", "TanStack Virtual's 'fixed' example, the row list (10,000 rows of 35 px, React): a steady scroll.", up("tanstack/fixed/index.html", "div.List >> nth=0", "div.List", [scroll(2400), ["wait", 500]]));
 add("u-tv-fixed-grid", "The same example's grid (10,000 × 10,000, two virtualizers on one scroller).", up("tanstack/fixed/index.html", "div.List >> nth=2", "div.List", [scroll(2400), ["wait", 500]]));
 add("u-tv-dynamic-load", "TanStack's 'dynamic' example (10,000 rows of unknown height, measured as they render): the page load, which jumps to the last row.", up("tanstack/dynamic/index.html", "div.List", "div.List", [["eval", "location.reload()"], ["wait", 2500]], { zero: "start", endTimeoutMs: 8000 }));
-add("u-tv-dynamic-scrollup", "The same list scrolled upward into rows never measured.", up("tanstack/dynamic/index.html", "div.List", "div.List", [["gesture", { distance: -4800, speed: 2400, source: "mouse" }], ["wait", 700]], { warmMs: 2500 }));
+add("u-tv-dynamic-scrollup", "The same list scrolled upward into rows never measured.", up("tanstack/dynamic/index.html", "div.List", "div.List", [["gesture", { distance: -4800, speed: 2400, source: "mouse", repeat: 1 }], ["wait", 700]], { warmMs: 2500 }));
 add("u-tv-table-scroll", "TanStack's 'table' example (50,000 rows × 8 columns in a real <table>, TanStack Table, overscan 20): a steady scroll.", up("tanstack/table/index.html", "div.container", "div.container td", [scroll(2400), ["wait", 500]]));
 add("u-tv-table-sort", "The same table: a click on a column header sorts 50,000 rows.", up("tanstack/table/index.html", "div.container", "div.container td", [["click", "div.container th div"], ["wait", 1500]], { endTimeoutMs: 10000 }));
 

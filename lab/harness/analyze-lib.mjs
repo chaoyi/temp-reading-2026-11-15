@@ -313,7 +313,10 @@ export function analyze(trace, scenario = {}) {
 
   // ── user timing: measures (async pairs) and marks ──
   const user = ev.filter((e) => e.cat === "blink.user_timing");
-  const { spans: measures } = pairAsync(user);
+  // A measure of 0 µs is exported as a begin with no end. It still happened:
+  // keep it, with no duration, so counts are right.
+  const paired = pairAsync(user);
+  const measures = [...paired.spans, ...paired.unclosed.map((b) => ({ name: b.name, cat: b.cat, pid: b.pid, tid: b.tid, ts: b.ts, dur: 0, args: b.args }))].sort((x, y) => x.ts - y.ts);
   const detail = (args) => {
     const d = args?.data?.detail ?? args?.detail;
     if (typeof d !== "string") return d ?? {};

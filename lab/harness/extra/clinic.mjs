@@ -4,7 +4,7 @@
 
 const L = { viewport: { width: 1640, height: 860 } };
 const big = { w: 1560, h: 792 };
-const scroll = (speed, seconds = 1) => ["gesture", { distance: Math.round(speed * seconds), speed, source: "mouse" }];
+const scroll = (speed, seconds = 1) => ["gesture", { distance: Math.round(speed * seconds), speed, source: "mouse", repeat: 1 }];
 
 export const scenarios = [
   {

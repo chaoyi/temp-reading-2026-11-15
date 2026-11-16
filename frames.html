@@ -87,16 +87,12 @@
   <div class="boxes">
     <div class="box file"><span class="label">Files I am reading, and why</span>
       <p>To know which line writes each event, so that I can trust its timestamp and its arguments:</p>
-<pre><span class="c">event                                     written at (Chromium 73c14f6)</span>
-BeginFrame                                cc/trees/layer_tree_host_impl.cc:3655
-Scheduler::BeginImplFrame                 cc/scheduler/scheduler.cc:588
-Scheduler::ScheduleBeginImplFrameDeadline cc/scheduler/scheduler.cc:866
-Scheduler::OnBeginImplFrameDeadline       cc/scheduler/scheduler.cc:891
-ProxyImpl::ScheduledActionDraw            cc/trees/proxy_impl.cc:851
-DrawFrame                                 cc/trees/layer_tree_host_impl.cc:3028
-SendBeginMainFrame, RequestMainThreadFrame cc/trees/proxy_impl.cc:831, 847
-Display::DrawAndSwap                      components/viz/service/display/display.cc:755
-Display::FrameDisplayed                   components/viz/service/display/display.cc:1362</pre>
+<dl>
+        <dt><code>BeginFrame</code>, <code>DrawFrame</code></dt><dd><code>cc/trees/layer_tree_host_impl.cc:3655</code> and <code>:3028</code></dd>
+        <dt><code>Scheduler::BeginImplFrame</code>, <code>…ScheduleBeginImplFrameDeadline</code>, <code>…OnBeginImplFrameDeadline</code></dt><dd><code>cc/scheduler/scheduler.cc:588</code>, <code>:866</code>, <code>:891</code></dd>
+        <dt><code>ProxyImpl::ScheduledActionDraw</code>, <code>SendBeginMainFrame</code>, <code>RequestMainThreadFrame</code></dt><dd><code>cc/trees/proxy_impl.cc:851</code>, <code>:831</code>, <code>:847</code></dd>
+        <dt><code>Display::DrawAndSwap</code>, <code>Display::FrameDisplayed</code></dt><dd><code>components/viz/service/display/display.cc:755</code>, <code>:1362</code></dd>
+      </dl>
       <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler.cc;l=586">cc/scheduler/scheduler.cc:586–590</a>
 <pre><span class="n">586</span>  bool main_thread_is_in_high_latency_mode =
 <span class="n">587</span>      state_machine_->main_thread_missed_last_deadline();
@@ -740,8 +736,8 @@ GROUP BY state ORDER BY reporters DESC;</pre>
     <p><b>Drops need a silent compositor.</b> The few red vsyncs (<b data-m="f-budget-600/frames.dropped"></b> at 600 µs, <b data-m="f-cpu-20x/frames.dropped"></b> at 20×) are all in the pause between the two wheel gestures or just after the last one, where the compositor had no scroll of its own to show (step 5).</p>
   </div></div>
   <div class="boxes">
-    <div class="box"><span class="label">What the user sees</span>
-      <p>The scroll position moves at 60 Hz in every one of these traces; the compositor never misses. What degrades is how often and how late the rows follow. With regular-table the table element is sticky inside the scroller and changes only when a draw commits (Module 3 reads this in source), so at 250 µs the visible rows step at 30 Hz, each step showing a position two frames old, while the scrollbar thumb moves smoothly. <b>I could not check this against pictures:</b> these traces were recorded with the screenshot category on and contain no <code>Screenshot</code> events.</p>
+    <div class="box"><span class="label">What the user sees (inferred, not observed)</span>
+      <p>The scroll position moves at 60 Hz in every one of these traces; the compositor never misses. What degrades is how often and how late the rows follow. That much is in the trace: every vsync of the gestures has a presented compositor frame. What the picture looked like is inference from regular-table's structure: its table element is sticky inside the scroller and changes only when a draw commits (Module 3 reads this in source), so at 250 µs the visible rows should step at 30 Hz, each step showing a position two frames old, while the scrollbar thumb moves smoothly. <b>No trace event proves it:</b> in this headless setup the traces contain no <code>Screenshot</code> events, so there is no filmstrip to look at.</p>
     </div>
     <div class="box"><span class="label">Knowledge I am using</span><dl>
       <dt>One BeginMainFrame at a time</dt><dd>While one is out, no other is sent (<code>cc/scheduler/scheduler_state_machine.cc:561–562</code>: <code>case BeginMainFrameState::SENT: return false;</code>). A main thread that is behind is never asked for frames it cannot make; the vsyncs it misses are simply not requested.</dd>
