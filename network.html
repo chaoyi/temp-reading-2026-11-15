@@ -1,0 +1,912 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Congestion and extreme latency · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">8 · Congestion and extreme latency</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="app">sender's code</span><span class="sep">→</span><span data-node="sockbuf">socket buffers</span><span class="sep">→</span>
+    <span data-node="link">link</span><span class="sep">→</span><span data-node="netsvc">network service</span><span class="sep">→</span>
+    <span data-node="pipe">data pipe</span><span class="sep">→</span><span data-node="taskq">main-thread queue</span><span class="sep">→</span>
+    <span data-node="handler">onmessage</span><span class="sep">→</span><span data-node="screen">screen</span>
+    <span class="sep">·</span><span data-node="policy">policy</span>
+    <span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 8 · recorded 2026-11-16</p>
+  <h1>The link is slow, narrow, or silent for a second and a half. Where is my data waiting, and what should the table show meanwhile?</h1>
+  <p class="lede">The same lab table, but now its WebSockets pass through a bad network: 25 to 500 ms of delay, a link four times too narrow for the stream, a link that stops for 1.5 s and then delivers everything at once, replies that queue behind each other. Every case is a recorded trace with the backend's and the proxy's counters in it. The module walks them in the language of queues: arrival rate, service rate, queue, age.</p>
+  <p><b>What you will be able to do.</b> Name the places between a server's <code>send</code> and your <code>onmessage</code> where bytes wait, and say which of them a trace can show. Say who can tell whom to stop sending, and who cannot. Recognise head-of-line blocking. Say what a table shows while its answer is far away, and what a stall's burst costs.</p>
+  <p><b>Why this matters for Tablelab.</b> The engine will sit behind a WebSocket or IPC transport, and the design says "conflation, one pull in flight, report data age". Several beliefs I held about those words did not survive these traces; each is a "Hard learning" box below.</p>
+  <p><b>What you need.</b> Module 6 (<a href="backend.html">One trace, two processes</a>) for the backend's lanes and request policies, and Module 7 (<a href="streaming.html">Live updates</a>) for the three paces and data age. Frame outcomes are Module 2's (<a href="frames.html">frames.html</a>).</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57, device scale factor 1.75, one traced run per scenario, browser, proxy and backend on one machine over loopback. The bad network is a user-space proxy (step 2 reads it): it shapes delay and throughput and does not lose packets. The stall and jitter traces were recorded with the proxy as it is now; the others with its first version, which released chunks differently (step 2) and, in these traces, in the right order (their sequence counters read 0). The traces hold no screenshots; the four pictures in step 3 are from a separate, untraced run of the same page. Bold numbers are read from the data and follow a re-recording; plain timestamps and counts are from this recording.</p>
+  <div class="foot"><button class="primary" data-start>Start: 15 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · Places to wait" data-title="Seven places a byte can wait" data-node="app sockbuf link netsvc pipe taskq handler"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>A value changes on the server. Before it is a number in a cell it passes through places where it can sit and wait. Which are they, and which of them leave a mark in a trace?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I take a quiet moment of <code>n-stall-msg-tanstack</code>, before its stall: 500 messages a second, one cell each, through the lab's proxy with nothing configured to be slow. I follow message 583 from the server's <code>send</code> to our handler and write down every event that mentions it.</p>
+  </div></div>
+  <div class="tracelink" data-trace="n-stall-msg-tanstack">In Perfetto: pin <code>tick producer</code> of the process <code>Backend (node)</code>, <code>Chrome_ChildIOThread</code> of <code>Service: network.mojom.NetworkService</code>, and <code>CrRendererMain</code> of the Renderer; zoom to 104–106 ms after the mark <code>trace: start</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["n-stall-msg-tanstack"],"from":100,"to":112,"rows":["backendTicks","marks","app"],"pins":[[1,104.42,"backendTicks"],[2,105.67,"marks"],[3,105.66,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The server's <code>produce + send</code> span for message 583, at 104.42 ms.</li>
+    <li><i>2</i>Our mark <code>app: tick message</code> on the page's main thread, at 105.67 ms: 1.25 ms later.</li>
+    <li><i>3</i><code>app: tick apply</code>: the cell's text is written, 0.05 ms.</li>
+  </ol>
+<pre>ms        process / thread                      event
+104.42    Backend (node) / tick producer        produce + send {"messages":1,"seq":583}
+105.57    NetworkService / Chrome_ChildIOThread EpollEvent  (the socket is readable; created in net/socket/socket_posix.cc)
+105.59    NetworkService / Chrome_ChildIOThread Send mojo message                    <span class="c">← start of a flow arrow</span>
+105.64    Renderer / CrRendererMain             Receive mojo message  (network.mojom.WebSocketClient)   <span class="c">← its end</span>
+105.64    Renderer / CrRendererMain             WebSocketReceive {"dataLength":58}
+105.67    Renderer / CrRendererMain             app: tick message {"seq":583}, then app: tick apply {"cells":1}</pre>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Six events, three processes. Between them are the places where the message could have waited. I list them in order, with what would make each one fill, and what a trace has for it:</p>
+  </div></div>
+  <table>
+    <tr><th></th><th>Place</th><th>It fills when</th><th>What the trace shows of it</th></tr>
+    <tr><td><span class="cp">1</span></td><td><b>The sender's code</b>: it decides to send and calls <code>ws.send()</code></td><td>never by itself: <code>send</code> does not refuse</td><td>the <code>produce + send</code> spans (lane "backend: tick producer")</td></tr>
+    <tr><td><span class="cp">2</span></td><td><b>The sender's socket buffers</b>: first Node's own (in the process), then the kernel's</td><td>the kernel cannot pass bytes on as fast as they come</td><td>counter <code>ticks socket buffered bytes</code> = the server's <code>ws.bufferedAmount</code>: the part in the process only. The kernel's part: nothing.</td></tr>
+    <tr><td><span class="cp">3</span></td><td><b>The link</b>: here the lab's proxy</td><td>delay, a rate limit, a stall</td><td>counter <code>netem queued bytes (to page)</code>; instants on the lane "netem proxy"</td></tr>
+    <tr><td><span class="cp">4</span></td><td><b>The receiver's kernel buffer and Chrome's network service</b>, which reads the socket and cuts the bytes into WebSocket frames</td><td>the network service stops reading</td><td><code>EpollEvent</code> slices on that process's IO thread (one per socket read)</td></tr>
+    <tr><td><span class="cp">5</span></td><td><b>The pipes into the renderer</b>: a data pipe of 131,000 bytes for payloads, a message pipe for "a frame of n bytes follows"</td><td>the page's main thread does not take messages as fast as they are announced</td><td>no event of its own. The flow arrow <code>Send mojo message</code> → <code>Receive mojo message</code> crosses it.</td></tr>
+    <tr><td><span class="cp">6</span></td><td><b>The main thread's task queue</b>: one task per message</td><td>the thread is busy</td><td>the task (<code>ThreadControllerImpl::RunTask</code>, queue <code>FRAME_LOADING_TQ</code>); its wait is the length of the arrow of place 5</td></tr>
+    <tr><td><span class="cp">7</span></td><td><b>The handler</b>: <code>socket.onmessage</code>, then our code</td><td>(it is the service at the end of the line)</td><td><code>WebSocketReceive</code>, <code>FunctionCall</code>, our <code>app: tick message</code> and <code>app: tick apply</code></td></tr>
+  </table>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Of the 1.25 ms, 1.15 ms lie between the server's send and Chrome's socket read: place 3. Nothing is configured to be slow, but the proxy releases every chunk from a timer (step 2 reads the line), and Node's shortest timer is one millisecond. The same stream without the proxy, Module 7's <code>s-msg-500-tanstack</code>, is handled <b data-m="s-msg-500-tanstack/ticks.ageWhenHandled.p50"></b> ms after it was sent (median). So every number in this module that comes through the proxy carries about one extra millisecond: a property of the instrument.</p>
+    <p>From the socket read to our handler: 0.1 ms here; the arrow across places 5 and 6 is 0.04 ms long at the median. These places exist, and on a quiet day they are empty.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Queue, arrival rate, service rate</dt><dd>A place where things wait for something that handles them one after another. Things come at the arrival rate; the handler finishes them at the service rate. While arrivals are faster, the line grows by the difference.</dd>
+      <dt>Age</dt><dd>How old a value is when it is used: now minus the time the server sent it. The lab stamps every message with the server's send time on the trace's clock, so age is a subtraction (Module 7).</dd>
+      <dt>Flow arrow</dt><dd>A pair of events with one id, written where a message is sent and where it is received. Its length is the time the message spent between two threads, waiting included.</dd>
+    </dl></div>
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/harness/analyze-lib.mjs:432–434, 496–497</span>
+      <p>To know what the bold numbers are. Age when handled is our mark's time minus the send time the message carries; the two buffer metrics are the maxima of the two counters.</p>
+<pre><span class="n">434</span>  const ageHandled = tickMsgs.filter((m) => m.d.sentUs).map((m) => <mark>(m.ts - m.d.sentUs) / 1000</mark>);
+<span class="n">496</span>    socketBufferedMaxKb: … e.name.startsWith("ticks socket") …
+<span class="n">497</span>    netemQueuedMaxKb: … e.name.startsWith("netem queued") …</pre>
+    </div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> there are seven places; three have a direct instrument (1, 3, 7), one has half of one (2: the process's part), three are seen through two events and an arrow (4–6).</p>
+    <p><b>No:</b> that a counter at zero means an empty path. The kernel's socket buffers on both machines have no event at all. Steps 9 to 11 find megabytes in them.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-stall-msg-tanstack slices 'produce|EpollEvent|Send mojo|Receive mojo|WebSocketReceive' 104.5 107.2</code> prints <code>produce + send</code> at 104.42 ms, then the socket read, both ends of the arrow and <code>WebSocketReceive</code> between 105.57 and 105.64 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One message on a quiet link: 1.25 ms from the server's send to our handler, 1.15 ms of it in the lab proxy's timer; 0.1 ms from Chrome's socket read to the handler.</li>
+    <li data-kind="read">Between send and onmessage there are seven places to wait; the kernel's socket buffers are the ones no trace event covers.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Place 3, the link, is sixty lines of Node in this lab. What exactly does it do to my bytes, and what does it not do?</p>
+</section>
+
+<section class="step" data-part="A · Places to wait" data-title="The bad network, read line by line" data-node="link method"
+  data-ask="where|When a link is slow, narrow or stalled: in which of the seven places do the bytes pile up, and what bounds the age of the data?">
+  <p class="holding"><span class="label">Question I hold</span><span><code>net=1</code> sends the page's WebSockets through <code>lab/server/netem.mjs</code>. Before I believe a number that passed through it: what does it model, and what not?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the proxy. It accepts the page's TCP connection, opens its own to the backend, and copies chunks both ways. Each chunk gets a release time <code>at</code>; four rules move that time later. Then I check the simplest rule, delay, against three traces.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/server/netem.mjs:22, 42–83</span>
+      <p>Every "bad network" in this module is one of these lines.</p>
+<pre><span class="n">22</span>  const HIGH_WATER = 256 * 1024;
+<span class="n">42</span>    let lastRelease = 0; <span class="c">// … at which the previous chunk leaves (one per connection and direction)</span>
+<span class="n">47</span>    const release = () => {
+<span class="n">50</span>      <mark>while (fifo.length &amp;&amp; fifo[0].at &lt;= now) {</mark>
+<span class="n">53</span>        if (!to.destroyed) to.write(chunk);
+<span class="n">55</span>      if (queued &lt;= HIGH_WATER / 2 &amp;&amp; from.isPaused()) from.resume();
+<span class="n">56</span>      if (dir === "down") counter("netem queued bytes (to page)", queued);
+<span class="n">57</span>      if (fifo.length) timer = setTimeout(release, Math.max(0, Math.ceil(fifo[0].at - now)));
+<span class="n">59</span>    from.on("data", (chunk) => {
+<span class="n">62</span>      let at = now + <mark>c.latencyMs + (c.jitterMs ? (Math.random() * 2 - 1) * c.jitterMs : 0)</mark>;
+<span class="n">63</span>      if (c.kbps) at = Math.max(at, <mark>lastRelease + (chunk.length * 8) / c.kbps</mark>); <span class="c">// ms to send these bytes</span>
+<span class="n">66</span>        const since = at - <mark>opened</mark> - c.stallAtMs;
+<span class="n">68</span>        if (phase >= 0 &amp;&amp; phase &lt; c.stallMs) {
+<span class="n">69</span>          <mark>at += c.stallMs - phase;</mark>
+<span class="n">74</span>      at = Math.max(at, lastRelease); <span class="c">// never reorder</span>
+<span class="n">76</span>      queued += chunk.length;
+<span class="n">77</span>      <mark>if (queued > HIGH_WATER) from.pause();</mark>
+<span class="n">82</span>      <mark>fifo.push({ chunk, at });</mark>
+<span class="n">83</span>      if (!timer) timer = setTimeout(release, Math.max(0, Math.ceil(at - now)));</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>One-way delay, round trip</dt><dd><code>latencyMs</code> is applied to each direction. A request and its reply cross twice: the round trip is twice the delay.</dd>
+      <dt>Bandwidth in bytes</dt><dd>256 kbit/s is 32,000 bytes a second. Line 63 lets a chunk of n bytes leave no sooner than n × 8 ÷ kbps milliseconds after the one before.</dd>
+      <dt>High-water mark</dt><dd>A queue length above which a stage stops taking more. Line 77: above 256 KB the proxy stops reading from the sender; line 55: it reads again at 128 KB.</dd>
+    </dl></div>
+  </div>
+  <ol class="pins">
+    <li><i>1</i><b>Delay</b> (62): release = arrival + delay ± jitter, in each direction.</li>
+    <li><i>2</i><b>Bandwidth</b> (63): bytes leave no faster than <code>kbps</code>.</li>
+    <li><i>3</i><b>Stall</b> (66–69): a chunk whose release falls into the stall window leaves at the window's end. The window is counted from the moment the <em>socket opened</em>, not from the trace's start: <code>stallAtMs: 1300</code> lands at about 230 ms on a chart whose zero is the start mark.</li>
+    <li><i>4</i><b>Order</b> (74, 82, 50): a chunk's release time is never earlier than its predecessor's, and chunks leave through one first-in-first-out queue served by one timer. As TCP: nothing overtakes.</li>
+    <li><i>5</i><b>Push-back</b> (77, 55): the proxy stops reading from the sender when it holds more than 256 KB, so the queue should move back into the sender's socket.</li>
+    <li><i>6</i><b>The instrument</b> (56): the counter. It has one name for every connection of the server; that matters in step 10.</li>
+  </ol>
+  <div class="hard"><span class="label">Hard learning</span><p>The first version of this proxy also said <code>// never reorder</code>, and reordered. It ordered the release <em>times</em> and then gave each chunk a timer of its own. Node keeps timers in whole milliseconds, one list per duration, so 750 chunks due at the same instant after a stall left in 191 shuffled runs. What showed it was the page's own counter of sequence jumps (<code>ticks.ts:72</code>), which read 747 where it now reads <b data-m="n-stall-msg-tanstack/state.ticks.gaps"></b>. The rule I keep: order is something the receiver checks, with a sequence number; and a network simulator is a program whose claims need a test like any other.</p></div>
+  <table class="mtable" data-rows="n-lat-25-tanstack,n-lat-100-tanstack,n-lat-500-tanstack" data-names="latencyMs 25,latencyMs 100,latencyMs 500" data-head="Scenario"
+    data-cols="ws.upMs.p50|request mark → server receive|ms,ws.downMs.p50|server done → reply handled|ms,ws.roundTrip.p50|round trip|ms,ws.requests|requests in the trace"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Each direction takes the configured delay plus 0.3 to 0.9 ms; a round trip is twice the delay plus about 1.5 ms. The delay is plain arithmetic on release times.</p>
+    <p>What the file's own header says it leaves out: "It does not model loss, retransmission or congestion-window dynamics" (lines 16–17). Two more limits follow from the code. <code>lastRelease</code> is per connection and direction (line 42): two sockets each get the full bandwidth, where a real narrow link would be shared. And the proxy is a second TCP connection: between the server's code and the page there are now two pairs of kernel socket buffers on loopback.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> delays and rates in these traces are exact and repeatable; what waits, waits in a place I can name.</p>
+    <p><b>No:</b> anything about loss. On a real path a lost segment is sent again after a timeout that doubles on each failure, and because TCP is "a reliable, in-order, byte-stream service" everything behind it waits too (read: RFC 9293 §2.2 and §3.8.2, "exponential backoff for successive RTO values"). A real 500 ms path with loss is worse than this one, and its stalls are that backoff.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-lat-500-tanstack marks 'ws (request|round trip)|content complete'</code>: four round trips of about 1,001 ms, sent at 6, 1,007, 2,009 and 3,009 ms, and one <code>content complete</code> at 4,011 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">The lab's bad network moves each chunk's release time: delay ± jitter, a byte rate, a stall window counted from the socket's open; chunks leave through one FIFO; it stops reading its sender above 256 KB (netem.mjs:62–83).</li>
+    <li data-kind="rejected">"A comment that says never reorder means order is kept": the proxy's first version shuffled a burst; the page's sequence counter caught it.</li>
+    <li data-kind="read">Not modelled: loss, retransmission, congestion window, a bottleneck shared between sockets.</li>
+    <li data-kind="measured">Round trip = 2 × latencyMs + about 1.5 ms (51 / 201 / 1,001 ms).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> With every answer a full second away, what is on the screen while I scroll?</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · Delay" data-title="A second away: what is on the screen?" data-node="link handler screen policy"
+  data-ask="screen|While the answer is hundreds of milliseconds away: what should the table show, and how soon after I stop can it be right?">
+  <p class="holding"><span class="label">Question I hold</span><span>I scroll for two seconds at 1,200 px/s, 50 rows a second, and every reply needs one second. What do the two panels show during those two seconds?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The TanStack panel writes <code>…</code> into a row it has no data for. regular-table keeps its previous rows on screen until a draw completes. Halfway through the scroll, what do they show?</p>
+    <div class="opts">
+      <button data-k="a">Both show rows about one second behind the scrollbar.</button>
+      <button data-k="b">TanStack: the newest rows as <code>…</code>, the older ones filled; regular-table: an empty table.</button>
+      <button data-k="c">TanStack: <code>…</code> in every cell; regular-table: a full, normal-looking table of rows the scrollbar left a second ago.</button>
+    </div>
+    <div class="reveal"><p><b>c.</b> One panel is honest and empty, the other is full and about another place. The pictures and the two request lanes below show both.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>n-lat-500-tanstack</code> (our source with one request in flight) and <code>n-lat-500-regular</code>. The input is two one-second wheel gestures back to back (the harness repeats the gesture once): about 2,400 px, from 0 to 2,067 ms, ending at row 100. I read each request's rows from its mark and each draw's rows from its measure.</p>
+  </div></div>
+  <div class="tracelink" data-trace="n-lat-500-tanstack"></div>
+  <div class="tracelink" data-trace="n-lat-500-regular"></div>
+  <div class="lanes" data-lanes='{"traces":["n-lat-500-tanstack","n-lat-500-regular"],"titles":["n-lat-500-tanstack · our source, one request in flight","n-lat-500-regular · regular-table awaits its data listener"],"from":-50,"to":4300,"rows":["inputs","backendQuery","app","frames"],"pins":[[1,6,"app",0],[2,1007,"app",0],[3,2008.6,"app",0],[4,2066,"inputs",0],[5,3009,"app",0],[6,4011,"app",0],[7,1036,"app",1],[8,2050.6,"app",1],[9,3052.5,"app",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>6 ms: request #2 asks for rows 0–14, the range wanted at that moment. Each blue bar is one round trip, one second long.</li>
+    <li><i>2</i>1,007 ms: #2 is back; #3 asks for rows 47–63. The scroller is 47 rows further.</li>
+    <li><i>3</i>2,009 ms: #4 asks for rows 94–110.</li>
+    <li><i>4</i>2,067 ms: the last input (<code>GestureScrollEnd</code>). The scroller rests at row 100; the panel wants rows 98–113.</li>
+    <li><i>5</i>3,009 ms: #4 is back with rows 94–110. Three rows of the wanted range are missing, so #5 asks for 98–113.</li>
+    <li><i>6</i>4,011 ms: ◆ the first moment since the scroll began that the visible rows show their data.</li>
+    <li><i>7</i>regular-table, 1,036 ms: its first draw of the scroll completes, with rows 1–13, asked for at 34 ms.</li>
+    <li><i>8</i>2,051 ms: its second draw: rows 50–61, asked for at 1,036 ms. The scroller is at row 100.</li>
+    <li><i>9</i>3,053 ms: ◆ rows 100–111.</li>
+  </ol>
+  <div class="two">
+    <figure><div class="frame"><img src="assets/network/live-tanstack-1500.jpg" alt="TanStack panel, every cell shows an ellipsis"></div><figcaption><b>TanStack panel at 1.5 s</b> (scroller at row 70): every cell is <code>…</code>. Separate untraced run, same query and delay.</figcaption></figure>
+    <figure><div class="frame"><img src="assets/network/live-regular-1500.jpg" alt="regular-table showing rows 1 to 12"></div><figcaption><b>regular-table at 1.5 s</b> (scroller at row 69): rows 1–12, complete and readable. Same separate run.</figcaption></figure>
+    <figure><div class="frame"><img src="assets/network/live-tanstack-3500.jpg" alt="TanStack panel, still an ellipsis in every cell"></div><figcaption><b>TanStack panel at 3.5 s</b>, 1.4 s after the scroll stopped at row 100: still <code>…</code>.</figcaption></figure>
+    <figure><div class="frame"><img src="assets/network/live-regular-2600.jpg" alt="regular-table showing rows 50 to 61"></div><figcaption><b>regular-table at 2.6 s</b>, 0.5 s after the scroll stopped at row 100: rows 50–61. Look at the scrollbar thumb: it is not where these rows are.</figcaption></figure>
+  </div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The TanStack panel made 4 requests. Every <code>app: draw</code> between 0 and 4,010 ms carries <code>filled: false</code>. regular-table made 3 requests and drew three times; each draw showed the rows of the position it had asked about one second earlier.</p>
+    <p>Why is the TanStack panel empty for four seconds, when replies do arrive every second? At 500 ms the answer looks obvious: reply #3 (rows 47–63) lands when the panel wants rows 94–110. But the 25 ms trace, with a 51 ms round trip in which the scroller moves only 2.5 rows, has the same single ◆ (<b data-m="n-lat-25-tanstack/content.completeMarks"></b> in the whole run, after the scroll). The reply overlaps the wanted range almost completely, and still nothing is filled.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/source.ts:160–165 · lab/pages/src/tanstack.ts:113, 121, 129</span>
+      <p>To find who decides that a row stays <code>…</code>. It is our page, not the library: TanStack Virtual computes ranges and never fetches.</p>
+<pre><span class="n">160</span>    peek(y0, y1, x0, x1) {
+<span class="n">162</span>      <mark>if (has(y0, y1, x0, x1)) return collect(y0, y1, x0, x1);</mark>   <span class="c">// every cell of the range, or …</span>
+<span class="n">163</span>      request(y0, y1, x0, x1);
+<span class="n">164</span>      <mark>return undefined;</mark>                                          <span class="c">// … nothing</span>
+
+<span class="n">113</span>    const data = source.peek(first, last + 1, x0, x1 + 1); <span class="c">// ws: asks for what is missing</span>
+<span class="n">121</span>        const row = <mark>data?.[item.index - first]</mark>;
+<span class="n">129</span>        } else if (el._x0 !== x0 || el._x1 !== x1 || (!el._ready &amp;&amp; row)) fill(el, item.index, x0, x1, row);</pre>
+      <p>The cache is per row, but the panel reads it all-or-nothing. A range that moves by one row every 20 ms is never whole.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Placeholder</dt><dd>A cell that says "no data yet". Honest; useless to read.</dd>
+      <dt>Stale rows</dt><dd>Real data, for a position the user has left. Readable; wrong place; nothing marks it.</dd>
+      <dt>regular-table's draw loop</dt><dd>A draw awaits its data listener; one draw is in flight; the table is sticky, so the old rows stay under a moving scrollbar (Module 3, <a href="anatomy.html">anatomy.html</a>).</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed the placeholders were the price of the delay: data is a second away, so the screen is a second behind. The 51 ms trace shows the same empty table. The screen was empty because the panel waits for the <em>whole</em> wanted range, and a moving range is never whole. The rule I keep: with a far source, draw from what is cached row by row. Atomic windows turn any delay, however small, into a blank table while moving.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with one second of round trip, this page's TanStack panel shows nothing for the whole scroll and regular-table shows rows up to a second (50 rows) off, unmarked.</p>
+    <p><b>No:</b> that "TanStack shows placeholders and regular-table stale rows" by nature. The first is 60 lines of our page; the second is regular-table's draw loop meeting a listener that awaits the network. The four pictures are from a separate untraced run; the traces carry the marks, not pixels.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A proposal: a row on screen is in one of three states, and the painter shows which: current, stale (with the age of the window it came from), unknown. A full table of rows for another position, drawn like current data, is the state to rule out.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-lat-500-regular marks 'listener'</code>: three <code>data listener</code> measures of about 1,001 ms (the await), and <code>style listener</code> entries whose <code>first</code> is 1, then 50, then 100.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">1 s round trip, 2 s scroll: the TanStack panel shows placeholders in every row from the start of the scroll to 4,011 ms; regular-table draws three times, each time rows one second old.</li>
+    <li data-kind="read">The placeholders come from our page reading its cache all-or-nothing (source.ts:162–164, tanstack.ts:113–129), not from the delay: a 51 ms round trip gives the same blank scroll.</li>
+    <li data-kind="rejected">"The screen is one round trip behind": with atomic windows it is blank at any round trip.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> I stop scrolling. How long until the rows are right, and what decides that?</p>
+</section>
+
+<section class="step" data-part="B · Delay" data-title="How long after I stop?" data-node="link policy screen">
+  <p class="holding"><span class="label">Question I hold</span><span>After the last input the TanStack panel needed 1,944 ms to show the right rows, regular-table 1,010 ms. The link is the same. Where does the factor of two come from?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>Both have one request in flight at a time. Why is one twice as slow to settle?</p>
+    <div class="opts">
+      <button data-k="a">regular-table's draw loop needs one round trip; a one-in-flight source needs two.</button>
+      <button data-k="b">Chance: it depends on how old the request in flight was at the moment the scroll stopped.</button>
+      <button data-k="c">The TanStack panel's replies are larger and take longer on the wire.</button>
+    </div>
+    <div class="reveal"><p><b>b.</b> At 25 ms of delay the order is the other way round: regular-table is the slower one. The table shows all six, and a seventh that asks for everything.</p></div>
+  </div>
+  <table class="mtable" data-rows="n-lat-25-tanstack,n-lat-25-regular,n-lat-100-tanstack,n-lat-100-regular,n-lat-500-tanstack,n-lat-500-regular,n-lat-500-tanstack-every"
+    data-names="25 ms · TanStack one in flight,25 ms · regular-table,100 ms · TanStack one in flight,100 ms · regular-table,500 ms · TanStack one in flight,500 ms · regular-table,500 ms · TanStack every range"
+    data-head="One-way delay · panel" data-hi="n-lat-500-tanstack:content.settleMs,n-lat-500-regular:content.settleMs,n-lat-500-tanstack-every:ws.requests"
+    data-cols="ws.roundTrip.p50|round trip|ms,ws.requests|requests,content.settleMs|last input → right rows in the DOM|ms,ws.bytes|bytes received"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>In round trips, the six one-in-flight runs settle after 1.5, 1.8, 1.8, 1.6, 1.9 and 1.0. Always between one and two.</p>
+    <p>The reason is in step 3's chart. When the scroll stops, a request is out, sent some time <i>a</i> ago for a range that is already old. The final range can only be asked for when that one returns. So the wait is (round trip − <i>a</i>) + round trip. For the TanStack panel at 500 ms: #4 left at 2,008.6 ms, the last input came at 2,066.7 ms, <i>a</i> = 58 ms, and 943 + 1,001 = 1,944. For regular-table: a reply landed 4 ms before the last input and the next request left 8 ms after it: 8 + 1,001 = 1,010. Nothing about the libraries; only where in its round trip the scroll happened to stop.</p>
+    <p><b>Every range.</b> <code>n-lat-500-tanstack-every</code> asks at once for each row that enters: <b data-m="n-lat-500-tanstack-every/ws.requests"></b> requests of one row each (<code>source.ts:113–118</code> trims a request to the rows not cached or in flight). The request for the last row left 8 ms before the last input, and it settles one round trip later. That is the least a client can do without guessing ahead. And nothing filled progressively: all 100 replies were in the cache one by one, and the panel, reading all-or-nothing, showed them together at 3,051 ms.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <table>
+      <tr><th>Policy</th><th>Requests</th><th>Settles after the stop</th><th>Costs</th></tr>
+      <tr><td>One in flight (newest range next)</td><td>at most one per round trip</td><td>1 to 2 round trips, by chance of phase</td><td>up to one wasted round trip at the end</td></tr>
+      <tr><td>Every range</td><td>one per change of range (here 100)</td><td>1 round trip</td><td>25 times the requests; against a backend with a queue, Module 6's <code>b-drag-every-tanstack</code> shows the line it builds</td></tr>
+      <tr><td>Ask ahead (prefetch)</td><td>as above, larger</td><td>0 while the guess holds</td><td>rows fetched = speed × round trip ahead: 50 rows/s × 1 s = 50 rows, four screens, in the direction of travel; nothing for a jump</td></tr>
+    </table>
+    <p>The third row is reasoning, not a trace. This page cannot show it: its overscan rows belong to the same all-or-nothing range as the visible ones, so asking ahead would only make the range harder to complete.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read "1,944 against 1,010" as "the TanStack source needs two round trips, regular-table one" and started looking for the cause in the code. The cause was phase. The rule I keep: before explaining a difference between two single runs, look for the same pair at another setting. The 25 ms pair, <b data-m="n-lat-25-tanstack/content.settleMs"></b> against <b data-m="n-lat-25-regular/content.settleMs"></b> ms, ends the theory in one line.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> one in flight settles in one to two round trips; asking for every range settles in one and multiplies the requests.</p>
+    <p><b>No:</b> that every range is better. Its 100 requests met a server that answers in 0.02 ms. And the distribution between one and two round trips is six points here, not a measurement of it.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A proposal: keep one pull in flight while the window is moving, and when the window has stopped changing, let the final window go out at once instead of waiting for the stale pull (a second request, or a cancel and a resend). Draw rows as they arrive. Report the age of the shown window: now minus the time its request left.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-lat-500-tanstack-every marks 'content complete|ws request' 1900 3100</code>: the last request marks up to 2,051 ms, then one <code>content complete</code> at 3,052 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One request in flight settles (round trip − age of the in-flight request) + one round trip after the stop: 1.0 to 1.9 round trips in six runs.</li>
+    <li data-kind="measured">Asking for every range: 100 requests instead of 4, right rows exactly one round trip after the last range was wanted.</li>
+    <li data-kind="rejected">"The TanStack source needs two round trips, regular-table one": at 25 ms the order is reversed; it is phase.</li>
+    <li data-kind="inferred">Asking ahead needs speed × round trip rows of lead (50 rows at 1 s); not shown by a trace.</li>
+  </ul>
+  <p class="next" data-answer="screen"><b>Next question →</b> Delay is a link that works, slowly. What happens when it passes nothing at all for a while?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · A stall and its burst" data-title="The link goes silent for a second and a half" data-node="link screen app"
+  data-ask="burst|When a stalled link comes back, everything arrives together. What does the burst cost, and what would bound it?">
+  <p class="holding"><span class="label">Question I hold</span><span>500 updates a second are flowing. The link stops passing data for 1.5 s (a radio handover, a suspended laptop) and no connection breaks. What does the server see, what does the page see, what does the user see?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>n-stall-msg-tanstack</code>: the keyed panel, one cell patched per message. The proxy stalls from 1,300 ms after the socket opened; on this chart, whose zero is the start mark, that is 227 ms.</p>
+  </div></div>
+  <div class="tracelink" data-trace="n-stall-msg-tanstack">In Perfetto: the counter track <code>netem queued bytes (to page)</code> of <code>Backend (node)</code>, next to <code>CrRendererMain</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["n-stall-msg-tanstack"],"from":0,"to":2100,"rows":["backendTicks","netem","marks","app","frames"],"counters":["netem queued bytes (to page)","ticks socket buffered bytes"],"pins":[[1,227.1,"netem"],[2,1000,"backendTicks"],[3,1000,"marks"],[4,1000,"frames"],[5,1727.7,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>227.1 ms: the proxy's instant <code>stall down 1500 ms</code>. From here its queue counter climbs in a straight line.</li>
+    <li><i>2</i>The server keeps producing a message every 2 ms. Its own socket counter (last row) stays at 0: every <code>send</code> is accepted.</li>
+    <li><i>3</i>The page: the last message is handled at 226.0 ms, the next at 1,727.7 ms. Between them our handler does not run.</li>
+    <li><i>4</i>Frames: one "no update wanted" at 265.3 ms, then no frame at all until 1,715 ms. Nothing changed, so nothing was drawn.</li>
+    <li><i>5</i>1,727.7 ms: everything at once (next step).</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>For 1.5 s the page was idle and correct by every local measure: socket open, no error, no long task, no dropped frame. The proxy's queue grew to <b data-m="n-stall-msg-tanstack/backend.netemQueuedMaxKb"></b> KB, 750 messages of 62 bytes. The oldest message of the burst was <b data-m="n-stall-msg-tanstack/ticks.ageWhenHandled.max"></b> ms old when the handler saw it.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The user saw a table in which every cell holds a number, as always. The numbers were up to 1.5 s old and nothing said so. A stall is not a failure the page is told about; it is an absence.</p>
+    <p>Two signals were available. <b>Silence</b>: at 500 messages a second, 100 ms without one is already 50 missing; a timer can see that <em>during</em> the stall. <b>Age</b>: each message carries its send time, so the handler can compute how old it is; that works only <em>after</em> the stall, when the burst lands. Neither is in the lab page.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a stalled link is invisible to the code at both ends; the queue was in place 3; the screen stayed plausible and went stale at one second per second.</p>
+    <p><b>No:</b> that silence always means a stall. A stream that is allowed to be quiet needs a heartbeat before silence can mean anything. And a real stall's queue is not in a proxy: it is in the sender's kernel, waiting for a retransmission timer (read, RFC 9293 §3.8.2; not modelled here).</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A proposal: the transport sends a heartbeat when it has nothing else to send, and the view keeps "time since anything arrived". Past a threshold the painter marks the whole view stale and shows the age. This is the only defence that works while the link is still silent.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-stall-msg-tanstack frames 235 1710</code> prints two vsync lines: 248.68 ms, and state <code>none</code> at 265.34 ms. Nothing else in 1.4 s.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">A 1.5 s stall: no message, no frame, no error on the page; the server's socket counter stays 0; 750 messages (46 KB) wait in the link.</li>
+    <li data-kind="inferred">During a stall the screen is plausible and stale; only a silence timer (with a heartbeat) can tell while it lasts.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> At 1,727 ms the proxy lets 750 messages go at once. What does that look like on the main thread?</p>
+</section>
+
+<section class="step" data-part="C · A stall and its burst" data-title="750 messages at once: one long task, or 750 small ones?" data-node="netsvc pipe taskq handler">
+  <p class="holding"><span class="label">Question I hold</span><span>46 KB holding 750 messages reach Chrome within a few milliseconds. How are they handed to my handler?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>What does <code>CrRendererMain</code> show from 1,727 ms on?</p>
+    <div class="opts">
+      <button data-k="a">One task of 50 ms or more: Chrome delivers everything it has read in one go.</button>
+      <button data-k="b">750 separate tasks of a few tens of microseconds each, back to back for some tens of milliseconds.</button>
+      <button data-k="c">A few messages per frame over the next second: Chrome paces them.</button>
+    </div>
+    <div class="reveal"><p><b>b.</b> No task in this trace reaches 50 ms (<b data-m="n-stall-msg-tanstack/main.longTasks"></b> long tasks; the longest is <b data-m="n-stall-msg-tanstack/main.maxTaskMs"></b> ms). The burst is a line of 750 tasks, and a frame has to stand in that line.</p></div>
+  </div>
+  <div class="lanes" data-lanes='{"traces":["n-stall-msg-tanstack"],"from":1715,"to":1805,"rows":["marks","app","tasks","mainFrames","frames"],"pins":[[1,1727.7,"app"],[2,1785,"app"],[3,1760,"tasks"],[4,1765,"mainFrames"],[5,1768,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>1,727.7 ms: the first message of the burst is handled.</li>
+    <li><i>2</i>1,785 ms: the line is empty again; from here one message every 2 ms as before.</li>
+    <li><i>3</i>The lane of tasks of 1 ms or more holds a few thin bars. The dense band above it is made of tasks of 0.03 to 0.15 ms.</li>
+    <li><i>4</i>The main frame for vsync 183: asked for at 1,748.78 ms, started at 1,782.1 ms. It waited <b data-m="n-stall-msg-tanstack/frames.mainQueueMs.max"></b> ms.</li>
+    <li><i>5</i>Vsync 184 is dropped (red): the main frame before it was still in the line.</li>
+  </ol>
+<pre>network service, Chrome_ChildIOThread     EpollEvent (socket read): 1727.43 ms, for 2.10 ms
+                                          Send mojo message, per millisecond:  1727: 134 · 1728: 430 · 1729: 231
+renderer, CrRendererMain                  Receive mojo message, per 2 ms:      20 to 60, from 1728 to 1784
+arrow Send → Receive (wait in places 5–6) before the stall: median 0.04 ms    in the burst: median 29 ms, longest 51.8 ms</pre>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The network service read the whole burst from the socket in one 2 ms read and announced all 750 frames to the renderer within 3 ms. Nothing slowed it: 46 KB fit into the 131,000-byte pipe. So in three milliseconds the queue moved from the link (place 3) into the main thread's task queue (place 6), and that thread needed 57 ms to work through it: one task per message, each with one <code>WebSocketReceive</code>, median 44 µs, mean 69 µs. They arrived in sequence: the page counted <b data-m="n-stall-msg-tanstack/state.ticks.gaps"></b> jumps.</p>
+    <p>The main frame asked for at 1,748.78 ms ran at normal priority, in arrival order, behind the tasks that were posted before it. Its vsync was shown 35 ms late and the next one not at all.</p>
+    <p>One run is one run: an earlier recording of this same scenario (replaced when the proxy was repaired) worked through its burst in 22 ms at 24 µs a message. The shape was the same; the cost of a message was not.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc;l=1038">third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc:1038–1040, 630–645</a>
+      <p>Could Chrome have handed over several messages in one task? The code can: it is a loop over every announced frame whose bytes are in the pipe.</p>
+<pre><span class="n">1038</span>  void WebSocketChannelImpl::ConsumePendingDataFrames() {
+<span class="n">1040</span>    <mark>while (!pending_data_frames_.empty() &amp;&amp; !backpressure_ &amp;&amp;</mark>
+<span class="n">1041</span>           GetState() == State::kOpen) {</pre>
+      <p>But each announcement (<code>OnDataFrame</code>, line 630) arrives as its own mojo message in its own task, finds its bytes present and consumes exactly one frame. In the trace the 750 tasks are on <code>FRAME_LOADING_TQ</code> at <code>NORMAL_PRIORITY</code>, posted from <code>PostDispatchNextMessageFromPipe</code>. Batching would need a frame whose bytes arrive after its announcement; I did not see one in these traces.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Drain time</dt><dd>A backlog of N items, each costing s, while new ones keep coming at rate λ, is gone after N·s ÷ (1 − λ·s). Here 750 × 69 µs ÷ (1 − 500/s × 69 µs) = 54 ms.</dd>
+      <dt>FIFO at one priority</dt><dd>Chrome's main thread runs the oldest task of the highest priority that has work. WebSocket tasks and the main frame's task are both "normal" here, so the frame waits its turn (Module 7 has the priorities).</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a burst of N messages is N tasks; its cost is N times the cost of one message; a main frame queues behind whatever part of the burst was posted before it.</p>
+    <p><b>No:</b> that Chrome never batches (the loop exists), or that a burst cannot block: at 25 to 70 µs a message, 10,000 messages are a quarter to two thirds of a second of main thread that no single task shows. A search for "long tasks" finds nothing here.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-stall-msg-tanstack tasks 1727 1790 0</code> lists (the first 300 of) the tasks: <code>FRAME_LOADING_TQ NORMAL_PRIORITY … PostDispatchNextMessageFromPipe</code>. In Perfetto, search <code>WebSocketReceive</code> on <code>CrRendererMain</code> and watch the hits bunch up from 1,727 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">The burst is 750 tasks, one message each, in sequence, done in 57 ms (22 ms in an earlier recording); no long task. Chrome's network service passed all 750 to the renderer within 3 ms.</li>
+    <li data-kind="measured">A message of the burst waited up to 52 ms in the renderer (normally 0.04 ms); a main frame behind it waited 33 ms, one vsync was dropped.</li>
+    <li data-kind="read">Blink can deliver several WebSocket frames in one task (websocket_channel_impl.cc:1040); with one announcement per task it delivers one.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> If the burst is N tasks, then what one task costs is the applier's choice. Which way of applying makes the burst cheap?</p>
+</section>
+
+<section class="step" data-part="C · A stall and its burst" data-title="The same burst into four appliers" data-node="taskq handler screen policy">
+  <p class="holding"><span class="label">Question I hold</span><span>Patch a cell per message; mark dirty and patch once per frame; ask regular-table for a draw per message; set React state per message. Which of the four gets through 750 messages with the least damage?</span></p>
+  <div class="lanes" data-lanes='{"traces":["n-stall-msg-tanstack","n-stall-raf-tanstack","n-stall-msg-regular","n-stall-msg-react"],"titles":["n-stall-msg-tanstack · keyed cells, patched per message","n-stall-raf-tanstack · keyed cells, patched once per frame","n-stall-msg-regular · regular-table, a draw() per message","n-stall-msg-react · React, a state update per message"],"from":1690,"to":1920,"rows":["marks","mainFrames","frames"],"pins":[[1,1755,"marks",0],[2,1752,"marks",1],[3,1825,"marks",2],[4,1800,"mainFrames",2],[5,1724,"marks",3]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Keyed, per message: the band of handled messages is 57 ms wide (1,728 to 1,785 ms).</li>
+    <li><i>2</i>Keyed, per frame: 19 ms (1,743 to 1,762 ms).</li>
+    <li><i>3</i>regular-table: 160 ms (1,745 to 1,905 ms).</li>
+    <li><i>4</i>Its main frame: asked for at 1,761.1 ms, run at 1,846.0 ms.</li>
+    <li><i>5</i>React: 27 ms (1,711 to 1,738 ms).</li>
+  </ol>
+  <table>
+    <tr><th>Applier (trace)</th><th>Burst handled in</th><th>One message's task, median</th><th>Wait of a message in the renderer, median / longest</th><th>What 750 messages became</th></tr>
+    <tr><td>keyed, per message</td><td class="num">57 ms</td><td class="num">44 µs</td><td class="num">29 / 52 ms</td><td>750 cell writes</td></tr>
+    <tr><td>keyed, per frame</td><td class="num">19 ms</td><td class="num">20 µs</td><td class="num">7.8 / 15.7 ms</td><td>one apply of 24 cells at 1,761 ms</td></tr>
+    <tr><td>regular-table, <code>draw()</code> per message</td><td class="num">160 ms</td><td class="num">180 µs</td><td class="num">78 / 147 ms</td><td>750 complete draws</td></tr>
+    <tr><td>React, state per message</td><td class="num">27 ms</td><td class="num">27 µs</td><td class="num">12.7 / 23 ms</td><td>a handful of renders</td></tr>
+  </table>
+  <table class="mtable" data-rows="n-stall-msg-tanstack,n-stall-raf-tanstack,n-stall-msg-regular,n-stall-msg-react" data-names="keyed · per message,keyed · per frame,regular-table · draw per message,React · state per message" data-head="Whole run"
+    data-cols="frames.mainQueueMs.max|longest wait of a main frame|ms,frames.dropped|frames dropped,main.longTasks|tasks ≥ 50 ms,main.maxTaskMs|longest task|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Per frame is still 750 tasks.</b> With <code>apply=raf</code> the handler only parses, stores the value and writes one mark; the DOM gets one apply of 24 cells instead of 750 writes. That made a message cheaper here (20 µs against 44 µs; in an earlier recording the two were equal at about 22 µs). But the burst is still 750 deliveries: 20 ms of main thread that no frame callback can remove. It kept all its frames because its burst happened to fit between two main frames (longest wait <b data-m="n-stall-raf-tanstack/frames.mainQueueMs.max"></b> ms). That is phase again.</p>
+    <p><b>regular-table ran 750 draws.</b> Each message's task is about 0.2 ms: 0.03 ms of handler, then 0.18 ms of microtasks that contain a forced layout (6 objects dirty). That is a whole draw, finished inside the task that asked for it. Over the run it received <b data-m="n-stall-msg-regular/state.counters.drawRequests"></b> draw requests and ran <b data-m="n-stall-msg-regular/state.counters.draws"></b> draws. Its main frame waited <b data-m="n-stall-msg-regular/frames.mainQueueMs.max"></b> ms, and then ran at <code>VERY_HIGH_PRIORITY</code> at 1,845.96 ms: 100 ms after the previous main frame ended at 1,745.94. That is Chrome's rendering-starvation rule (Module 7), and it is what ended the wait.</p>
+    <p><b>React batched by itself.</b> Over the run the page handled <b data-m="n-stall-msg-react/state.ticks.messages"></b> messages and React rendered <b data-m="n-stall-msg-react/state.counters.renders"></b> times: one render per message in steady state, and about 770 fewer than messages, which is the burst. Its renders run in tasks of their own (<code>FRAME_PAUSABLE_TQ</code>, posted through a message port) that stand in the same line; each render covers every state update made before it. (How React schedules them I infer from those tasks; I did not read React's source for this module.)</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">regular-table 0.9.2 · src/ts/utils.ts:57–66 · src/ts/scroll_panel.ts:113–120</span>
+      <p>regular-table has a lock that merges draw requests. Why did it merge none?</p>
+<pre><span class="n">57</span>  export async function throttle_tag&lt;T&gt;(tag: any, f: () => Promise&lt;T&gt;) {
+<span class="n">61</span>      <mark>if (TAGS.has(tag)) {</mark>                       <span class="c">// a draw is in flight: wait for it</span>
+<span class="n">62</span>          await TAGS.get(tag)?.promise;
+<span class="n">63</span>          if (TAGS.has(tag)) {
+<span class="n">64</span>              await TAGS.get(tag)?.promise;
+<span class="n">65</span>              return;                              <span class="c">// … and somebody else already ran: skip mine</span></pre>
+      <p>The lock merges calls that arrive <em>while a draw is awaiting something</em>. With rows computed in the page, a draw awaits only promises that are already resolved, so it completes in the microtasks of the task that called <code>draw()</code>. The next message's task finds no draw in flight.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Coalescing needs a gap</dt><dd>Two requests merge only if the second arrives before the first has run. React leaves that gap (it renders in a later task); a frame callback leaves it (until the next frame); a draw that completes in its caller's microtasks leaves none.</dd>
+      <dt>Conflation by key</dt><dd>Keep only the latest value per cell. The per-frame policy does this in the page: 750 messages for 24 cells became 24 writes.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected "apply once per frame" to turn a burst into one cheap callback. It bounded the DOM work, 24 writes instead of 750, and still ran 750 tasks, because every message arrives as its own task and is parsed and marked there. The rule I keep: to bound what a burst costs the main thread, the messages must not reach it one by one. Conflate before it: in a worker (Module 7's <code>s-worker-8000-tanstack</code> takes 8,000 messages a second with the main thread almost idle, so 750 at once is a tenth of a second of that load; inferred, there is no stall trace with the worker) or at the sender.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the burst's length is N × the cost of one message's task; a per-message draw makes that cost a draw; per-frame apply bounds DOM writes, not tasks.</p>
+    <p><b>No:</b> that conflation at the sender removes the burst. With one conflated message per 50 ms, a 1.5 s stall still queues 30 messages, 29 of them obsolete pictures of the same cells: the sender does not know the link is stalled (arithmetic, not a trace).</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-stall-msg-regular tree 1800 1800.5 main 5</code>: message tasks of about 0.25 ms, each <code>socket.onmessage</code> (0.03 ms) followed by <code>RunMicrotasks</code> with <code>Document::UpdateStyleAndLayout</code> and a <code>Layout</code> of 6 dirty objects inside.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">The burst took 19 ms (keyed, per frame), 27 ms (React), 57 ms (keyed, per message), 160 ms (regular-table, a draw per message; seven frames dropped, main frame rescued by the 100 ms starvation rule).</li>
+    <li data-kind="rejected">"Applying once per frame turns a burst into one callback": the DOM writes fell from 750 to 24, the 750 tasks stayed (20 ms).</li>
+    <li data-kind="read">regular-table's lock merges draw requests only while a draw is awaiting (utils.ts:61–65); with a synchronous data listener none ever is.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The line is empty again. Is everything as it was before the stall?</p>
+</section>
+
+<section class="step" data-part="C · A stall and its burst" data-title="After the burst: is the steady state the same?" data-node="screen method">
+  <p class="holding"><span class="label">Question I hold</span><span>The line is empty again. Is that the whole bill? I compare a frame from before the stall with a frame from 200 ms after the burst, in regular-table's run.</span></p>
+  <div class="tracelink" data-trace="n-stall-msg-regular"></div>
+  <div class="lanes" data-lanes='{"traces":["n-stall-msg-regular"],"titles":["n-stall-msg-regular · before the stall, the vsync at 194.31 ms"],"from":193.9,"to":197.9,"rows":["compositor","mainFrames","app"],"pins":[[1,194.42,"mainFrames"],[2,195.06,"compositor"],[3,195.4,"compositor"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>194.42 ms: the main frame begins (grey tick on the compositor lane: <code>ScheduledActionSendBeginMainFrame</code>).</li>
+    <li><i>2</i>195.06 ms: its commit arrives on the compositor thread and is activated.</li>
+    <li><i>3</i>195.26 ms: <code>ScheduledActionDraw</code>. The frame shown for this vsync contains this vsync's DOM. Presented 1.2 ms after the vsync.</li>
+  </ol>
+  <div class="lanes" data-lanes='{"traces":["n-stall-msg-regular"],"titles":["n-stall-msg-regular · after the burst, the vsync at 1994.23 ms"],"from":1993.9,"to":1997.9,"rows":["compositor","mainFrames","app"],"pins":[[1,1994.39,"mainFrames"],[2,1994.55,"compositor"],[3,1995.02,"compositor"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>1,994.39 ms: the main frame begins.</li>
+    <li><i>2</i>1,994.42 ms: the draw, 0.03 ms later. It can only contain the <em>previous</em> vsync's commit.</li>
+    <li><i>3</i>1,995.02 ms: this vsync's commit arrives and is activated, and now waits 16 ms for the next draw.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The same work in a different order: before, commit then draw; after, draw then commit. Every frame after the burst is counted "without the main thread's update", and every value reaches the screen one vsync later than before the stall. Then I look at the other three runs, and the picture is not "a burst makes frames late":</p>
+    <table>
+      <tr><th>Trace</th><th>Frame presented after its vsync: before the stall → after the burst</th><th>Age of a value on screen, median: before → after</th><th><code>main_thread_missed_last_deadline</code></th></tr>
+      <tr><td>regular-table, draw per message</td><td class="num">1.2 → 17.2 ms</td><td class="num">10.5 → 26.4 ms</td><td>false, then true from 1,777.9 ms to the end</td></tr>
+      <tr><td>keyed, per message</td><td class="num">17.4 → 17.4 ms</td><td class="num">27.0 → 26.7 ms</td><td>true before and after</td></tr>
+      <tr><td>keyed, per frame</td><td class="num">17.0 → 1.6 ms</td><td class="num">33.3 → 17.9 ms</td><td>false throughout</td></tr>
+      <tr><td>React, state per message</td><td class="num">16.9 → 1.4 ms</td><td class="num">26.5 → 10.4 ms</td><td>false throughout</td></tr>
+    </table>
+    <p>One run got a vsync later, two got a vsync <em>earlier</em>, one was late all along. Frames counted "without the main update" over the whole run: <b data-m="n-stall-msg-regular/frames.partial"></b>, <b data-m="n-stall-msg-tanstack/frames.partial"></b>, <b data-m="n-stall-raf-tanstack/frames.partial"></b> and <b data-m="n-stall-msg-react/frames.partial"></b>, in the table's order. The main thread is between 4 and 14% busy in all four.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The frame pipeline has two steady states, one vsync apart: the screen shows this vsync's DOM, or the previous one's. Which state a run is in was set by an accident: a main frame that waited behind the burst (regular-table), or the 1.5 s without frames after which the pipeline started afresh (React and the per-frame run, which were in the late state from page load). "Without the main update" names the first form of the late state: the compositor drew before this vsync's commit. It says the draw came first, not that the main thread was slow (Module 2, <a href="frames.html">frames.html</a>). The second form has complete frames that are still presented a vsync later, and no flag.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=1325">cc/scheduler/scheduler_state_machine.cc:1325–1328, 1400–1401</a>
+      <p>To see why, in regular-table's run, one late frame kept the next ones late.</p>
+<pre><span class="n">1325</span>  // If a new or undrawn active tree is pending after the deadline,
+<span class="n">1326</span>  // then the main thread is in a high latency mode.
+<span class="n">1327</span>  <mark>main_thread_missed_last_deadline_ =</mark>
+<span class="n">1328</span>      CommitPending() || has_pending_tree_ || active_tree_needs_first_draw_;
+
+<span class="n">1400</span>  <mark>if (active_tree_needs_first_draw_)</mark>     <span class="c">// in ShouldTriggerBeginImplFrameDeadlineImmediately()</span>
+<span class="n">1401</span>    return true;</pre>
+      <p>A commit that was activated after its vsync's draw is "an undrawn active tree". At the next vsync the compositor draws it immediately (1400), before the new commit can arrive; so that new commit is again undrawn after the deadline (1327). The state feeds itself.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Waiting for the commit</dt><dd>Normally the compositor holds its draw until the main thread's commit for this vsync has arrived, up to a deadline. In regular-table's trace each vsync before the stall has two deadline decisions, <code>LATE</code> then <code>IMMEDIATE</code>; after the burst only <code>IMMEDIATE</code> (Module 2 explains the modes).</dd>
+      <dt>Age on screen</dt><dd>Send time of a value to the presentation of the frame that carries it (Module 7). It is the number that sees both forms of "late".</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I measured the burst by the time its queue took to empty. In the first recording of these scenarios two runs came out a vsync later and I wrote "a burst leaves the pipeline one frame late". The re-recording has one run later, two earlier. The rule I keep is narrower and more useful: after any disturbance compare the steady state before and after, by age on screen; and before comparing two runs at all, check which of the two states each is in. A difference of 16 ms in data age may be the pipeline's state and not my change.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these runs the steady state after a stall and its burst differed from the one before by one vsync of data age in three of four cases, in both directions.</p>
+    <p><b>No:</b> which way it goes, or why the pipeline stays in the late state when the main thread is idle. One headless run each, software compositing. This is Module 2's ground; here it is a cost, or a gift, of a disturbance that I did not expect.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-stall-msg-regular frames 180 215</code> and then <code>… frames 1990 2025</code>: state <code>all</code>, presented about 1.3 ms after the vsync; then state <code>partial</code>, presented about 17.2 ms after. The same two commands on <code>n-stall-msg-react</code> give 16.9 ms, then 1.3 ms, both <code>all</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">After the stall and burst, values reach the screen one vsync later than before in regular-table's run (10.5 → 26.4 ms) and one vsync earlier in two others; the keyed per-message run was late before and after.</li>
+    <li data-kind="read">An active tree left undrawn after the deadline puts the scheduler in high-latency mode and is drawn immediately at the next vsync (scheduler_state_machine.cc:1327, 1400).</li>
+    <li data-kind="rejected">"A burst leaves the frame pipeline one frame late": a re-recording moved two of four runs the other way.</li>
+  </ul>
+  <p class="next" data-answer="burst"><b>Next question →</b> A stall ends. What about a link that works all the time, but is too narrow for the stream?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · A narrow link" data-title="More arrives than leaves" data-node="app sockbuf link"
+  data-ask="stop|Between the server's code and my handler: who can tell whom to stop, and who cannot?">
+  <p class="holding"><span class="label">Question I hold</span><span>2,000 messages a second of about 62 bytes are close to a megabit. The link passes 256 kbit/s. Arrivals are four times the service rate. Where does the difference go, second by second?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>n-bw-256-ticks</code>, three seconds. The stream had been running for about a second when the trace started. I put the proxy's counter and the server's socket counter under each other, and compute what neither shows: bytes the server has sent and the page has not handled, minus the two counters.</p>
+  </div></div>
+  <div class="tracelink" data-trace="n-bw-256-ticks"></div>
+  <div class="lanes" data-lanes='{"traces":["n-bw-256-ticks"],"from":0,"to":3000,"rows":["backendTicks","marks","frames"],"counters":["netem queued bytes (to page)","ticks socket buffered bytes"],"pins":[[1,800,"backendTicks"],[2,800,"marks"],[3,1650,"marks"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The server: 2,000 messages a second, evenly.</li>
+    <li><i>2</i>The page: <b data-m="n-bw-256-ticks/ticks.perSecondHandled"></b> a second, evenly: 32,000 bytes ÷ 62. Each one older than the last.</li>
+    <li><i>3</i>1,650 ms: the proxy's queue reaches 256 KB and it stops reading from the server (first counter). The server's own counter (second) does not move: every sample is 0 (the chart cannot scale to 0 and labels it 1).</li>
+  </ol>
+  <table>
+    <tr><th>At</th><th>Sent, not yet handled</th><th>in the proxy (counter)</th><th>in the server process (counter)</th><th>left over: in no counter</th></tr>
+    <tr><td>0 ms</td><td class="num">95 KB</td><td class="num">97 KB</td><td class="num">0</td><td class="num">≈ 0</td></tr>
+    <tr><td>1,000 ms</td><td class="num">185 KB</td><td class="num">191 KB</td><td class="num">0</td><td class="num">≈ 0</td></tr>
+    <tr><td>1,650 ms</td><td class="num">244 KB</td><td class="num">252 KB</td><td class="num">0</td><td class="num">≈ 0</td></tr>
+    <tr><td>2,000 ms</td><td class="num">276 KB</td><td class="num">247 KB</td><td class="num">0</td><td class="num">29 KB</td></tr>
+    <tr><td>2,500 ms</td><td class="num">321 KB</td><td class="num">231 KB</td><td class="num">0</td><td class="num">90 KB</td></tr>
+    <tr><td>3,000 ms</td><td class="num">367 KB</td><td class="num">215 KB</td><td class="num">0</td><td class="num">151 KB</td></tr>
+  </table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The backlog grows by 92 KB a second: 124 KB arrive, 32 KB leave. Until 1,650 ms all of it is in the proxy. Then the proxy stops reading, its queue slowly falls, and the surplus goes somewhere that has no counter: the kernel's socket buffers between the server and the proxy (place 2's second half). The server's <code>bufferedAmount</code> is <b data-m="n-bw-256-ticks/backend.socketBufferedMaxKb"></b> KB at its highest.</p>
+    <p>Age: the median of the first half of the messages is <b data-m="n-bw-256-ticks/ticks.ageFirstHalf"></b> ms, of the second half <b data-m="n-bw-256-ticks/ticks.ageSecondHalf"></b> ms. It grows by 0.75 ms every millisecond (1 − 502 ÷ 2,000), and nothing in sight will stop it.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Utilisation ρ</dt><dd>Arrival rate ÷ service rate. Here 2,000 ÷ 502 ≈ 4. Above 1 the queue grows by (arrivals − service) for as long as it lasts.</dd>
+      <dt>A queue's size in time</dt><dd>Bytes waiting ÷ bytes leaving per second. The proxy's 256 KB in front of a 32 KB/s link is <em>eight seconds</em> of data. The same buffer in front of a 4 MB/s link is 64 ms.</dd>
+      <dt>Bufferbloat</dt><dd>A large buffer before a slow link does not lose anything. It converts overload into delay, silently.</dd>
+    </dl></div>
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/server/netem.mjs:76–77, 55</span>
+      <p>The proxy's push-back: this is the lab's stand-in for a receiver that closes its TCP window. "The window sent in each segment indicates the range of sequence numbers the sender of the window (the data receiver) is currently prepared to accept" (read: RFC 9293 §3.8.6).</p>
+<pre><span class="n">76</span>      queued += chunk.length;
+<span class="n">77</span>      <mark>if (queued > HIGH_WATER) from.pause();</mark>
+<span class="n">55</span>      if (queued &lt;= HIGH_WATER / 2 &amp;&amp; from.isPaused()) from.resume();   <span class="c">// in release()</span></pre>
+    </div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with ρ = 4 the queue grows without bound; it fills the places in order from the bottleneck backwards (proxy, then kernel); after three seconds the server's own code has seen nothing.</p>
+    <p><b>No:</b> that the server would never see it. Step 11 measures how much the kernel takes before it does: megabytes. At 92 KB a second that is the better part of a minute away.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>In Perfetto, expand <code>Backend (node)</code> and look at the two counter tracks side by side: one climbs to 262,000 and then sinks slowly, the other is a flat zero. Then <code>node lab/harness/q.mjs n-bw-256-ticks summary</code> and find <code>ageFirstHalf</code>, <code>ageSecondHalf</code> under <code>ticks</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">256 kbit/s under a 990 kbit/s stream: backlog +92 KB/s; first all in the proxy (to 256 KB at 1,650 ms), then 151 KB more in a place without a counter; the server's bufferedAmount stays 0.</li>
+    <li data-kind="measured">Data age grows 0.75 s per second: 1.3 s (first half) → 2.5 s (second half), 3.0 s at the end.</li>
+    <li data-kind="inferred">The uncounted bytes are in the kernel's socket buffers between server and proxy.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Two standard remedies: the server sends less (conflation), or the server skips a send when its socket is already full (drop). Which one bounds the age here?</p>
+</section>
+
+<section class="step" data-part="D · A narrow link" data-title="Two remedies at 256 kbit/s: one works, one never fires" data-node="app sockbuf link policy">
+  <p class="holding"><span class="label">Question I hold</span><span>Same link, same 2,000 updates a second. Once with <code>conflate=50</code> (latest value per cell, one message every 50 ms), once with <code>dropAbove=16384</code> (skip a send while the socket holds more than 16 KB). What happens to the age?</span></p>
+  <div class="predict" data-right="a"><span class="label">Predict first</span>
+    <p>The drop rule: before each send, the server looks at <code>ws.bufferedAmount</code> and skips the message if it is above 16 KB. On this link that should give:</p>
+    <div class="opts">
+      <button data-k="a">Nothing. The same age as without the rule.</button>
+      <button data-k="b">Age bounded at about half a second: 16 KB at 32 KB/s.</button>
+      <button data-k="c">Age near zero, with most values skipped.</button>
+    </div>
+    <div class="reveal"><p><b>a.</b> The rule never fired. The number it looks at was 0 for the whole run, as step 9 showed for the run without it.</p></div>
+  </div>
+  <table class="mtable" data-rows="n-bw-256-ticks,n-bw-256-drop,n-bw-256-conflate" data-names="every update sent,dropAbove=16384,conflate=50" data-head="256 kbit/s · server policy"
+    data-hi="n-bw-256-drop:ticks.ageSecondHalf,n-bw-256-conflate:ticks.ageSecondHalf,n-bw-256-drop:backend.socketBufferedMaxKb"
+    data-cols="ticks.perSecondHandled|messages handled per second,ticks.ageFirstHalf|age when handled · first half|ms,ticks.ageSecondHalf|second half|ms,ticks.ageWhenApplied.p50|age when in the DOM|ms,backend.socketBufferedMaxKb|server's bufferedAmount · max|KB,state.ticks.gaps|sequence jumps seen by the page"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Drop</b> is the run without it, to the millisecond: same rate, same growing age, no sequence jump, because <code>bufferedAmount</code> never exceeded 16 KB. It never exceeded 0.</p>
+    <p><b>Conflation</b> works: 20 messages a second of about 335 bytes are 6.7 KB/s into a 32 KB/s link, ρ = 0.2. A message is handled 1.4 ms after it was sent, and a value is at most one flush interval older than that. What it costs: 2,000 updates a second go into the server's map, 24 cells × 20 flushes = 480 values a second come out. Three quarters of the values were never sent. For a cell that shows a current price that is the point. For a log of every trade it would be data loss. (Under conflation the page's gap counter is switched off, <code>ticks.ts:72</code>: its 0 means "not counted".)</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/server/backend.mjs:122–123 · lab/node_modules/ws/lib/websocket.js:141–145 (ws 8.23.0)</span>
+      <p>What exactly does the drop rule look at?</p>
+<pre><span class="n">122</span>  const send = (updates, t, first) => {
+<span class="n">123</span>    <mark>if (dropAbove &amp;&amp; ws.bufferedAmount > dropAbove) return void skipped++;</mark>
+
+<span class="n">141</span>  get bufferedAmount() {
+<span class="n">144</span>    return <mark>this._socket._writableState.length + this._sender._bufferedBytes</mark>;</pre>
+      <p>Bytes that Node's stream and the <code>ws</code> sender still hold <em>in the process</em>. Whatever the kernel has accepted is no longer counted. The kernel accepted everything.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Conflation</dt><dd>Replace queued values of the same key by the newest. It lowers the arrival rate itself, so the queue never forms (Module 7 has the mechanism).</dd>
+      <dt>Tail drop on a gauge</dt><dd>Refuse new items when a measured queue is long. It can only be as good as the gauge: here the gauge sits before megabytes of unmeasured queue.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed "check <code>bufferedAmount</code> before you send, and the backlog is bounded". The counter read 0 while the screen went three seconds stale. The rule I keep: the sender's gauge sees the <em>last</em> queue on the path to fill, the only unbounded one. The bounded queues after it (its kernel, proxies, the receiver's kernel) fill first, in silence, and they hold megabytes. Age is bounded by a signal measured in time, at the receiver.</p></div>
+  <p class="note"><b>Instrument note.</b> If you open the counter <code>netem queued bytes (to page)</code> in <code>n-bw-256-conflate</code> you may see a line that starts above 100 KB and falls by 32 KB a second. That is not this scenario's queue. The counter has one name for all connections (step 2, pin 6), and the proxy was still releasing the queue of the previous scenario's connection, recorded on the same server. This scenario's own values are the ones near zero. For the same reason I do not quote <code>backend.netemQueuedMaxKb</code> for this trace.</p>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on this link conflation to 20 messages a second keeps age at a few milliseconds plus the flush interval; a drop rule on the sender's <code>bufferedAmount</code> did nothing in three seconds.</p>
+    <p><b>No:</b> that conflation always fits. Its interval is fixed at 50 ms; on a link eight times narrower the same 6.7 KB/s would overflow too. It does not know the link either; it was simply small enough.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-bw-256-ticks summary</code> and the same for <code>n-bw-256-drop</code>: under <code>ticks</code>, <code>ageFirstHalf</code> and <code>ageSecondHalf</code> agree to within 10 ms; under <code>backend</code>, <code>socketBufferedMaxKb</code> is 0 in both.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Conflating to one message per 50 ms: 6.7 KB/s into 32 KB/s, age 1.4 ms when handled; three quarters of the values never sent.</li>
+    <li data-kind="rejected">"Skipping sends above 16 KB of bufferedAmount bounds the backlog": the gauge read 0 all run; the trace is identical to the one without the rule.</li>
+    <li data-kind="read">ws.bufferedAmount counts only bytes still in the Node process (websocket.js:141–145).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> So when does the sender's gauge move, and what does the drop rule buy once it does?</p>
+</section>
+
+<section class="step" data-part="D · A narrow link" data-title="Make the sender feel it" data-node="app sockbuf link policy">
+  <p class="holding"><span class="label">Question I hold</span><span>At 256 kbit/s the trace ends long before the queue reaches the server's code. I speed everything up: a stream that jumps from 27 KB/s to about 19 MB/s into a 4 MB/s link, inside the trace, with and without the drop rule. In which order do the queues fill, and what is the age then?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Two scenarios of my own, <code>n-flood-ticks</code> and <code>n-flood-drop</code>: messages of 2,000 cells (24 KB), one a second at first; at 305 ms the page asks for 800 a second. The link is 32 Mbit/s. Each was recorded on a fresh server, so the proxy's counter is clean.</p>
+  </div></div>
+  <div class="tracelink" data-trace="n-flood-ticks"></div>
+  <div class="tracelink" data-trace="n-flood-drop"></div>
+  <div class="lanes" data-lanes='{"traces":["n-flood-ticks","n-flood-drop"],"titles":["n-flood-ticks · every message sent","n-flood-drop · a send is skipped while the socket holds more than 16 KB"],"from":0,"to":3500,"rows":["backendTicks","marks"],"counters":["netem queued bytes (to page)","ticks socket buffered bytes"],"pins":[[1,305,"backendTicks",0],[2,548,"marks",0],[3,3300,"marks",0],[4,2062,"marks",1],[5,2637,"marks",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>305 ms: <code>rate → 800/s</code>. The proxy's counter (first line chart) is at its mark within 60 ms.</li>
+    <li><i>2</i>548 ms: the server's <code>bufferedAmount</code> (second line chart) leaves zero for the first time, 243 ms after the flood began. From there it climbs by about 16 MB a second: what the server produces minus what the link carries away.</li>
+    <li><i>3</i>By the end of the window it holds <b data-m="n-flood-ticks/backend.socketBufferedMaxKb"></b> KB, and the page is handling messages <b data-m="n-flood-ticks/ticks.ageWhenHandled.max"></b> ms old.</li>
+    <li><i>4</i>With the drop rule, 2,062 ms: the page sees its first hole, sequence 289 → 306. The server made it at about 665 ms; it took 1.4 s to come through.</li>
+    <li><i>5</i>2,637 ms: 402 → 699. Later 761 → 1,047. Holes of nearly 300 messages: a third of a second of updates gone at a time.</li>
+  </ol>
+  <table class="mtable" data-rows="n-flood-ticks,n-flood-drop" data-names="every message sent,dropAbove=16384" data-head="≈19 MB/s into 4 MB/s"
+    data-cols="backend.socketBufferedMaxKb|server's bufferedAmount · max|KB,ticks.ageFirstHalf|age when handled · first half|ms,ticks.ageSecondHalf|second half|ms,ticks.ageWhenHandled.max|oldest|ms,state.ticks.gaps|sequence jumps (to the snapshot after the trace)"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>The order of filling.</b> Proxy first (60 ms), then a place without a counter, then the server's process. When the server's gauge first moved, the server had sent about 4.4 MB more than the page had handled and the proxy held 0.3 MB: some 4 MB had gone into the kernel's socket buffers. (On this machine the kernel's send buffer may grow to 4 MB: <code>tcp_wmem</code> is "4096 16384 4194304".) That is the queue step 9 could not reach in three seconds.</p>
+    <p><b>Without the rule</b> the last queue, the one in the process, takes the whole surplus from then on, tens of megabytes in three seconds, and the age grows 0.8 s per second.</p>
+    <p><b>With the rule</b> the server's memory is bounded: its gauge never shows more than one message. The age stops growing, at about 1.5 to 1.8 s. Not at zero: every message the server does send joins a line of 4 to 6 MB that is already past it, and that line leaves at 4 MB/s.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>One law covers steps 9 to 11: <b>age ≈ bytes queued ahead ÷ service rate</b>. A bounded queue bounds memory. It bounds age only if its bound is small <em>in time at the link's rate</em>, and the buffers between a sender and a slow link are sized in megabytes by people who never saw this link. The drop rule bounded what it could see. What it could not see was already 1.5 s long.</p>
+    <p>And the answer to step 2's question. The bytes pile up from the bottleneck backwards: link, kernel buffers, and last the sender's process, which is the only one without a bound. Of these a trace shows the first and the last.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the sender's gauge moves only after every bounded queue behind it is full (here about 4 MB); a drop rule on that gauge bounds the sender's memory and makes age level off at (bytes already downstream) ÷ (link rate).</p>
+    <p><b>No:</b> that 4 MB or 1.7 s are constants. They are this kernel's loopback buffers (two connections) and this rate. The 4 MB is a subtraction, not a counter. One run each.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A proposal: the receiver reports back what it has applied (a sequence number, or the age it measured), and the sender keeps the unacknowledged window below a target <em>in time</em>, conflating into it. That is a queue bound at every stage, set where the latency is seen. <code>bufferedAmount</code> stays as a last-resort memory guard, not as the control.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-flood-drop slices 'tick message' 2040 2080</code>: the sequence numbers run to 289 and continue at 306. In Perfetto, the counter <code>ticks socket buffered bytes</code> of <code>n-flood-ticks</code> is flat until 548 ms and then a ramp.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">A 19 MB/s flood into 4 MB/s: proxy full after 60 ms, server's bufferedAmount moves after 243 ms, then grows by the whole surplus (about 16 MB/s).</li>
+    <li data-kind="inferred">About 4 MB disappeared into kernel socket buffers before the sender's gauge moved (sent − handled − counters).</li>
+    <li data-kind="measured">With dropAbove the server's buffer stays under one message and age levels off at 1.5–1.8 s, not zero; values are lost in runs of about 300 messages.</li>
+    <li data-kind="inferred">Age ≈ bytes queued ahead ÷ service rate; a bound in bytes bounds age only if it is small in time at the link's rate.</li>
+  </ul>
+  <p class="next" data-answer="where"><b>Next question →</b> So far every queue held small messages of equal worth. What if one big thing is in the line, and something urgent is behind it?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · Order" data-title="Eight replies on one ordered connection" data-node="link policy screen">
+  <p class="holding"><span class="label">Question I hold</span><span>I drag the scrollbar thumb. The page asks for eight ranges within 0.9 s; the server answers each within 0.03 ms. Each reply is 200 KB, and the link carries 4 Mbit/s, so a reply takes 0.4 s on the wire. When do I see the rows of the place where I let go?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Only the reply to the <em>last</em> request is of any use: the others are for places the thumb passed. How long after it was asked is it handled?</p>
+    <div class="opts">
+      <button data-k="a">About 0.4 s: the server answered at once, and it is one reply's worth of bytes.</button>
+      <button data-k="b">About 0.9 s: it shares the link with the others.</button>
+      <button data-k="c">About 2.3 s: it waits for all seven before it.</button>
+    </div>
+    <div class="reveal"><p><b>c.</b> The useful reply was ready on the server 1.3 ms after the request and was handled <b data-m="n-hol-every-tanstack/ws.downMs.max"></b> ms after that. In between it stood behind seven replies nobody wanted any more.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>n-hol-every-tanstack</code> (mine): our source asking for every range, plus a stream of 50 small updates a second on its own socket. Under it <code>n-hol-regular</code>, the shared scenario with the same replies and link, where regular-table's draw loop keeps one request in flight.</p>
+  </div></div>
+  <div class="tracelink" data-trace="n-hol-every-tanstack"></div>
+  <div class="tracelink" data-trace="n-hol-regular"></div>
+  <div class="lanes" data-lanes='{"traces":["n-hol-every-tanstack","n-hol-regular"],"titles":["n-hol-every-tanstack · every range asked for, one socket for rows, another for ticks","n-hol-regular · one request in flight"],"from":-50,"to":3400,"rows":["inputs","backendQuery","app","marks"],"pins":[[1,122.6,"app",0],[2,905.6,"backendQuery",0],[3,395,"app",0],[4,3207.5,"app",0],[5,1800,"marks",0],[6,345,"app",1],[7,1522,"app",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>122.6 ms: the first request (┃). Seven more follow, the last at 905.6 ms.</li>
+    <li><i>2</i>The server lane: eight query spans, each done about 1.3 ms after its request. By 907 ms the server has nothing left to do.</li>
+    <li><i>3</i>395 ms: the first reply is handled (light bar: <code>JSON.parse</code> of 200 KB).</li>
+    <li><i>4</i>3,207.5 ms: the eighth reply; ◆ right rows. 2.3 s after the mouse was released.</li>
+    <li><i>5</i>The tick stream on the other socket: a mark every 20 ms, all through.</li>
+    <li><i>6</i>One in flight: a request leaves only when the previous reply is in. Four requests in all.</li>
+    <li><i>7</i>1,522 ms: ◆ 0.6 s after release.</li>
+  </ol>
+  <table>
+    <tr><th>Request</th><th>asked at</th><th>server done after</th><th>handled at</th><th>server done → handled</th></tr>
+    <tr><td>#2</td><td class="num">123 ms</td><td class="num">1.4 ms</td><td class="num">395 ms</td><td class="num">271 ms</td></tr>
+    <tr><td>#3</td><td class="num">225</td><td class="num">1.3</td><td class="num">798</td><td class="num">572</td></tr>
+    <tr><td>#4</td><td class="num">339</td><td class="num">1.3</td><td class="num">1,322</td><td class="num">982</td></tr>
+    <tr><td>#5</td><td class="num">455</td><td class="num">1.3</td><td class="num">1,658</td><td class="num">1,201</td></tr>
+    <tr><td>#6</td><td class="num">572</td><td class="num">1.3</td><td class="num">2,051</td><td class="num">1,477</td></tr>
+    <tr><td>#7</td><td class="num">676</td><td class="num">1.3</td><td class="num">2,445</td><td class="num">1,767</td></tr>
+    <tr><td>#8</td><td class="num">788</td><td class="num">1.3</td><td class="num">2,912</td><td class="num">2,122</td></tr>
+    <tr><td>#9</td><td class="num">906</td><td class="num">1.3</td><td class="num">3,208</td><td class="num">2,301</td></tr>
+  </table>
+  <table class="mtable" data-rows="n-hol-every-tanstack,n-hol-regular" data-names="every range (8 in flight),one in flight (regular-table)" data-head="200 KB replies · 4 Mbit/s"
+    data-cols="ws.requests|requests,ws.downMs.p50|server done → handled · median|ms,ws.downMs.max|longest|ms,content.settleMs|release → right rows|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Replies are handled 0.3 to 0.5 s apart, the time one of them needs on the wire, whatever the server did. The wait of the k-th grows by one reply's transfer time each. This is <b>head-of-line blocking</b>: on an ordered stream, whatever is at the front holds everything behind it, however urgent or however small.</p>
+    <p>The tick stream on its own socket did not wait: handled <b data-m="n-hol-every-tanstack/ticks.ageWhenHandled.p50"></b> ms after sending (median), <b data-m="n-hol-every-tanstack/ticks.ageWhenHandled.max"></b> ms at worst, while the row replies stood in line for seconds.</p>
+    <p>With one request in flight there is nothing to stand behind. Each reply still costs its 0.4 s, and the page asked for only four of the positions it passed.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">RFC 6455 §5.4 (Fragmentation) · RFC 9293 §2.2</span>
+      <p>Could reply #9 have overtaken the others on the same WebSocket? Not by the protocol:</p>
+<pre>o  Message fragments MUST be delivered to the recipient in the order
+   sent by the sender.
+o  The fragments of one message MUST NOT be interleaved between the
+   fragments of another message unless an extension has been
+   negotiated that can interpret the interleaving.</pre>
+      <p>A WebSocket has no stream numbers: one message at a time, whole, in order, over TCP's one ordered byte stream. Only control frames (ping, close) may be injected in the middle of a fragmented message. Read, not measured: the proxy enforces the same thing by its rate rule.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>The lab uses two sockets</dt><dd><code>/ws/rows</code> and <code>/ws/ticks</code> are separate connections (<code>source.ts:63</code>, <code>ticks.ts:49</code>). That is why the ticks were not behind the replies.</dd>
+      <dt>What the model flatters</dt><dd>The proxy gives every connection its own 4 Mbit/s (step 2). On a real narrow link the two sockets would share the bandwidth; the ticks would slow down, but would still not be tied to the order of the big replies.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on one ordered connection a reply waits for every byte sent before it; a fast server does not help; a separate connection is a separate line.</p>
+    <p><b>No:</b> that <code>n-hol-regular</code> shows head-of-line blocking, as its description suggests. With one request in flight nothing is ever behind anything; it shows the transfer time of one large reply (<b data-m="n-hol-regular/ws.downMs.p50"></b> ms).</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A proposal: large window replies and small live updates do not share an ordered stream (two connections, or a transport with independent streams). A large reply is sent in pieces that can be abandoned between pieces when the view has moved. And one pull in flight, which removes the line entirely.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-hol-every-tanstack marks 'ws round trip'</code>: eight lines whose durations climb 273, 573, 984, 1,202, 1,479, 1,769, 2,124, 2,302 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Eight 200 KB replies on one connection at 4 Mbit/s: the k-th is handled about k × 0.4 s after the first request; the last, the only useful one, 2.3 s after it was ready on the server.</li>
+    <li data-kind="measured">Small updates on a second socket were not delayed (1.5 ms); with one request in flight nothing queues (0.6 s to right rows instead of 2.3 s).</li>
+    <li data-kind="read">WebSocket messages cannot interleave or overtake (RFC 6455 §5.4) on TCP's in-order byte stream (RFC 9293 §2.2).</li>
+    <li data-kind="rejected">"n-hol-regular shows replies stacking up": one in flight leaves nothing to block.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Order also has a price when nothing is big: what does an ordered stream do with a delay that varies from message to message?</p>
+</section>
+
+<section class="step" data-part="E · Order" data-title="Jitter on an ordered stream" data-node="link handler screen">
+  <p class="holding"><span class="label">Question I hold</span><span>60 messages a second, each delayed by 80 ± 60 ms. Taken alone, a message would need between 20 and 140 ms, 80 on average. What arrives at the page?</span></p>
+  <div class="tracelink" data-trace="n-jitter-ticks"></div>
+  <div class="lanes" data-lanes='{"traces":["n-jitter-ticks"],"from":0,"to":700,"rows":["backendTicks","marks","frames"],"pins":[[1,309.1,"backendTicks"],[2,443.3,"marks"],[3,376.1,"backendTicks"],[4,459.5,"marks"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The server sends evenly, every 17 ms. This message leaves at 309.1 ms and draws a long delay.</li>
+    <li><i>2</i>It is handled at 443.3 ms, 134 ms old. Nothing sent after it could arrive before it: the next one, sent 17 ms later, follows 0.2 ms behind.</li>
+    <li><i>3</i>Three messages sent at 343.1, 359.1 and 376.1 ms …</li>
+    <li><i>4</i>… are handled together between 457.15 and 457.40 ms: the first had the longest delay and the other two were waiting behind it.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <table>
+      <tr><th></th><th>median</th><th>95th percentile</th><th>longest</th></tr>
+      <tr><td>Time between two sends, at the server</td><td class="num">17.0 ms</td><td class="num">17.1 ms</td><td class="num">17.2 ms</td></tr>
+      <tr><td>Time between two arrivals, at the page</td><td class="num">0.8 ms</td><td class="num">65.6 ms</td><td class="num">89.4 ms</td></tr>
+    </table>
+    <p>Half of the gaps at the page (78 of 149) are under a millisecond, and 35 are over 30 ms: the even stream arrives in clumps. And the age is not 80 ms: the median is <b data-m="n-jitter-ticks/ticks.ageWhenHandled.p50"></b> ms, the 95th percentile <b data-m="n-jitter-ticks/ticks.ageWhenHandled.p95"></b> ms, the freshest message 30.3 ms. The order is kept: <b data-m="n-jitter-ticks/state.ticks.gaps"></b> sequence jumps.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>A message's delay on an ordered stream is the larger of its own and what is left of its predecessor's. Every long delay is paid by the messages behind it too; a short one helps nobody. So the stream's typical delay moves from the middle of the jitter range (80) toward its top (140). On an ordered stream, variance in delay becomes delay.</p>
+    <p>For the applier: a clump is two to six messages inside one frame. Applied per message they are separate tasks and separate DOM writes for one picture; applied per frame they merge, which is the per-frame policy's real use (Module 7). Either way the screen changes in steps of up to 89 ms: the rhythm the user sees is the link's.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> jitter on an ordered stream gives clumps and a typical age well above the average delay.</p>
+    <p><b>No:</b> that real jitter looks like this. Here each message draws its delay independently and uniformly; real paths change delay in bursts, and loss adds whole retransmission timeouts.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs n-jitter-ticks slices 'tick message' 300 460</code>: marks at 314.67, 353.97, 366.73, then 443.32 and 443.54, then three within 0.25 ms at 457.15–457.40.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">80 ± 60 ms on an ordered stream: half of the arrivals under 1 ms apart, gaps up to 89 ms; median age 97 ms, not 80; order kept.</li>
+    <li data-kind="inferred">On an ordered stream each message's delay is the maximum of its own and its predecessor's: variance becomes delay.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> In every case so far the slow part was the link. What if the link is fine and the page is the slow one: who tells the server?</p>
+</section>
+
+<!-- ═════════════════════════ PART F ═════════════════════════ -->
+
+<section class="step" data-part="F · Backpressure" data-title="The page is the slow one: who tells the server?" data-node="netsvc pipe taskq handler app sockbuf">
+  <p class="holding"><span class="label">Question I hold</span><span>8,000 messages a second arrive for a page that can handle about 6,000. No proxy, a perfect link. A second later a few thousand messages are waiting somewhere. Where?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>Module 7's overload trace, <code>s-msg-8000-regular</code>. At 1.3 s the server has sent about 3,600 messages more than our handler has seen. They are:</p>
+    <div class="opts">
+      <button data-k="a">All in the main thread's task queue, as 3,600 waiting tasks.</button>
+      <button data-k="b">About 2,200 inside the renderer; the rest still in the kernel's socket buffers; none in the server's process.</button>
+      <button data-k="c">In the server's <code>bufferedAmount</code>: the server is the one that is ahead.</button>
+    </div>
+    <div class="reveal"><p><b>b.</b> The renderer's share stops growing at about 2,200 messages, which is the size of a pipe. The server's gauge reads <b data-m="s-msg-8000-regular/backend.socketBufferedMaxKb"></b>.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I use the arrows of step 1. For every 100 ms I count the messages the network service has announced to the renderer (<code>Send mojo message</code> on its IO thread) and the ones the main thread has received (the arrow's other end). The difference is what is inside the renderer, places 5 and 6. I read the trace up to 1,300 ms; after that the recording was ending.</p>
+  </div></div>
+  <div class="tracelink" data-trace="s-msg-8000-regular"></div>
+  <div class="lanes" data-lanes='{"traces":["s-msg-8000-regular"],"from":0,"to":1400,"rows":["backendTicks","marks","mainFrames"],"counters":["ticks socket buffered bytes"],"pins":[[1,600,"backendTicks"],[2,600,"marks"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The server: 8,000 a second. Its socket counter below: flat zero.</li>
+    <li><i>2</i>The page: about <b data-m="s-msg-8000-regular/ticks.perSecondHandled"></b> a second.</li>
+  </ol>
+  <table>
+    <tr><th>During</th><th>network service announces</th><th>main thread receives</th><th>inside the renderer at the end</th><th>an announced message waits (median)</th></tr>
+    <tr><td>0–100 ms</td><td class="num">800</td><td class="num">638</td><td class="num">1,214</td><td class="num">141 ms</td></tr>
+    <tr><td>200–300</td><td class="num">803</td><td class="num">684</td><td class="num">1,538</td><td class="num">186 ms</td></tr>
+    <tr><td>400–500</td><td class="num">798</td><td class="num">504</td><td class="num">2,026</td><td class="num">232 ms</td></tr>
+    <tr><td>600–700</td><td class="num">670</td><td class="num">633</td><td class="num">2,145</td><td class="num">291 ms</td></tr>
+    <tr><td>800–900</td><td class="num">718</td><td class="num">692</td><td class="num">2,214</td><td class="num">332 ms</td></tr>
+    <tr><td>1,000–1,100</td><td class="num">621</td><td class="num">624</td><td class="num">2,211</td><td class="num">336 ms</td></tr>
+    <tr><td>1,200–1,300</td><td class="num">603</td><td class="num">614</td><td class="num">2,210</td><td class="num">348 ms</td></tr>
+  </table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>For the first 500 ms the network service passes on everything the server sends, 800 per 100 ms, and the renderer's backlog grows. Above 2,100 messages it stops growing. From then on the network service announces only as many as the main thread takes, about 650 per 100 ms. It has been slowed to the page's pace.</p>
+    <p>2,210 messages of 63 bytes are 139 KB. The pipe is 131,000 bytes, 2,080 messages; the other 130 are frames the network service had already read from the socket and announced when it found the pipe full (it announces first, line 417 below, then writes).</p>
+    <p>The server kept sending 8,000 a second. By 1.3 s it was about 1,400 messages ahead of what the network service had read. Those are in the kernel's buffers, place 4 and place 2; the server's own gauge is zero.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:services/network/websocket.cc;l=840">services/network/websocket.cc:69–70, 417–421, 840–846</a> · <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:net/websockets/websocket_channel.cc;l=630">net/websockets/websocket_channel.cc:630</a>
+      <p>Where the plateau comes from: the one place between a socket and JavaScript where Chrome says "stop".</p>
+<pre><span class="n"> 69</span>  constexpr uint32_t kReceiveDataPipeCapacity =
+<span class="n"> 70</span>      BUILDFLAG(IS_ANDROID) ? 1 &lt;&lt; 16 : <mark>131000</mark>;
+
+<span class="n">417</span>    impl_->client_->OnDataFrame(fin, OpCodeToMessageType(type), payload.size());   <span class="c">// announce</span>
+<span class="n">419</span>      impl_->pending_data_frames_.push(payload);
+<span class="n">421</span>    impl_->SendPendingDataFrames(InterruptionReason::kNone);                       <span class="c">// then write</span>
+
+<span class="n">840</span>      SendDataFrame(&amp;data_frame);
+<span class="n">841</span>      <mark>if (data_frame.size() > 0) {</mark>                    <span class="c">// the pipe did not take all of it</span>
+<span class="n">842</span>        // Mojo doesn't have any write buffer so far.
+<span class="n">843</span>        writable_watcher_.ArmOrNotify();
+<span class="n">845</span>        incoming_frames_interrupted_ = InterruptionReason::kMojoPipe;
+<span class="n">846</span>        <mark>return;</mark>
+
+<span class="n">630</span>    <mark>while (!event_interface_->HasPendingDataFrames()) {</mark>   <span class="c">// websocket_channel.cc: read the socket only while nothing is pending</span></pre>
+    </div>
+    <div class="box file"><span class="label">And on the page's side</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/dom_websocket.cc;l=84">third_party/blink/renderer/modules/websockets/dom_websocket.cc:84–88</a> · <span class="path">websocket_channel_impl.cc:535–538</span>
+<pre><span class="n">84</span>  void DOMWebSocket::EventQueue::Dispatch(Event* event) {
+<span class="n">86</span>      case kActive:
+<span class="n">88</span>        <mark>target_->DispatchEvent(*event);</mark>     <span class="c">// the message event: at once, no questions</span></pre>
+      <p>Blink has a switch that stops consuming frames (<code>ApplyBackpressure()</code>, 535). Its three callers are in <code>websocket_stream.cc</code> (199, 217, 681), the <code>WebSocketStream</code> API. The classic <code>WebSocket</code> never calls it. A <code>message</code> handler cannot refuse a message; it can only be slow.</p>
+    </div>
+  </div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <table>
+      <tr><th>Who</th><th>can say "stop" to</th><th>how</th><th>evidence</th></tr>
+      <tr><td>our <code>onmessage</code></td><td>nobody</td><td>only by taking long</td><td>read (dom_websocket.cc:88)</td></tr>
+      <tr><td>the renderer</td><td>the network service</td><td>the 131,000-byte pipe is full</td><td>measured: plateau at about 2,210 messages</td></tr>
+      <tr><td>the network service</td><td>the kernel</td><td>it stops reading the socket</td><td>read (websocket_channel.cc:630); measured: its rate falls to the page's</td></tr>
+      <tr><td>the receiving kernel</td><td>the sending kernel</td><td>TCP's window closes</td><td>read (RFC 9293 §3.8.6); not measured</td></tr>
+      <tr><td>the sending kernel</td><td>Node</td><td>writes stay in the process: <code>bufferedAmount</code> rises</td><td>measured in step 11; not reached here</td></tr>
+      <tr><td>Node</td><td>the server's code</td><td>it does not. <code>ws.send()</code> always accepts. The code must look.</td><td>read (backend.mjs:123); measured in step 11</td></tr>
+    </table>
+    <p>Every stage but two has a bounded buffer and a way to refuse. The two that have neither are the ends: the server's code, which is never refused, and our handler, which cannot refuse. So the unbounded queues are at the ends: the server's memory (step 11) and, in time, the age of what the handler sees. Everything between them only decides how late each end finds out.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> Chrome bounds what a slow page can accumulate from a WebSocket to about the pipe's 131,000 bytes plus one socket read, and then stops reading the socket; the page's task queue held about 350 ms of messages at that point; the server noticed nothing in 1.3 s.</p>
+    <p><b>No:</b> that 131,000 bytes is a small queue. In 63-byte messages it is 2,200 tasks. And I did not see the TCP window itself: no trace event shows it.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>In Perfetto open <code>s-msg-8000-regular</code>, pin <code>Chrome_ChildIOThread</code> of the network service and <code>CrRendererMain</code>, and click a <code>Send mojo message</code> instant near 1,000 ms: its arrow ends about 335 ms to the right. Near 50 ms the same arrow is about 140 ms long.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">A page handling 6,000 of 8,000 msg/s: the renderer's backlog levels off at about 2,210 messages (139 KB), the network service slows to the page's rate, the rest stays in kernel buffers, the server's bufferedAmount is 0.</li>
+    <li data-kind="read">The network service stops reading the socket while a frame does not fit the 131,000-byte data pipe (websocket.cc:69–70, 840–846; websocket_channel.cc:630).</li>
+    <li data-kind="read">A classic WebSocket's message events have no flow control: ApplyBackpressure is called only by WebSocketStream (websocket_channel_impl.cc:535; websocket_stream.cc:199, 217, 681).</li>
+    <li data-kind="inferred">The unbounded queues are at the two ends: the sender's process and the age seen by the handler.</li>
+  </ul>
+  <p class="next" data-answer="stop"><b>Next question →</b> Can I answer the module's questions without scrolling back?</p>
+</section>
+
+<!-- ═════════════════════════ PART G ═════════════════════════ -->
+
+<section class="step" data-part="G · Check" data-title="Check yourself, and what to build" data-node="method policy">
+  <p class="holding"><span class="label">Question I hold</span><span>Seven questions. Answer each before opening it.</span></p>
+  <div class="exercise"><span class="label">1 · A frozen table</span>
+    <p>A live table shows normal numbers, no error, the socket is open. Name two measurements that tell you the link stalled, and say when each can speak.</p>
+    <details><summary>Answer</summary><p>Silence against an expected rate (or a heartbeat): a timer sees it while the stall lasts. The age of the next message, from the send time it carries: only when the burst arrives. Sequence gaps tell you about loss or reordering, not about a stall. (Step 5.)</p></details>
+  </div>
+  <div class="exercise"><span class="label">2 · A buffer's size in time</span>
+    <p>A full 256 KB buffer sits before a 256 kbit/s link. How old is a byte when it leaves? And before a 4 MB/s link?</p>
+    <details><summary>Answer</summary><p>256 KB ÷ 32 KB/s = 8 s. Before 4 MB/s: 64 ms. Age ≈ bytes queued ahead ÷ service rate; the same buffer is harmless or ruinous depending on the link. (Steps 9, 11.)</p></details>
+  </div>
+  <div class="exercise"><span class="label">3 · The gauge that read zero</span>
+    <p>A server skips a send whenever <code>bufferedAmount</code> exceeds 16 KB. On the 256 kbit/s link the data on screen still became three seconds old. Why? And when the rule did fire, on the fast link, why did age settle near 1.7 s and not near zero?</p>
+    <details><summary>Answer</summary><p><code>bufferedAmount</code> counts only bytes still in the server's process. The proxy's 256 KB and then about 4 MB of kernel buffers fill first; at 92 KB/s of surplus that takes most of a minute. When it fires, every message it lets through still joins the megabytes already downstream, which leave at the link's rate. (Steps 10, 11.)</p></details>
+  </div>
+  <div class="exercise"><span class="label">4 · After the scroll stops</span>
+    <p>With one request in flight, how many round trips until the right rows, and why is it not a fixed number? What gets it to one?</p>
+    <details><summary>Answer</summary><p>Between one and two: the rest of the round trip that is in flight for an old range, plus one for the final range. Sending the final range at once (every range, or a second request when the window has settled, or cancel and resend) gives one. Asking ahead can give zero while the guess holds. (Step 4.)</p></details>
+  </div>
+  <div class="exercise"><span class="label">5 · 750 at once</span>
+    <p>How many main-thread tasks, what sets the time to work through them, and why did applying once per frame not shorten it?</p>
+    <details><summary>Answer</summary><p>750 tasks, one message each. Time = N × cost of one message's task ÷ (1 − arrival rate × cost): 20 ms at 20 µs a message, 57 ms at 69 µs, 160 ms when the task contains a draw. Per-frame apply removes DOM writes, but each message is still delivered, parsed and marked in its own task. To shorten it, conflate before the main thread. (Steps 6, 7.)</p></details>
+  </div>
+  <div class="exercise"><span class="label">6 · The reply that could not overtake</span>
+    <p>Eight replies on one WebSocket; only the last matters. Why can it not go first, and what are two designs in which it would not have to wait?</p>
+    <details><summary>Answer</summary><p>A WebSocket delivers whole messages in the order sent, over TCP's ordered byte stream; there are no stream numbers. Designs: one request in flight (nothing to wait behind); a separate connection or independent streams for different kinds of traffic; replies in pieces that can be abandoned. (Step 12.)</p></details>
+  </div>
+  <div class="exercise"><span class="label">7 · The slow page</span>
+    <p>A page handles 6,000 of 8,000 messages a second. After a second, where is the backlog, and what does the server's <code>bufferedAmount</code> read?</p>
+    <details><summary>Answer</summary><p>About 2,200 messages (the 131,000-byte data pipe and one socket read) inside the renderer, waiting about 350 ms; the rest in the kernel's socket buffers, because the network service has stopped reading as fast as the server sends; the server's gauge reads 0. (Step 14.)</p></details>
+  </div>
+  <div class="insight"><span class="label">For a table engine</span>
+    <p>Proposals from this module, to argue with, not decisions:</p>
+    <p><b>1. Bound every queue, in time.</b> Each stage between engine and painter has a limit and a way to refuse, and the limit is stated as "at most t of data at this link's rate" (steps 9–11). The stage with no limit is where the damage will be.</p>
+    <p><b>2. Conflate replaceable state at the source, and before the main thread.</b> Latest value per cell, in the engine and again in a worker on the receiving side, so that a burst reaches the main thread as one batch (steps 7, 10).</p>
+    <p><b>3. Pace by what the receiver reports.</b> The receiver sends back the last sequence it applied or the age it measured; the sender keeps the unacknowledged window small in time. The sender's own buffer gauge is a memory guard only (steps 10, 11, 14).</p>
+    <p><b>4. Report age, and show staleness.</b> Age when handled, when applied, when on screen, with their tails; a heartbeat and a silence timer; rows that are stale or unknown are drawn as such (steps 3, 5).</p>
+    <p><b>5. One pull in flight, with a fast last step.</b> And draw what is cached row by row (steps 3, 4, 12).</p>
+    <p><b>6. Version updates and check order at the receiver.</b> Count gaps and reorders (steps 2, 6).</p>
+    <p><b>7. After a disturbance, measure the steady state again.</b> The frame pipeline can settle a vsync later, or earlier, than before; compare data age on screen, and check which state a run is in before comparing runs (step 8).</p>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> where bytes wait, who can refuse whom, and what each policy did, for these loads, in these recordings.</p>
+    <p><b>No:</b> anything about lossy paths, congestion control between competing flows, or mobile radios: the lab's network delays, limits and stalls, and never loses. The methods carry over (age from the sender's clock, sequence numbers, sent minus handled); the numbers do not.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Seven proposals for the engine: queues bounded in time, conflation before the main thread, pacing by receiver feedback, age and staleness reported, one pull in flight, versioned updates, steady state re-measured after a disturbance.</li>
+  </ul>
+  <p class="next"><b>Next →</b> Module 9 (<a href="perspective.html">Perspective end to end</a>) puts a real engine behind a socket; its scenario with 50 ms of delay uses the proxy read here.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>
