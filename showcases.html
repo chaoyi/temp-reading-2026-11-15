@@ -1,0 +1,866 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The libraries' own showcases · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">10 · The libraries' own showcases</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="source">example code</span><span class="sep">→</span><span data-node="input">input</span><span class="sep">→</span><span data-node="compositor">compositor</span><span class="sep">→</span>
+    <span data-node="frame">main frame</span><span class="sep">→</span><span data-node="js">JavaScript</span><span class="sep">→</span>
+    <span data-node="layout">style + layout</span><span class="sep">→</span><span data-node="paint">paint</span><span class="sep">→</span><span data-node="present">screen</span>
+    <span class="sep">·</span><span data-node="bench">benchmark</span><span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 10 · recorded 2026-11-16</p>
+  <h1>A library shows off a demo and prints a frame rate. What did it measure?</h1>
+  <p class="lede">regular-table ships an example with two billion rows and a benchmark that prints "Throughput (fps)". TanStack Virtual ships a fixed list, a measured list, a 50,000-row table and a benchmark that reports "60 fps, 0 long frames". This module runs those pages as shipped, at pinned revisions, under the same instruments as the rest of the course, and reads each example's code next to its trace.</p>
+  <p>For every showcase the steps answer the same things: what the code sets up, what one unit of work is, where the time goes, what a user would have seen, and what the showcase does not exercise. Three of the benchmark numbers turn out to count something other than frames on a screen. One of them reports a perfect score while the list is blank.</p>
+  <p><b>Why this matters for Tablelab.</b> We will publish numbers for our own engine and compare them with these libraries. A number is only comparable if we know which clock counted it and what was on the screen while it ticked. The study plan asks us to name observation points precisely (DOM completion ≠ rAF ≠ commit ≠ presentation); these traces show what happens when a benchmark does not.</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>) for the trace vocabulary and Module 2 (<a href="frames.html">What happened to each frame?</a>) for frame outcomes. <a href="anatomy.html">Module 3</a> reads both libraries' source in depth; this module quotes only the lines each trace needs. Perspective's own examples are traced in <a href="perspective.html">Module 9</a>.</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57, device scale factor 1.75, viewport 1640 × 860, one traced run per scenario: good for mechanisms, not for ranking libraries. The pages are the upstream examples built by <code>lab/upstream/fetch.sh</code>: regular-table v0.9.2 (<code>52e86bf</code>, examples load the published minified build), TanStack virtual-core 3.19.11 and react-virtual 3.14.26 (<code>11b48e4</code>) with React 19.3.1, built unminified. Bold numbers and tables are read from the traces; plain numbers were read once from this recording.</p>
+  <div class="foot"><button class="primary" data-start>Start: 16 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · What is on show" data-title="Read the shop window before the trace" data-node="source method"
+  data-ask="standing|Faced with any demo or benchmark: what is one unit of work, which clock counted it, and what was on the screen meanwhile?">
+  <p class="holding"><span class="label">Question I hold</span><span>Before recording anything: what did each library choose to show, and what workload does that code really set up?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read each example's source at the pinned revision and write down the three things that decide its cost: how many cells are on screen, what changes when the user scrolls, and who generates the data. Then I record each page with real input, and each benchmark the way its own runner drives it.</p>
+  </div></div>
+  <div class="scroll"><table>
+    <tr><th>Showcase</th><th>What its code sets up</th><th>Traces</th></tr>
+    <tr><td><b>regular-table</b> <code>examples/two_billion_rows</code></td><td><code>NUM_ROWS = 2000000000</code>, <code>NUM_COLUMNS = 1000</code>; every cell made on demand by <code>Intl.NumberFormat</code>; two header levels on both axes</td><td><code>u-rt-2b-scroll</code>, <code>-drag</code>, <code>-diagonal</code></td></tr>
+    <tr><td><b>regular-table</b> <code>benchmarks/</code></td><td>100,000 × 1,000 cells, three header levels, a style listener that reads every cell's text; a Playwright runner that prints "Throughput (fps)"</td><td><code>u-rt-bench-steps</code>, <code>-loop</code>, <code>-wheel</code>, <code>-raf</code></td></tr>
+    <tr><td><b>TanStack Virtual</b> <code>examples/react/fixed</code></td><td>10,000 rows of 35 px in a 400 × 200 px list; a 10,000 × 10,000 grid from two virtualizers on one scroller</td><td><code>u-tv-fixed-rows</code>, <code>-grid</code></td></tr>
+    <tr><td><b>TanStack Virtual</b> <code>examples/react/table</code></td><td>50,000 rows × 8 columns in a real <code>&lt;table&gt;</code>, TanStack Table for sorting, <code>overscan: 20</code></td><td><code>u-tv-table-scroll</code>, <code>-sort</code>, <code>-sort-name</code></td></tr>
+    <tr><td><b>TanStack Virtual</b> <code>examples/react/dynamic</code></td><td>10,000 rows of unknown height, measured as they render; on mount it jumps to the last row</td><td><code>u-tv-dynamic-load</code>, <code>-scrollup</code></td></tr>
+    <tr><td><b>TanStack Virtual</b> <code>benchmarks/</code></td><td>a harness that writes <code>scrollTop</code> once per animation frame and reports "scrollFps"</td><td><code>u-tv-bench-drive</code></td></tr>
+  </table></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/examples/two_billion_rows/two_billion_rows.js#L14-L30">regular-table examples/two_billion_rows/two_billion_rows.js:14–15, 20–30</a>
+      <p>The whole data source of the largest claim. Nothing is stored: a window of values is computed per call.</p>
+<pre><span class="n">14</span>  const NUM_ROWS = <mark>2000000000</mark>;
+<span class="n">15</span>  const NUM_COLUMNS = 1000;
+<span class="n">20</span>  export function dataListener(num_rows, num_columns) {
+<span class="n">21</span>    return (x0, y0, x1, y1) =&gt; ({
+<span class="n">24</span>        row_headers: range(y0, y1, group_header.bind(null, "Row")),
+<span class="n">26</span>        data: range(x0, x1, (x) =&gt;
+<span class="n">27</span>            range(y0, y1, (y) =&gt; <mark>formatter.format(x + y)</mark>),</pre>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/examples/react/fixed/src/main.tsx#L45-L50">TanStack Virtual examples/react/fixed/src/main.tsx:45–50</a>
+      <p>The smallest: a count, a constant size, and five rows of overscan.</p>
+<pre><span class="n">45</span>  const rowVirtualizer = useVirtualizer({
+<span class="n">46</span>    count: 10000,
+<span class="n">48</span>    <mark>estimateSize: () =&gt; 35</mark>,
+<span class="n">49</span>    overscan: 5,</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Showcase and benchmark</dt><dd>A showcase is a page built to look good under a person's hand. A benchmark is a script that turns a run into a number. Both are chosen by the author; neither is a neutral sample of a product's workload.</dd>
+      <dt>Three cost drivers</dt><dd>Cells on screen (how much DOM one step can touch), what a step changes (one entering row, or every cell), and where the data comes from (generated, stored, fetched).</dd>
+      <dt>Pinned and as shipped</dt><dd>I trace the upstream files unmodified, with one exception: the dynamic example picks its view from the URL path, which a sub-directory cannot match, so the lab's copy reads <code>?view=</code> instead (<code>lab/upstream/fetch.sh</code>).</dd>
+    </dl></div>
+  </div>
+  <div class="bars" data-bars='{"ids":["u-rt-2b-scroll","u-rt-bench-wheel","u-tv-fixed-rows","u-tv-fixed-grid","u-tv-table-scroll","u-tv-dynamic-scrollup"],"labels":["rt two_billion_rows","rt benchmark page","tv fixed, rows","tv fixed, grid","tv table","tv dynamic (up)"],"series":[{"path":"main.scriptMs","label":"script","color":"#d9a800"},{"path":"main.gcMs","label":"GC","color":"#e0572f"},{"path":"main.styleMs","label":"style","color":"#c39be0"},{"path":"main.layoutMs","label":"layout","color":"#9b59d0"},{"path":"main.paintMs","label":"paint","color":"#2e9e5b"}],"stack":true,"unit":"ms","title":"Main-thread time during one wheel scroll of each showcase, whole trace"}'></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The two regular-table pages keep the main thread busy for <b data-m="u-rt-2b-scroll/threads.mainUtilPct" data-unit="%"></b> and <b data-m="u-rt-bench-wheel/threads.mainUtilPct" data-unit="%"></b> of their traces; the TanStack pages for <b data-m="u-tv-dynamic-scrollup/threads.mainUtilPct" data-unit="%"></b> (dynamic) to <b data-m="u-tv-table-scroll/threads.mainUtilPct" data-unit="%"></b> (table). The dynamic bar covers a scroll twice as long as the others.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> what each page asks the browser to do, by its own code.</p>
+    <p><b>No:</b> that one library is faster. The regular-table pages fill a 1640 × 860 viewport with about a thousand cells; the TanStack list shows six rows in a 200 px box. The bars compare showcases, not libraries. Module 4 (<a href="javascript.html">What JavaScript costs per frame</a>) compares the libraries at equal cell counts.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/record.mjs --list | grep '^u-'</code> prints the fifteen scenarios of this module with the question each one asks. To open a page yourself: <code>sh lab/upstream/fetch.sh</code> once, then <code>node lab/server/main.mjs</code> and <code>http://127.0.0.1:5199/upstream/regular-table/examples/two_billion_rows/index.html</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">regular-table's largest example stores nothing: 2,000,000,000 × 1,000 cells are formatted per data call (two_billion_rows.js:14–27).</li>
+    <li data-kind="measured">Under a wheel scroll the regular-table showcases use over half of the main thread, the TanStack ones under a sixth; the cell counts differ by two orders of magnitude, so this ranks showcases, not libraries.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The largest claim first. Two billion rows scroll under the wheel: what is one unit of work, and where does its time go?</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · regular-table: two billion rows" data-title="One frame of two billion rows" data-node="frame js layout paint"
+  data-ask="dirty|The data is generated in under a millisecond. Why does one frame of this example cost twelve?">
+  <p class="holding"><span class="label">Question I hold</span><span>The wheel turns at a steady speed over <code>two_billion_rows</code>. What repeats, and what is it made of?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Each frame the page formats about a thousand numbers with <code>Intl.NumberFormat</code> and regular-table writes them into about a thousand cells. Where does most of the frame's main-thread time go?</p>
+    <div class="opts"><button data-k="a">Formatting: Intl is slow.</button><button data-k="b">regular-table's JavaScript: a thousand cells visited.</button><button data-k="c">Neither: style and layout after the JavaScript has finished.</button></div>
+    <div class="reveal"><p><b>Style and layout.</b> Over the trace, script is <b data-m="u-rt-2b-scroll/main.scriptMs" data-unit="ms"></b>, style <b data-m="u-rt-2b-scroll/main.styleMs" data-unit="ms"></b>, layout <b data-m="u-rt-2b-scroll/main.layoutMs" data-unit="ms"></b> and paint <b data-m="u-rt-2b-scroll/main.paintMs" data-unit="ms"></b>. The JavaScript that the example's author wrote, and the library's own, are the small part.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div><p>I pick one frame in the middle of the scroll and read it top to bottom. Every frame of the scroll has this shape.</p></div></div>
+  <div class="tracelink" data-trace="u-rt-2b-scroll">In Perfetto pin <code>CrRendererMain</code> and <code>Compositor</code> of the Renderer process and zoom to one <code>ProxyMain::BeginMainFrame</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["u-rt-2b-scroll"],"from":115.5,"to":131.5,"rows":["compositor","frames","mainFrames","main","raster"],"pins":[[1,116.73,"compositor"],[2,117.53,"main.js"],[3,117.96,"main.js"],[4,119.02,"main.layout"],[5,120.61,"main.layout"],[6,126.84,"main.paint"],[7,129.53,"raster"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The compositor applies 39 px of wheel scroll, draws, and sends <code>BeginMainFrame</code>.</li>
+    <li><i>2</i><b>scroll event</b>, 0.43 ms: regular-table plans the new window and calls the example's data listener (the red sliver in the row below is a 50-element style recalculation, forced when the handler reads the scroll position; the pointer rests over the table, so it is probably the hover highlight changing rows).</li>
+    <li><i>3</i><b>requestAnimationFrame</b>, 1.05 ms: the library writes every visible cell (<code>draw_sync</code>).</li>
+    <li><i>4</i><b>Recalculate style</b>, 1.58 ms for 1,129 elements.</li>
+    <li><i>5</i><b>Layout</b>, 5.11 ms: 2,120 of 2,236 layout objects dirty.</li>
+    <li><i>6</i>Pre-paint, paint and layerize, about 2.8 ms together, then commit.</li>
+    <li><i>7</i>Raster of the new tiles on worker threads, after the commit.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>One unit of work is one main frame per display refresh: <b data-m="u-rt-2b-scroll/main.scrollEvents"></b> scroll events, <b data-m="u-rt-2b-scroll/main.rafCallbacks"></b> animation-frame callbacks, <b data-m="u-rt-2b-scroll/main.layouts"></b> layouts. Its median length is <b data-m="u-rt-2b-scroll/frames.mainFrameMs.p50" data-unit="ms"></b> against a budget of 16.7 ms, and the longest took <b data-m="u-rt-2b-scroll/frames.mainFrameMs.max" data-unit="ms"></b>. JavaScript is about 1.5 ms of the frame at pin 2 and 3; rendering is 9.7 ms.</p>
+  </div></div>
+  <div class="prof" data-prof="u-rt-2b-scroll" data-top="7" data-by="self"></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/events.ts#L77-L89">regular-table src/ts/events.ts:77–89</a>
+      <p>Why the JavaScript is split in two (pins 2 and 3). The scroll handler awaits the data, then one animation frame, then writes:</p>
+<pre><span class="n">77</span>    const commit = <mark>await this.predraw(</mark>width, height, {
+<span class="n">78</span>        invalid_viewport: false,
+<span class="n">86</span>    if (!commit.inline) {
+<span class="n">87</span>        <mark>await new Promise(requestAnimationFrame);</mark>
+<span class="n">88</span>        commit();
+<span class="n">89</span>    }</pre>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/build.mjs#L29-L33">regular-table build.mjs:29–33</a>
+      <p>Why the profile above shows <code>_e</code>, <code>O</code> and <code>D</code>. The published build renames every member that starts with an underscore:</p>
+<pre><span class="n">31</span>        minifyIdentifiers: true,
+<span class="n">33</span>        <mark>mangleProps: /^[_#]/</mark>,</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Plan, then commit</dt><dd>regular-table's scroll path fetches data first and writes the DOM in the next animation-frame callback. With a synchronous data listener both land in the same main frame (<a href="anatomy.html">Module 3</a>).</dd>
+      <dt>Names in a minified build</dt><dd><code>_on_scroll</code>, <code>_draw_td</code> and <code>internal_draw</code> do not appear; public names such as <code>predraw</code>, <code>draw_sync</code> and <code>draw</code> do. The lab's own pages serve regular-table from source, so compare with <code>f-scroll-regular</code> when you need a name.</dd>
+      <dt>(program)</dt><dd>Sampled time with no JavaScript on the stack: here, mostly Blink doing style, layout and paint. It is the largest line of this profile.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in this recording a frame of the example is about one eighth JavaScript; generating and formatting the data is a fraction of that.</p>
+    <p><b>No:</b> that Intl is free in general. The example reuses one formatter (line 68); <a href="javascript.html">Module 4</a> shows what a formatter created per cell costs.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-rt-2b-scroll tree 116.9 130 main 40</code> prints this frame as nested slices: <code>EventDispatch scroll</code> 0.43 ms, <code>FireAnimationFrame</code> 1.05 ms, <code>UpdateLayoutTree</code> with <code>elementCount 1129</code>, <code>Layout</code> with <code>dirtyObjects 2120</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">two_billion_rows under the wheel: one main frame per refresh, median about 11 ms; JavaScript about 1.5 ms of it, style and layout about 6.7 ms, paint about 2.8 ms.</li>
+    <li data-kind="read">regular-table's scroll handler awaits the data, then one animation frame, then commits (events.ts:77–89); the published build mangles underscore-prefixed names (build.mjs:33).</li>
+    <li data-kind="rejected">"Generating and formatting a thousand values per frame is the cost of this example": the data listener is a fraction of a millisecond per frame.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> A wheel step moved the content 39 px and the table laid out 2,120 objects. Why is everything dirty?</p>
+</section>
+
+<section class="step" data-part="B · regular-table: two billion rows" data-title="Two hundred rows per pixel" data-node="compositor layout">
+  <p class="holding"><span class="label">Question I hold</span><span>Why does a small scroll step rewrite and re-lay-out every cell of this table?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Rows are 19 px high. In the frame of step 2 the wheel moved the scroll position by 39 px. By how many rows did the table move?</p>
+    <div class="opts"><button data-k="a">About 2 (39 ÷ 19).</button><button data-k="b">39.</button><button data-k="c">About 7,800.</button></div>
+    <div class="reveal"><p><b>About 7,800.</b> Two billion rows of 19 px would need a 38-billion-pixel scroller. regular-table caps the scroller at 10,000,000 px and maps the scroll position to rows by proportion, so one pixel is about 200 rows.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the row mapping in source, then check it against the thumb-drag trace, where the compositor records the scroll distance of every mouse step.</p>
+  </div></div>
+  <div class="tracelink" data-trace="u-rt-2b-drag">The scenario drags the thumb 280 px in 30 mouse steps over 0.9 s.</div>
+  <div class="lanes" data-lanes='{"traces":["u-rt-2b-drag"],"from":22,"to":116,"rows":["compositor","frames","mainFrames","main"],"pins":[[1,30.7,"compositor"],[2,28.1,"frames"],[3,36.48,"main.layout"],[4,44.77,"frames"],[5,61.59,"compositor"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>One mouse step of 9.3 px on the thumb. The compositor's <code>HandleGestureScrollUpdate</code> carries <code>dy: 110420</code>: the scroll position jumps 110,420 px.</li>
+    <li><i>2</i>That refresh is presented without the main thread's update: the thumb has moved, the rows have not.</li>
+    <li><i>3</i>The main frame redraws the table: 2,206 of 2,326 layout objects.</li>
+    <li><i>4</i>The next refresh shows the new rows.</li>
+    <li><i>5</i>The next mouse step, 31 ms later; the pattern repeats.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>At about 200 rows per pixel, a mouse step of 110,420 px is about 22 million rows, and one pixel of thumb travel is about 2.4 million rows (110,420 ÷ 9.3 × 200). The last update of the drag reports a scroll position of 3,435,290 px: a third of the way down, near row 687 million. No scroll position reachable by wheel, key or thumb is one row away from another.</p>
+    <p>So on every frame every cell shows a different value. Three things follow, each visible in the trace:</p>
+    <p><b>Every text changes.</b> The main thread shaped text 123,805 times during the scroll of step 2 (<code>InlineNode::ShapeTextIncludingFirstLine</code>), about 1,040 per frame. regular-table writes a cell's text only if it differs from the last value; here it always differs.</p>
+    <p><b>Every element is restyled.</b> <b data-m="u-rt-2b-scroll/main.styleElements"></b> elements over <b data-m="u-rt-2b-scroll/main.styleRecalcs"></b> style recalculations. The library writes four CSS custom properties on the <code>&lt;table&gt;</code> at every commit, and custom properties inherit.</p>
+    <p><b>The whole table is laid out.</b> <b data-m="u-rt-2b-scroll/main.layoutDirty"></b> dirty objects over <b data-m="u-rt-2b-scroll/main.layouts"></b> layouts. Column widths of an automatic-layout table depend on cell content.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/constants.ts#L18">regular-table src/ts/constants.ts:18</a> · <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/scroll_panel.ts#L862-L873">scroll_panel.ts:862–873</a>
+      <p>The cap, and the proportional mapping that hides it:</p>
+<pre><span class="n"> 18</span>  export const BROWSER_MAX_HEIGHT = isFirefox ? 5000000 : <mark>10000000</mark>;
+<span class="n">862</span>        const total_scroll_height = Math.max(1, panel_height - containerHeight);
+<span class="n">864</span>        const percent_scroll =
+<span class="n">865</span>            Math.max(Math.ceil(scroll_top), 0) / total_scroll_height;
+<span class="n">873</span>        const start_row = <mark>scrollable_rows * percent_scroll</mark>;</pre>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/scroll_panel.ts#L753-L759">scroll_panel.ts:753–759</a>
+      <p>Why every element is restyled. The doc comment above these lines says the properties are written on the table "from where they inherit into every cell":</p>
+<pre><span class="n">753</span>    protected _set_sub_cell_offset(x_offset: number, y_offset: number): void {
+<span class="n">754</span>        const style = this.table_model.table.style;
+<span class="n">755</span>        <mark>style.setProperty(CLIP_X, `${x_offset}px`);</mark>
+<span class="n">758</span>        style.setProperty(TRANSFORM_Y, `${-y_offset}px`);</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Scroll extent</dt><dd>A browser cannot scroll an element of unlimited height. A virtualized table either caps its spacer and maps position to rows (regular-table), or sets the true height and leaves the limit to the browser (TanStack Virtual; <a href="anatomy.html">Module 3</a>).</dd>
+      <dt>Cross-check with a control</dt><dd>In the lab's own regular-table page scrolled at a quarter of the speed (<code>j-speed-600-regular</code>) the rows do not change on every frame: <b data-m="j-speed-600-regular/main.layouts"></b> layouts, but <b data-m="j-speed-600-regular/main.styleRecalcs"></b> style recalculations. Style follows the property write, which happens on every frame; layout follows the text changes.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> this example always runs regular-table's worst case, a full rewrite, at any scroll speed. It shows that the worst case fits in a frame at a thousand cells on this machine.</p>
+    <p><b>No:</b> that the layout cost is unavoidable. I did not test fixed column widths or containment on this page; <a href="rendering.html">Module 5</a> does on the lab's.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: Tablelab's engine already knows column widths, so the DOM painter can use fixed table layout and keep a text change from re-measuring columns; and a sub-row offset can be one transform on one container instead of a property inherited by every cell. Separately, an extent beyond the browser's limit needs a stated mapping from scroll position to rows, including what one thumb pixel and one wheel notch mean.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-rt-2b-drag slices 'HandleGestureScrollUpdate$' Compositor</code> lists 30 scroll updates with <code>"dy":110420.0625</code> (two with 122688.9375). <code>node lab/harness/q.mjs u-rt-2b-scroll names main | grep ShapeText</code> prints the count of text shapings.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">regular-table caps its scroller at 10,000,000 px in Chrome and maps scroll position to rows by proportion (constants.ts:18, scroll_panel.ts:862–873): two billion rows are about 200 rows per pixel.</li>
+    <li data-kind="measured">One 9.3 px mouse step on the thumb moved the scroll position 110,420 px, about 22 million rows; the thumb moves in one refresh and the rows follow in the next.</li>
+    <li data-kind="inferred">Every cell is dirty every frame for three reasons: every text changes (about 1,040 text shapings per frame), four inherited custom properties are written on the table at each commit (scroll_panel.ts:753–759), and the table's layout is automatic.</li>
+  </ul>
+  <p class="next" data-answer="dirty"><b>Next question →</b> The diagonal scroll of the same page shows forced layouts, which the vertical one did not. Is sideways the expensive direction?</p>
+</section>
+
+<section class="step" data-part="B · regular-table: two billion rows" data-title="Sideways: 127 forced layouts" data-node="js layout">
+  <p class="holding"><span class="label">Question I hold</span><span>The diagonal trace counts <b data-m="u-rt-2b-diagonal/main.forcedLayouts"></b> forced layouts and <b data-m="u-rt-2b-diagonal/main.forcedMs" data-unit="ms"></b> of forced style and layout. Is this layout thrashing?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>I put two consecutive frames of the diagonal scroll side by side: one with a long scroll event, one without.</p></div></div>
+  <div class="tracelink" data-trace="u-rt-2b-diagonal"></div>
+  <div class="lanes" data-lanes='{"traces":["u-rt-2b-diagonal"],"from":82.5,"to":114.5,"rows":["frames","mainFrames","main"],"pins":[[1,84.03,"main.js"],[2,86.14,"main.layout"],[3,91.54,"main.layout"],[4,100.63,"main.js"],[5,103.88,"main.layout"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>A <b>scroll event of 10.2 ms</b> and no animation-frame callback: the whole draw runs inside the event.</li>
+    <li><i>2</i>Inside it, a forced layout of 2,214 of 2,236 objects, 5.2 ms.</li>
+    <li><i>3</i>A second forced style recalculation, 1,117 elements.</li>
+    <li><i>4</i>The next frame is the ordinary shape of step 2: a 0.4 ms scroll event, then the commit in <code>requestAnimationFrame</code>.</li>
+    <li><i>5</i>Its layout, after the JavaScript: 2,123 of 2,236 objects, 5.0 ms.</li>
+  </ol>
+  <table class="mtable" data-rows="u-rt-2b-scroll,u-rt-2b-diagonal" data-names="vertical,diagonal" data-head="two_billion_rows" data-cols="main.scrollEvents|scroll events,main.rafCallbacks|rAF callbacks,main.forcedLayouts|forced layouts,main.layouts|layouts,frames.mainFrameMs.p50|main frame p50|ms,frames.mainFrameMs.p95|p95|ms,frames.partial|frames without main"></table>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Of <b data-m="u-rt-2b-diagonal/main.scrollEvents"></b> scroll events only <b data-m="u-rt-2b-diagonal/main.rafCallbacks"></b> were followed by an animation-frame commit. The others met a column whose width had never been measured, and regular-table fell back to its other draw path, which measures while it draws. The layout at pin 2 is the same full-table layout as at pin 5. It moved from after the JavaScript to inside it; the frame as a whole got about a millisecond longer at the median.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/scroll_panel.ts#L178-L179">regular-table src/ts/scroll_panel.ts:178–179, 241–243</a>
+      <p>The fallback. When planning cannot size a column, <code>predraw</code> runs the awaiting draw at once and returns a commit that does nothing:</p>
+<pre><span class="n">178</span>        const inline = async (): Promise&lt;PredrawCommit&gt; =&gt; {
+<span class="n">179</span>            <mark>await this.draw({</mark>
+<span class="n">241</span>            if (end_col === undefined) {
+<span class="n">242</span>                <mark>return await inline();</mark>
+<span class="n">243</span>            }</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Forced layout</dt><dd>Layout that JavaScript makes the browser run at once, by reading a geometry property after changing the DOM. One per frame replaces the layout the frame would have run anyway. Several per frame, each after new writes, is thrashing (<a href="rendering.html">Module 5</a>).</dd>
+      <dt>Two draw paths</dt><dd><code>draw_sync</code> runs in the animation-frame commit and reads no geometry. The awaiting <code>draw()</code> writes whenever its data resolves and measures new columns as it goes.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I took the count of forced layouts as a count of wasted layouts. The table says otherwise. A frame of the diagonal run still has one full-table layout; the extra layouts it counts touch two or three objects each (pin 3's neighbours), and the median frame grew from <b data-m="u-rt-2b-scroll/frames.mainFrameMs.p50" data-unit="ms"></b> to <b data-m="u-rt-2b-diagonal/frames.mainFrameMs.p50" data-unit="ms"></b>. A forced layout is waste only when the frame then needs another full one. The rule I keep: compare the size of each layout and the frame length before counting red bars.</p></div>
+  <div class="hard"><span class="label">Hard learning</span><p>In these samples the function named <code>Object.assign.inline</code> is not the inline fallback. V8 gave that name to the commit closure that <code>predraw</code> returns through <code>Object.assign(() =&gt; {…}, { inline: false })</code>; it is the parent of <code>draw_sync</code> in the ordinary path. The rule I keep: tell the two paths apart by where the DOM is written, in a <code>FireAnimationFrame</code> or in the microtasks of an event, not by a sampled name.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> scrolling into unvisited columns switches regular-table to its measuring path on about four frames in ten here, at a small cost per frame.</p>
+    <p><b>No:</b> that the measuring path is always this cheap. Its cost grows with the number of unmeasured columns that enter in one step; here it is one at a time.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-rt-2b-diagonal prof 0 2900 | grep -n "draw_sync\|Object.assign.inline\| draw "</code>: <code>draw</code> totals about 689 ms (both paths call a method of that name), <code>draw_sync</code> and <code>Object.assign.inline</code> about 106 ms each, one inside the other.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Diagonal scroll of two_billion_rows: about four frames in ten draw inside the scroll event with a forced full-table layout; there is still one full layout per frame, and the median frame is about a millisecond longer than in the vertical scroll.</li>
+    <li data-kind="read">predraw falls back to the awaiting draw() when a column in the new window has no measured width (scroll_panel.ts:178–179, 241–243).</li>
+    <li data-kind="rejected">"127 forced layouts means layout thrashing": each replaced the frame's own layout.</li>
+    <li data-kind="rejected">"Object.assign.inline in the profile is the inline fallback": it is the ordinary commit closure, named by V8 from its Object.assign wrapper.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The example is a page for a hand. regular-table also ships a benchmark that prints frames per second. What does it count?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · regular-table's benchmark" data-title="Read the benchmark before running it" data-node="source bench"
+  data-ask="unit|One iteration of a library's benchmark: how many frames on a screen is that?">
+  <p class="holding"><span class="label">Question I hold</span><span>The runner prints "Throughput (fps)" and "Avg Frame (ms)". From its code alone, what is one "frame"?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>I read the runner (Node, Playwright) and the page function it calls, and write down what starts and stops its clock.</p></div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/benchmarks/benchmark.mjs#L125-L129">regular-table benchmarks/benchmark.mjs:125–129, 166, 346–350</a>
+      <p>The clock is in Node. It starts before a DevTools-protocol call and stops when the call returns:</p>
+<pre><span class="n">125</span>    for (let i = 0; i &lt; CONFIG.iterations; i++) {
+<span class="n">126</span>        const frameStart = performance.now();
+<span class="n">127</span>        <mark>await scrollFn();</mark>
+<span class="n">128</span>        const frameEnd = performance.now();
+<span class="n">129</span>        frameTimes.push(frameEnd - frameStart);
+<span class="n">166</span>        <mark>throughput: (CONFIG.iterations / totalTime) * 1000,</mark>
+<span class="n">346</span>            () =&gt;
+<span class="n">347</span>                page.evaluate(
+<span class="n">348</span>                    (px) =&gt; window.scrollDown(px),</pre>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/benchmarks/benchmark.html#L236-L239">benchmarks/benchmark.html:236–239</a>
+      <p>What the call does in the page:</p>
+<pre><span class="n">236</span>            window.scrollDown = async function (pixels = 100) {
+<span class="n">237</span>                <mark>table.scrollTop += pixels;</mark>
+<span class="n">238</span>                <mark>await table.draw();</mark>
+<span class="n">239</span>            };</pre>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/scroll_panel.ts#L113-L121">src/ts/scroll_panel.ts:113–121</a>
+      <p>And what <code>draw()</code> waits for: the awaiting draw path, which has no <code>requestAnimationFrame</code> in it.</p>
+<pre><span class="n">113</span>    async draw(options: DrawOptions = {}): Promise&lt;void&gt; {
+<span class="n">117</span>            return await throttle_tag(this, () =&gt;
+<span class="n">118</span>                <mark>internal_draw.call(this, options)</mark>,</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>The benchmark's workload</dt><dd>200 iterations after 20 of warm-up, 100 px each, on 100,000 × 1,000 cells with three header levels (benchmark.mjs:24–45). A style listener reads every cell's text, runs a regular expression on it and toggles two classes (benchmark.html:195–215). The window is 1920 × 1080; this course records it at 1640 × 860.</dd>
+      <dt>A protocol call is a task</dt><dd><code>page.evaluate</code> sends a message to the browser; the renderer runs the function in a main-thread task and replies when the returned promise resolves. Between two such tasks the main thread is free to run anything else that is queued.</dd>
+      <dt>A scroll that is not an input</dt><dd>Writing <code>scrollTop</code> moves the scroller on the main thread. No wheel event, no gesture, no compositor-driven scroll; the <code>scroll</code> event is queued for the next frame.</dd>
+    </dl></div>
+  </div>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Sixty iterations of <code>scrollDown(100)</code>. How many frames reach the screen while they run?</p>
+    <div class="opts"><button data-k="a">Sixty: one per iteration.</button><button data-k="b">One, at the end: nothing in the loop waits for a frame.</button><button data-k="c">It depends on who yields the main thread between iterations.</button></div>
+    <div class="reveal"><p><b>It depends on who yields.</b> Nothing in an iteration waits for a frame, so the code does not decide. Driven as the runner drives it, with one protocol call per iteration, the trace of step 6 has <b data-m="u-rt-bench-steps/frames.mainFrames"></b> main frames for 60 iterations. The same sixty iterations in one in-page loop (step 7) present <b data-m="u-rt-bench-loop/frames.all"></b> frame.</p></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes, from source:</b> the runner's "frame" is one protocol round trip around a scroll-position write and one awaited draw. Its "fps" is round trips per second.</p>
+    <p><b>No:</b> what happens between two round trips. That is not in the code; it needs a trace.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Open <code>lab/upstream/dist/regular-table/benchmarks/benchmark.mjs</code> and find the fifth test, "Continuous Scroll" (lines 200–225). Before step 8: what does <em>its</em> number count?</div>
+  <ul class="add" hidden>
+    <li data-kind="read">regular-table's benchmark times, in Node, one page.evaluate per iteration; the page function writes scrollTop and awaits draw() (benchmark.mjs:125–129, benchmark.html:236–239). "Throughput (fps)" is iterations per second (benchmark.mjs:166).</li>
+    <li data-kind="read">draw() is the awaiting draw path; it contains no requestAnimationFrame (scroll_panel.ts:113–121).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Driven exactly this way, one protocol call per iteration: what runs between two calls?</p>
+</section>
+
+<section class="step" data-part="C · regular-table's benchmark" data-title="Sixty protocol calls" data-node="bench frame js layout paint">
+  <p class="holding"><span class="label">Question I hold</span><span>What is inside one iteration, and what is between two?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The scenario <code>u-rt-bench-steps</code> sends sixty <code>page.evaluate</code> calls, as the runner does. I wrapped each in one <code>performance.measure</code>, <code>app: bench step</code>, from the call to the resolved draw, so the iterations show as bars. The runner has no such measure.</p>
+  </div></div>
+  <div class="tracelink" data-trace="u-rt-bench-steps"></div>
+  <div class="lanes" data-lanes='{"traces":["u-rt-bench-steps"],"from":50,"to":86,"rows":["tasks","frames","mainFrames","main","app"],"pins":[[1,51.67,"app"],[2,53.62,"tasks"],[3,55.47,"main.layout"],[4,63.34,"main.js"],[5,64.59,"main.layout"],[6,66.03,"main.paint"],[7,68.21,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>One iteration</b>, 1.9 ms: the task that runs the protocol call. It contains the data listener, regular-table's cell writes and the style listener, all in microtasks. No style, no layout, no paint.</li>
+    <li><i>2</i>The next task is not the next iteration. It is a <code>BeginMainFrame</code> that the compositor had queued, 14.5 ms.</li>
+    <li><i>3</i>In it: style for 1,147 elements and layout of 2,147 objects, for the cells the iteration wrote.</li>
+    <li><i>4</i>Then the <code>scroll</code> event that the <code>scrollTop</code> write had queued, and regular-table's ordinary scroll path draws the table <em>again</em> in <code>requestAnimationFrame</code> (<code>draw_sync</code> and the style listener are sampled here).</li>
+    <li><i>5</i>A second style recalculation: 459 elements whose classes the style listener removed and added back. No text changed (2 layout objects).</li>
+    <li><i>6</i>Paint and commit.</li>
+    <li><i>7</i>Only now the next protocol call gets the main thread.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="u-rt-bench-steps/app.bench step.n"></b> iterations with a median of <b data-m="u-rt-bench-steps/app.bench step.p50" data-unit="ms"></b> each, and <b data-m="u-rt-bench-steps/frames.mainFrames"></b> main frames with a median of <b data-m="u-rt-bench-steps/frames.mainFrameMs.p50" data-unit="ms"></b> between them. The sixty calls started within 881 ms, about 67 a second. Six of them ran 3 ms after the one before, with no frame in between.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The iteration itself is JavaScript only. The rendering it causes runs in a different task, and that task delays the <em>next</em> iteration's protocol call. So the runner's clock does include most of the frame's cost, by queueing, but it does not wait for it: when two calls arrive before the next refresh, the second runs at once. "Throughput (fps)" can therefore exceed the display's refresh rate, as it does here (67 against 60).</p>
+    <p>Each iteration also draws the table twice. I read the reason in source but did not prove it by experiment: the awaiting draw and the scroll path compute the last visible column differently (<code>scroll_panel.ts:810</code> against <code>245–248</code>), and a different last column invalidates the window (<code>655–659</code>).</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>The frames lane of this trace is amber: <b data-m="u-rt-bench-steps/frames.partial"></b> refreshes "presented without the main thread's update". I read that as fifty-three frames with stale rows. The frame records say something narrower. Each refresh has two: a compositor-only record presented about 7 ms after its vsync, and the main thread's record for the same refresh, presented about 24 ms after it. The first carries the <em>previous</em> refresh's table. So every refresh showed a new table, one refresh late. The rule I keep: "without the main update" means the update for <em>that</em> vsync missed it; look at the main frame's own presentation time before calling a frame stale (<a href="frames.html">Module 2</a>).</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> driven by its runner, this benchmark does exercise style, layout and paint, about once per iteration, and its rate is bounded by the main thread's frame work.</p>
+    <p><b>No:</b> that its number is a frame rate. It counts protocol round trips, includes the Node-to-browser latency of each, and no part of it checks that a frame was presented.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-rt-bench-steps tasks 50 70 0.2</code> prints three tasks: <code>DEFAULT_TQ</code> 2.0 ms (the protocol call), <code>COMPOSITOR_TQ</code> 14.5 ms (<code>ScheduledActionSendBeginMainFrame</code>), <code>DEFAULT_TQ</code> 2.4 ms. <code>node lab/harness/q.mjs u-rt-bench-steps marks 'bench step'</code> lists all sixty with their start times.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Driven by one protocol call per iteration, an iteration is about 2 ms of JavaScript; a main frame of about 15 ms (style, layout, a second draw through the scroll path, paint) runs between most pairs of iterations: 54 main frames for 60 iterations, 67 iterations a second.</li>
+    <li data-kind="inferred">The benchmark's rate is bounded by frame work only through task queueing; nothing in it waits for a frame, so it can exceed the refresh rate.</li>
+    <li data-kind="rejected">"A frame labelled 'without the main update' showed stale rows": here every refresh carried the previous refresh's new table.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> What if nobody yields between iterations: the same sixty in one loop inside the page?</p>
+</section>
+
+<section class="step" data-part="C · regular-table's benchmark" data-title="The same sixty iterations without yielding" data-node="bench js layout present">
+  <p class="holding"><span class="label">Question I hold</span><span>The scenario <code>u-rt-bench-loop</code> runs <code>table.scrollTop += 100; await table.draw()</code> sixty times in one async function. Same work, different driver: what changes?</span></p>
+  <div class="tracelink" data-trace="u-rt-bench-loop"></div>
+  <div class="lanes" data-lanes='{"traces":["u-rt-bench-loop"],"from":-15,"to":645,"rows":["tasks","frames","mainFrames","main"],"pins":[[1,1.36,"tasks"],[2,108.81,"main.layout"],[3,301.46,"frames"],[4,617.02,"main.js"],[5,618.11,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>One task of 606 ms.</b> Each <code>await</code> resolves in a microtask, and microtasks run before the task ends, so the loop never returns to the event loop.</li>
+    <li><i>2</i>Sixty forced style-and-layout pairs, one per iteration (red), about 7.6 ms each.</li>
+    <li><i>3</i>Thirty-seven refreshes with nothing produced. The long green bar below them is the one <code>BeginMainFrame</code> the compositor asked for at the start, waiting for the task to end.</li>
+    <li><i>4</i>After the loop, <b>one</b> <code>scroll</code> event for sixty writes, and one more draw through the scroll path.</li>
+    <li><i>5</i>The only presented frame.</li>
+  </ol>
+  <div class="bars" data-bars='{"ids":["u-rt-bench-steps","u-rt-bench-loop"],"labels":["60 protocol calls","one in-page loop"],"series":[{"path":"main.scriptMs","label":"script","color":"#d9a800"},{"path":"main.gcMs","label":"GC","color":"#e0572f"},{"path":"main.styleMs","label":"style","color":"#c39be0"},{"path":"main.layoutMs","label":"layout","color":"#9b59d0"},{"path":"main.paintMs","label":"paint","color":"#2e9e5b"},{"path":"raster.ms","label":"raster (worker threads)","color":"#1baf7a"}],"stack":true,"unit":"ms","title":"Sixty iterations of the benchmark step, two drivers"}'></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Layout is almost the same in both, <b data-m="u-rt-bench-steps/main.layoutMs" data-unit="ms"></b> and <b data-m="u-rt-bench-loop/main.layoutMs" data-unit="ms"></b>. In the loop it is forced: <b data-m="u-rt-bench-loop/main.forcedLayouts"></b> forced layouts, against <b data-m="u-rt-bench-steps/main.forcedLayouts"></b> with protocol calls. Paint falls from <b data-m="u-rt-bench-steps/main.paintMs" data-unit="ms"></b> to <b data-m="u-rt-bench-loop/main.paintMs" data-unit="ms"></b>, raster from <b data-m="u-rt-bench-steps/raster.ms" data-unit="ms"></b> to <b data-m="u-rt-bench-loop/raster.ms" data-unit="ms"></b>. The loop's sampled time is 461 ms in the anonymous function that holds the loop itself: the statement <code>table.scrollTop += 100</code> reads the scroll position, and the read makes the browser lay out everything the previous draw wrote.</p>
+  </div></div>
+  <div class="boxes"><div class="box"><span class="label">Knowledge I am using</span><dl>
+    <dt>DOM completion is not a frame</dt><dd>The promise of <code>draw()</code> resolves when the cells are in the DOM. Style, layout, paint, raster and presentation happen later, in tasks that need the main thread back.</dd>
+    <dt>Scroll events coalesce</dt><dd>A <code>scroll</code> event reports that the position changed since the last frame, not each write. Sixty writes in one task give one event: <b data-m="u-rt-bench-loop/main.scrollEvents"></b> in this trace.</dd>
+    <dt>Dropped, but not shown as dropped</dt><dd>The compositor's records mark <b data-m="u-rt-bench-loop/frames.dropped"></b> refreshes dropped. DevTools' Frames track would show <b data-m="u-rt-bench-loop/frames.devtoolsDropped"></b>, because no scroll or animation was running on the compositor that could be judged unsmooth (<a href="frames.html">Module 2</a>).</dd>
+  </dl></div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>This loop was my first recording of "the benchmark as its runner drives it", and from it I concluded that regular-table's benchmark presents one frame per sixty iterations. That was the loop's doing, not the runner's: I had moved the loop into the page, where no task boundary separates the iterations. The rule I keep: when reproducing someone's benchmark, reproduce who waits for whom, not only the statements.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: a Tablelab benchmark states its observation point in the metric's name. "Draw resolved" (DOM completion), "frame committed" and "frame presented" are three clocks, and this pair of traces shows the first one running sixty times while the third ran once.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the benchmark step by itself produces no frame; whether style and layout run inside it (forced) or after it (in a frame) depends on the driver.</p>
+    <p><b>No:</b> that an in-page loop is a cheaper way to measure the same thing. It measures JavaScript, style and layout and silently drops paint and raster.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-rt-bench-loop tasks -50 1200 0.3</code> shows one <code>DEFAULT_TQ</code> task of 606 ms; <code>node lab/harness/q.mjs u-rt-bench-loop prof 0 610</code> puts about 461 ms of self time in <code>(anonymous)</code>, the evaluated loop.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">The same sixty iterations in one in-page loop: one 606 ms task, sixty forced layouts, one scroll event, one presented frame, almost no paint or raster.</li>
+    <li data-kind="rejected">"regular-table's benchmark presents one frame per sixty iterations": true of my in-page loop, false of the runner's sixty protocol calls.</li>
+  </ul>
+  <p class="next" data-answer="unit"><b>Next question →</b> Neither driver sent an input. What does the same page do under a real wheel, and what does the benchmark's last test, a rAF counter, count?</p>
+</section>
+
+<section class="step" data-part="C · regular-table's benchmark" data-title="A real wheel, and a rAF counter" data-node="input compositor frame bench"
+  data-ask="number|When a page or a runner prints FPS, which clock ticked?">
+  <p class="holding"><span class="label">Question I hold</span><span>The benchmark page has now been driven four ways. Which of the numbers a library could print agree with the frames the compositor reports?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I add two traces. <code>u-rt-bench-wheel</code> scrolls the benchmark page by wheel input. <code>u-rt-bench-raf</code> runs the runner's fifth test as written: <code>scrollLeft += 10; scrollTop += 20</code> in every animation frame, counted by <code>window._benchmarkFrameCount</code>. Beside it I run a second rAF chain that turns each gap between two rAF timestamps into a measure, <code>app: bench rAF gap</code>.</p>
+  </div></div>
+  <table class="mtable" data-rows="u-rt-bench-steps,u-rt-bench-loop,u-rt-bench-wheel,u-rt-bench-raf" data-names="60 protocol calls,one in-page loop,wheel input,rAF loop (Continuous Scroll)" data-head="Benchmark page, driven by" data-cols="main.scrollEvents|scroll events,main.rafCallbacks|rAF callbacks,frames.mainFrames|main frames,frames.mainFrameMs.p50|main frame p50|ms,frames.all|presented with main,frames.partial|without main,frames.dropped|dropped,main.forcedLayouts|forced layouts"></table>
+  <p class="note">"Without main" in the first and last rows is the pattern of step 6: every refresh showed the previous refresh's table. The one-loop row has two main frames because the first waited 606 ms.</p>
+  <div class="tracelink" data-trace="u-rt-bench-raf"></div>
+  <div class="lanes" data-lanes='{"traces":["u-rt-bench-raf"],"from":125,"to":185,"rows":["frames","mainFrames","main","app"],"pins":[[1,128.63,"main.js"],[2,135.27,"main.layout"],[3,143.69,"app"],[4,143.7,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Three animation-frame callbacks per frame: my gap recorder, the benchmark's <code>scroll()</code>, and regular-table's commit (the long one).</li>
+    <li><i>2</i>The same full-table layout as everywhere else on this page.</li>
+    <li><i>3</i>One rAF gap, 16.67 ms. The benchmark's counter ticks once per gap.</li>
+    <li><i>4</i>The refresh it belongs to: presented, one refresh late, as in step 6.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Wheel.</b> The draw runs in <code>requestAnimationFrame</code> (<code>draw_sync</code> under <code>Object.assign.inline</code> in the samples), the compositor scrolls first, and the main frame's median is <b data-m="u-rt-bench-wheel/frames.mainFrameMs.p50" data-unit="ms"></b>: close to the budget on this machine, and a little shorter than between protocol calls, because the table is drawn once per frame, not twice.</p>
+    <p><b>rAF loop.</b> <b data-m="u-rt-bench-raf/app.bench rAF gap.n"></b> gaps with a mean of <b data-m="u-rt-bench-raf/app.bench rAF gap.mean" data-unit="ms"></b> and a maximum of <b data-m="u-rt-bench-raf/app.bench rAF gap.max" data-unit="ms"></b>. A thousand divided by the mean is the benchmark's "scrollFps", about 58. The compositor reports <b data-m="u-rt-bench-raf/frames.dropped"></b> dropped refreshes and <b data-m="u-rt-bench-raf/frames.partial"></b> that showed the previous refresh's table. Here the rAF counter and the presented frames agree in count, because every main frame both ran the callbacks and reached the screen.</p>
+    <p><b>The table's own counter.</b> The runner also reads <code>table.getDrawFPS()</code>. At the end of this run it returned <code>num_frames: 13</code> and <code>real_fps: 4.9</code>, while the table had committed a draw in every one of the 88 frames.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/utils.ts#L37-L40">regular-table src/ts/utils.ts:37–40</a> · <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/scroll_panel.ts#L1058-L1060">scroll_panel.ts:1058–1060</a>
+      <p>Why thirteen. The counter is fed in one place, at the end of <code>internal_draw</code>, the awaiting path:</p>
+<pre><span class="n">  37</span>  export function log_perf(x: number) {
+<span class="n">  38</span>    AVG = (AVG * TOTAL + x) / (TOTAL + 1);
+<span class="n">  39</span>    TOTAL += 1;
+<span class="n">1058</span>    if (DEBUG) {
+<span class="n">1059</span>        <mark>log_perf(performance.now() - __debug_start_time__);</mark></pre>
+      <p>The scroll path of step 2 (<code>predraw</code>, then <code>draw_sync</code>) never calls it. During a scroll the counter sees only the fallback draws of step 4.</p>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/benchmarks/benchmark.mjs#L206-L221">benchmarks/benchmark.mjs:206–221, 262</a>
+<pre><span class="n">209</span>            table.scrollLeft += 10;
+<span class="n">210</span>            table.scrollTop += 20;
+<span class="n">220</span>            <mark>window._benchmarkFrameCount++;</mark>
+<span class="n">221</span>            requestAnimationFrame(scroll);
+<span class="n">262</span>        scrollFps: (frameCount / totalTime) * 1000,</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>What a rAF counter counts</dt><dd>How many times the main thread started a frame. It is capped at the refresh rate and it falls when a main frame overruns. It says nothing about a frame the compositor presented without the main thread, or a frame whose content was wrong.</dd>
+      <dt>Four clocks on one page</dt><dd>Protocol round trips (steps 5–6), the library's draw counter (one of two paths), rAF callbacks, and the compositor's frame records. Only the last is about the screen.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected <code>getDrawFPS()</code> to be the trustworthy number, since the library counts its own draws. It counts one of its two draw paths, and since v0.9.0 the scroll path is the other one. The rule I keep: before quoting a library's built-in counter, find the line that increments it.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on this page, in this recording, the rAF counter tracked main frames, and the benchmark's steps did exercise the rendering that dominates the page.</p>
+    <p><b>No:</b> that either number sees what a wheel scroll adds: input handling and a compositor scroll that runs ahead of the main thread. And none of the four drives checks what the table showed.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-rt-bench-raf raw 'app: bench result' 1</code> prints the mark I wrote when the test stopped; its <code>detail</code> holds <code>frameCount</code> and the object <code>getDrawFPS()</code> returned. <code>node lab/harness/q.mjs u-rt-bench-wheel prof 0 2100 | grep draw_sync</code> shows the commit path under the wheel.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Under wheel input the benchmark page draws once per frame, through the rAF commit path, with a main frame near 13 ms; driven by script it draws through the awaiting path first.</li>
+    <li data-kind="measured">The Continuous Scroll test's rAF counter matched the number of main frames (about 58 a second); every refresh was presented one refresh late and four were dropped.</li>
+    <li data-kind="read">getDrawFPS() is fed only by internal_draw, the awaiting path (utils.ts:37–40, scroll_panel.ts:1059); it does not count scroll-path commits.</li>
+    <li data-kind="rejected">"The library's own draw counter counts its draws": 13 counted, 88 committed.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Now the other library. TanStack Virtual's simplest example: what is a frame of it, and what does a second virtualizer add?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · TanStack Virtual's examples" data-title="fixed: seventeen rows, and a grid" data-node="js layout frame"
+  data-ask="late|A frame box is green. Does that mean the rows were on time?">
+  <p class="holding"><span class="label">Question I hold</span><span>The <code>fixed</code> example has a row list and a grid. What does one frame of each contain, and does upstream's own grid show the forced layout that the lab's two-virtualizer panel shows?</span></p>
+  <div class="tracelink" data-trace="u-tv-fixed-grid"></div>
+  <div class="lanes" data-lanes='{"traces":["u-tv-fixed-rows","u-tv-fixed-grid"],"titles":["fixed: row list (one virtualizer)","fixed: grid (two virtualizers on one scroller)"],"from":99.6,"to":104.4,"rows":["mainFrames","main"],"pins":[[1,100.62,"main.js",0],[2,101.56,"main.layout",0],[3,100.77,"main.js",1],[4,102.28,"main.layout",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Row list: a <code>scroll</code> event of 0.9 ms. TanStack's handler finds a new first row and React re-renders inside the event.</li>
+    <li><i>2</i>Layout after the event: 11 of 1,278 objects. One row div entered.</li>
+    <li><i>3</i>Grid: the <code>scroll</code> event has two listeners, one per virtualizer. The first renders (1.4 ms).</li>
+    <li><i>4</i>The second begins by reading the scroll position, and that read forces style and layout for what the first just rendered: 67 of 1,614 objects, 0.3 ms (red).</li>
+  </ol>
+  <table class="mtable" data-rows="u-tv-fixed-rows,u-tv-fixed-grid" data-names="row list,grid" data-head="examples/react/fixed" data-cols="main.scrollEvents|scroll events,frames.mainFrameMs.p50|main frame p50|ms,main.scriptMs|script|ms,main.layouts|layouts,main.forcedLayouts|forced layouts,main.forcedMs|forced|ms,heap.nodesMax|DOM nodes"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Yes, it happens in upstream's example: <b data-m="u-tv-fixed-grid/main.forcedLayouts"></b> forced layouts in the grid, none in the list. The number of layouts is the same in both, <b data-m="u-tv-fixed-grid/main.layouts"></b>. As in step 4, the frame's one layout moved into the event; the grid pays <b data-m="u-tv-fixed-grid/main.forcedMs" data-unit="ms"></b> for all of them together.</p>
+    <p>The frames lanes of both traces are green: <b data-m="u-tv-fixed-rows/frames.all"></b> and <b data-m="u-tv-fixed-grid/frames.all"></b> refreshes recorded as presented with the main thread's update. Step 13 asks what that label is worth.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/examples/react/fixed/src/main.tsx#L148-L161">TanStack Virtual examples/react/fixed/src/main.tsx:148–161</a>
+<pre><span class="n">148</span>  const rowVirtualizer = useVirtualizer({
+<span class="n">150</span>    <mark>getScrollElement: () =&gt; parentRef.current,</mark>
+<span class="n">155</span>  const columnVirtualizer = useVirtualizer({
+<span class="n">156</span>    horizontal: true,
+<span class="n">158</span>    <mark>getScrollElement: () =&gt; parentRef.current,</mark></pre>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/packages/virtual-core/src/index.ts#L217-L221">packages/virtual-core/src/index.ts:217–221, 245–248</a>
+      <p>Each virtualizer adds its own listener, and each listener's first statement reads the scroller. The sample at pin 4 is in the arrow function of line 245.</p>
+<pre><span class="n">217</span>  const createHandler = (isScrolling: boolean) =&gt; () =&gt; {
+<span class="n">218</span>    <mark>offset = readOffset(element)</mark>
+<span class="n">220</span>    cb(offset, isScrolling)
+<span class="n">245</span>  observeOffset(instance, cb, (el) =&gt; {
+<span class="n">247</span>    return horizontal ? <mark>el.scrollLeft</mark> * ((isRtl &amp;&amp; -1) || 1) : el.scrollTop</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Synchronous render in the event</dt><dd>While scrolling, react-virtual re-renders with <code>flushSync</code> inside TanStack's scroll listener, so the DOM is already changed when the next listener runs (<a href="anatomy.html">Module 3</a>).</dd>
+      <dt>Whose explanation this is</dt><dd><a href="rendering.html">Module 5</a> takes the two-virtualizer case apart on the lab page (<code>r-two-virtualizers</code> against <code>r-one-virtualizer</code>). Here I only establish that upstream's own grid does it.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a frame of this example is a millisecond or two; it shows that the library's own bookkeeping per scroll event is small.</p>
+    <p><b>No:</b> anything about rows that cost something. The list keeps about seventeen <code>div</code>s, each with one text node, in a 200 px box; the grid's cells are the same. Nothing is measured, fetched or formatted, and no row is taller than another.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-tv-fixed-grid tree 100 104 main 20</code>: under one <code>EventDispatch scroll</code> there are two <code>FunctionCall</code> slices at the same line; the second contains <code>Blink.ForcedStyleAndLayout.UpdateTime</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">TanStack's fixed example: a main frame of one to two milliseconds; in the grid every scroll event contains one forced style-and-layout, in the list none, with the same number of layouts in both.</li>
+    <li data-kind="read">Each virtualizer registers its own scroll listener, whose first statement reads scrollTop or scrollLeft (virtual-core index.ts:217–221, 245–248).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The table example renders forty rows of overscan. Does that buy fewer renders?</p>
+</section>
+
+<section class="step" data-part="D · TanStack Virtual's examples" data-title="table: fifty-eight rows rendered to add one" data-node="js layout compositor">
+  <p class="holding"><span class="label">Question I hold</span><span>50,000 rows, a real <code>&lt;table&gt;</code>, <code>overscan: 20</code>. How often does React render during a scroll, and how much of each render reaches the DOM?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The scroll moves 40 px per frame over rows of 34 px. With twenty rows of overscan on each side, how many of the <b data-m="u-tv-table-scroll/main.scrollEvents"></b> scroll events re-render the table component?</p>
+    <div class="opts"><button data-k="a">About six: one per twenty rows.</button><button data-k="b">About half.</button><button data-k="c">Nearly all.</button></div>
+    <div class="reveal"><p><b>Nearly all.</b> <b data-m="u-tv-table-scroll/main.layouts"></b> frames had DOM changes to lay out. TanStack notifies when the first or last <em>visible</em> row changes; overscan is added afterwards and changes how much is rendered, not how often.</p></div>
+  </div>
+  <div class="tracelink" data-trace="u-tv-table-scroll"></div>
+  <div class="lanes" data-lanes='{"traces":["u-tv-table-scroll"],"from":99.6,"to":104.4,"rows":["compositor","mainFrames","main"],"pins":[[1,100.95,"main.js"],[2,102.27,"main.layout"],[3,102.81,"main.paint"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The <code>scroll</code> event, 1.2 ms: the handler notifies, React re-renders the table component synchronously.</li>
+    <li><i>2</i>Style for 10 elements (one new <code>&lt;tr&gt;</code>, its eight cells, a spacer), then layout of 27 of 808 objects.</li>
+    <li><i>3</i>Paint and commit; the frame is 3.1 ms in all.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The table holds about 58 rows (18 visible and 40 of overscan; its layout tree has about 800 objects). Each render runs every one of them through React and through the cell renderers, including <code>toLocaleString()</code> on a date for every row, and then changes the DOM by one row, sometimes two. Script is <b data-m="u-tv-table-scroll/main.scriptMs" data-unit="ms"></b> for the scroll; garbage collection adds <b data-m="u-tv-table-scroll/main.gcMs" data-unit="ms"></b>, on a heap of up to <b data-m="u-tv-table-scroll/heap.maxMb" data-unit="MB"></b> that holds the 50,000 generated rows.</p>
+  </div></div>
+  <div class="prof" data-prof="u-tv-table-scroll" data-top="6" data-by="total" data-skip="(program),(idle),(root)"></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/examples/react/table/src/main.tsx#L82-L87">TanStack Virtual examples/react/table/src/main.tsx:82–87, 146–149</a>
+<pre><span class="n"> 82</span>  const virtualizer = useVirtualizer({
+<span class="n"> 83</span>    count: rows.length,
+<span class="n"> 85</span>    estimateSize: () =&gt; 34,
+<span class="n"> 86</span>    <mark>overscan: 20</mark>,
+<span class="n">146</span>          {virtualRows.map((virtualRow) =&gt; {
+<span class="n">147</span>            const row = rows[virtualRow.index]
+<span class="n">149</span>              &lt;tr key={row.id} style={{ height: `${virtualRow.size}px` }}&gt;</pre>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/packages/virtual-core/src/index.ts#L1017-L1029">packages/virtual-core/src/index.ts:1017–1029, 103–105</a>
+      <p>The notification is keyed on the visible range; overscan is applied later, by the range extractor:</p>
+<pre><span class="n">1021</span>      return [
+<span class="n">1022</span>        this.isScrolling,
+<span class="n">1023</span>        this.range ? <mark>this.range.startIndex</mark> : null,
+<span class="n">1024</span>        this.range ? this.range.endIndex : null,
+<span class="n"> 104</span>  const start = Math.max(range.startIndex - <mark>overscan</mark>, 0)
+<span class="n"> 105</span>  const end = Math.min(range.endIndex + overscan, range.count - 1)</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>What overscan buys</dt><dd>Rows that already exist when the compositor scrolls ahead of the main thread, so the edge is not blank. It does not reduce renders. <a href="javascript.html">Module 4</a> measures the trade on the lab page (<code>j-react-overscan</code>).</dd>
+      <dt>Keyed rows</dt><dd>React keeps the DOM of a row whose key stays. So the cost of the extra fifty-seven rows is JavaScript and garbage, not layout.</dd>
+      <dt>The label "main_thread" on this scroll</dt><dd>The frame records of this trace say <code>SCROLL_MAIN_THREAD</code>; those of the fixed and dynamic examples say <code>SCROLL_COMPOSITOR_THREAD</code>. The compositor did scroll here. But at the start of the gesture it could not decide what was under the pointer and asked the main thread (<code>PostingHitTestToMainThread</code>, only in this trace), and Chromium counts a scroll "driven by the compositor, but blocked on the main thread" as a main-thread scroll (<a href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/input/input_handler.cc;l=704-719">cc/input/input_handler.cc:704–719</a>). Why the hit test failed on this page I did not determine.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in this example a render per row boundary costs about a millisecond at eight plain columns, and overscan 20 does not reduce the number of renders.</p>
+    <p><b>No:</b> how it scales. Eight columns, text cells, rows of one height, all data in memory. A column count of fifty or a cell renderer that costs something multiplies the fifty-eight rows per render.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-tv-table-scroll slices 'PostingHitTestToMainThread|FindScrollTargetOnMainThread'</code> lists four events, two per gesture phase; the same command on <code>u-tv-fixed-rows</code> lists none.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">TanStack's table example re-renders on nearly every scroll event at 40 px per frame; each render passes about 58 rows through React to add one or two to the DOM.</li>
+    <li data-kind="read">TanStack notifies on a change of the visible first or last index; overscan is applied afterwards by the range extractor (virtual-core index.ts:1017–1029, 103–105).</li>
+    <li data-kind="measured">Only the table example's scroll is labelled main-thread; its compositor posted the initial hit test to the main thread, which Chromium counts as blocked on main (input_handler.cc:704–719).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The example's headline feature is sorting 50,000 rows with a click. My first trace of it showed 24 ms of script. Did the click miss?</p>
+</section>
+
+<section class="step" data-part="D · TanStack Virtual's examples" data-title="table: is the sort really that cheap?" data-node="input js present">
+  <p class="holding"><span class="label">Question I hold</span><span>A click on the first column header sorts 50,000 rows. Where does the work run, and how long is the screen without a new frame?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The first header is "ID". The click handler sorts 50,000 row objects on the main thread. How long is the <code>click</code> event?</p>
+    <div class="opts"><button data-k="a">Under 5 ms: the sort is deferred or lazy.</button><button data-k="b">About 20 ms.</button><button data-k="c">Over 100 ms.</button></div>
+    <div class="reveal"><p><b>About 20 ms</b> for the ID column: the longest task of that trace is <b data-m="u-tv-table-sort/main.maxTaskMs" data-unit="ms"></b>. A text column is a different matter: <b data-m="u-tv-table-sort-name/main.maxTaskMs" data-unit="ms"></b> for First Name, in the second trace below.</p></div>
+  </div>
+  <div class="tracelink" data-trace="u-tv-table-sort-name"></div>
+  <div class="lanes" data-lanes='{"traces":["u-tv-table-sort","u-tv-table-sort-name"],"titles":["click on ID (numbers, already in order)","click on First Name (strings, random order)"],"from":-8,"to":140,"rows":["inputs","frames","tasks","main"],"pins":[[1,0,"inputs",0],[2,12,"main.js",0],[3,20.34,"frames",0],[4,60,"main.js",1],[5,60,"frames",1],[6,125.32,"frames",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Mouse down and up on the header.</li>
+    <li><i>2</i>ID: a <code>click</code> event of 22.9 ms. <code>getSortedRowModel</code> and <code>sortData</code> are sampled inside it: the sort did run.</li>
+    <li><i>3</i>The refresh that shows the sorted table; it is on screen 34 ms after the click.</li>
+    <li><i>4</i>First Name: a <code>click</code> event of 117 ms, one task.</li>
+    <li><i>5</i>Seven refreshes pass with no frame.</li>
+    <li><i>6</i>The sorted table appears.</li>
+  </ol>
+  <p class="note">The red task that ends just before time zero in both charts is not the page: it is the profiler starting (<code>CpuProfiler::StartProfiling</code>, 138 ms on this heap of about 160 MB), an effect of recording. <a href="frames.html">Module 2</a> measures what the instruments cost.</p>
+  <table class="mtable" data-rows="u-tv-table-sort,u-tv-table-sort-name" data-names="sort by ID,sort by First Name" data-head="One click" data-cols="main.maxTaskMs|longest task|ms,main.scriptMs|script|ms,frames.dropped|refreshes with no frame,eventLatency.MOUSE_RELEASED.p50|click to screen|ms,main.styleElements|elements restyled,main.layoutDirty|layout objects"></table>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The ID column is the best possible input. The rows are generated with <code>id: index + 1</code>, so the array is already ordered; TanStack Table sorts a numeric column descending on the first click; and a comparison sort that meets one long run only has to reverse it. The name column has no such luck and costs five times as much. Both run entirely in the click's own task, on the main thread, and both end by replacing every row in view (the same <b data-m="u-tv-table-sort/main.styleElements"></b> elements, since every key changed).</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">@tanstack/table-core 8.21.3 src/features/RowSorting.ts:335–345</span>
+      <p>Why the first click on a number column sorts descending:</p>
+<pre><span class="n">335</span>    column.getAutoSortDir = () =&gt; {
+<span class="n">340</span>      if (typeof value === 'string') {
+<span class="n">341</span>        return 'asc'
+<span class="n">344</span>      <mark>return 'desc'</mark></pre>
+      <span class="path">@tanstack/table-core 8.21.3 src/utils/getSortedRowModel.ts:48–50</span>
+      <p>And what a sort allocates: a copy of every row object before sorting.</p>
+<pre><span class="n">48</span>          const sortedData = <mark>rows.map(row =&gt; ({ ...row }))</mark>
+<span class="n">50</span>          sortedData.sort((rowA, rowB) =&gt; {</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Input order decides a sort's cost</dt><dd>V8's array sort detects runs that are already ascending or descending and merges runs. One run of 50,000 needs about 50,000 comparisons; random order needs about sixteen times that.</dd>
+      <dt>Click to screen</dt><dd>The column "click to screen" is Chromium's own event latency for the mouse release: from the input to the presented frame.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>Twenty-four milliseconds looked too small for 50,000 rows, and I suspected the click had missed the header. The samples showed <code>sortData</code> running. The click was right; the column was the cheapest one. The rule I keep: when a number looks too good, check first that the work ran, then what input it ran on.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: this is the case for Tablelab's split. A sort of 50,000 rows by a text key held the UI thread for seven refreshes here. In our design the engine sorts off the UI thread and the frontend's job on a click is to show, within a frame, that the sort is under way.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the example sorts in the click handler, and a text column makes it a long task.</p>
+    <p><b>No:</b> how a server-side or worker sort would feel; the example has none. <a href="perspective.html">Module 9</a> traces a sort in a worker (<code>x-sort-worker</code>).</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-tv-table-sort-name prof -50 1500 | grep -n "sortData\|getSortedRowModel"</code>: about 95 ms and 106 ms of total time; the same on <code>u-tv-table-sort</code> gives about 13 and 18.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">A header click sorts in its own main-thread task: about 23 ms by ID (already ordered, one reversal), about 117 ms by First Name, during which seven refreshes produced no frame.</li>
+    <li data-kind="read">TanStack Table sorts non-string columns descending first (RowSorting.ts:335–345) and copies every row object before sorting (getSortedRowModel.ts:48).</li>
+    <li data-kind="rejected">"24 ms is too little for 50,000 rows, so the click missed": the sort ran on an already ordered column.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The third example measures its rows. Its page load already jumps to the last of 10,000 unmeasured rows. How does that converge?</p>
+</section>
+
+<section class="step" data-part="D · TanStack Virtual's examples" data-title="dynamic: a page load that jumps to row 9,999" data-node="js layout frame">
+  <p class="holding"><span class="label">Question I hold</span><span>The rows have unknown heights and an estimate of 45 px. On mount the example calls <code>scrollToIndex(count - 1)</code>. How many frames until the last row is really at the bottom?</span></p>
+  <div class="tracelink" data-trace="u-tv-dynamic-load">Time zero is just before the reload; the first frame of the new page is the one at 137 ms.</div>
+  <div class="lanes" data-lanes='{"traces":["u-tv-dynamic-load"],"from":50,"to":180,"rows":["tasks","frames","mainFrames","main"],"pins":[[1,56.05,"tasks"],[2,127.66,"main.js"],[3,137.45,"main.js"],[4,154.07,"main.js"],[5,170.82,"main.js"],[6,170.62,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>A task of 71 ms: the module script. Most of it is the example generating 10,000 random sentences with faker, before any library code runs.</li>
+    <li><i>2</i>React's first render and effects, 4.7 ms: rows 0 onward are mounted, then the effect jumps to an estimated end.</li>
+    <li><i>3</i>First frame: a <code>scroll</code> event renders the rows at the estimated end and measures them; they are taller than 45 px, so the real end is further down; the reconcile callback in <code>requestAnimationFrame</code> writes the scroll position again.</li>
+    <li><i>4</i>Second frame: the same, with a smaller correction.</li>
+    <li><i>5</i>Third frame: the target did not move.</li>
+    <li><i>6</i>The list rests, 171 ms after the reload and 43 ms after React started.</li>
+  </ol>
+  <div class="lanes" data-lanes='{"traces":["u-tv-dynamic-load"],"titles":["the same trace: React first render, effects and the first measurements"],"from":127.4,"to":132.8,"rows":["main"],"pins":[[1,129.07,"main.layout"],[2,130.05,"main.layout"],[3,130.77,"main.layout"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The first rows are measured as React attaches their refs: a forced layout of all 53 objects.</li>
+    <li><i>2</i>After the jump, the rows at the estimated end: 72 objects.</li>
+    <li><i>3</i>The first of about twenty tiny forced layouts, one per measured row, 2 or 3 objects and 10 to 20 µs each: every measurement changes a size, and the next read needs layout again. The chart leaves out bars under 20 µs; the Try-it command lists them all.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="u-tv-dynamic-load/main.forcedLayouts"></b> forced layouts in the load, costing <b data-m="u-tv-dynamic-load/main.forcedMs" data-unit="ms"></b> together. <b data-m="u-tv-dynamic-load/main.scrollEvents"></b> scroll events and <b data-m="u-tv-dynamic-load/main.rafCallbacks"></b> animation-frame callbacks: the convergence loop. The longest task, <b data-m="u-tv-dynamic-load/main.maxTaskMs" data-unit="ms"></b>, is the example's data generation.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/examples/react/dynamic/src/main.tsx#L22-L32">TanStack Virtual examples/react/dynamic/src/main.tsx:22–32</a>
+<pre><span class="n">22</span>  const virtualizer = useVirtualizer({
+<span class="n">25</span>    <mark>estimateSize: () =&gt; 45</mark>,
+<span class="n">27</span>    directDomUpdates: true,
+<span class="n">30</span>  React.useEffect(() =&gt; {
+<span class="n">31</span>    <mark>virtualizer.scrollToIndex(count - 1, { align: 'end' })</mark>
+<span class="n">32</span>  }, [])</pre>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/packages/virtual-core/src/index.ts#L2022-L2028">packages/virtual-core/src/index.ts:2022–2028, 1498–1503</a>
+      <p>Why rows are measured synchronously here, and why it takes at least two quiet frames to stop:</p>
+<pre><span class="n">2022</span>    if (
+<span class="n">2023</span>      node.isConnected &amp;&amp;
+<span class="n">2024</span>      (!this.isScrolling || <mark>this.scrollState</mark>) &amp;&amp;
+<span class="n">2027</span>      this.resizeItem(index, this.options.measureElement(node, undefined, this))
+<span class="n">1498</span>    const STABLE_FRAMES =
+<span class="n">1499</span>      this.scrollState.index == null
+<span class="n">1500</span>        ? 1
+<span class="n">1503</span>          : <mark>2</mark></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Estimate, measure, correct</dt><dd>Positions are sums of sizes. Unmeasured rows count as the estimate; a measured row replaces it and moves everything after it. A jump to an index is therefore a loop: scroll, render, measure, recompute the target, scroll again, until it stops moving (<a href="anatomy.html">Module 3</a>).</dd>
+      <dt>Why the forced layouts are cheap here</dt><dd>The scroller has <code>contain: strict</code>, the rows are absolutely positioned, and there are a few dozen layout objects. Each forced layout touches two or three of them.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in this recording the jump to an unmeasured end settles in three frames, and the reload trace captured the whole load in the same renderer process.</p>
+    <p><b>No:</b> what those three frames looked like. Screenshots are not recorded in this headless setup, so I cannot say whether a frame showed rows in a wrong place. And 43 ms is for rows of plain text; the loop repeats the consumer's render each lap.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-tv-dynamic-load slices '^(Layout|ScrollLayer|FireAnimationFrame)$' main 120 180</code>: three <code>FireAnimationFrame</code> slices (ids 1 to 3), and before each a run of <code>Layout</code> slices with <code>dirtyObjects</code> 2 or 3 and <code>partialLayout: true</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">The dynamic example's load: 71 ms of example data generation, then mount and a jump to the estimated end that converges in three frames with about forty tiny forced layouts (2.7 ms in all).</li>
+    <li data-kind="read">Rows are measured synchronously while a scrollToIndex is in progress (virtual-core index.ts:2022–2028); an index target must hold for two frames before the loop stops (1498–1503).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Scrolling this list upward enters rows that were never measured. The frames lane turns amber on every third frame. What is missing from those frames?</p>
+</section>
+
+<section class="step" data-part="D · TanStack Virtual's examples" data-title="dynamic: scrolling up, and the frames without main" data-node="compositor frame layout present">
+  <p class="holding"><span class="label">Question I hold</span><span>Scrolling up, <b data-m="u-tv-dynamic-scrollup/frames.partial"></b> refreshes were presented without the main thread's update. The fixed list of step 9 had <b data-m="u-tv-fixed-rows/frames.partial"></b>. Is the measured list worse for the user?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>First one frame of the scroll-up in which a new row enters, then the two lists side by side on the compositor's own events.</p></div></div>
+  <div class="tracelink" data-trace="u-tv-dynamic-scrollup"></div>
+  <div class="lanes" data-lanes='{"traces":["u-tv-dynamic-scrollup"],"titles":["dynamic, scrolling up: one frame in which a never-measured row enters"],"from":333.2,"to":335.2,"rows":["compositor","main"],"pins":[[1,333.47,"compositor"],[2,333.65,"main.js"],[3,334.19,"main.layout"],[4,334.39,"main.js"],[5,334.57,"main.layout"],[6,334.65,"main.paint"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The compositor scrolls, sends <code>BeginMainFrame</code>, and <b>draws at once</b>, without waiting.</li>
+    <li><i>2</i>The <code>scroll</code> event: a new row above the viewport enters the range; React renders it at its estimated 45 px.</li>
+    <li><i>3</i>Style and layout: 9 of 44 objects.</li>
+    <li><i>4</i>The <code>ResizeObserver</code> callback, inside the same frame: the row is taller than 45 px. TanStack records the size and, because the row starts above the viewport, writes the scroll position by the difference so that the visible rows stay where they are.</li>
+    <li><i>5</i>A second style and layout pass for the moved rows (6 elements, 2 objects).</li>
+    <li><i>6</i>Paint and commit. The compositor shows this at its next draw.</li>
+  </ol>
+  <div class="lanes" data-lanes='{"traces":["u-tv-fixed-rows","u-tv-dynamic-scrollup"],"titles":["fixed list: every frame has a main update","dynamic list, scrolling up: a main update on some frames"],"from":30,"to":105,"rows":["compositor","frames","mainFrames"],"pins":[[1,33.62,"compositor",0],[2,33.64,"mainFrames",0],[3,50.19,"compositor",1],[4,49.91,"frames",1],[5,66.94,"compositor",1],[6,66.58,"frames",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Fixed list: the compositor draws <em>first</em>, with the rows committed in the previous frame…</li>
+    <li><i>2</i>…and sends <code>BeginMainFrame</code> after the draw. This frame's rows reach the screen at the next refresh, 17 ms after their vsync. Its record is green.</li>
+    <li><i>3</i>Dynamic list, a frame where a row enters: <code>BeginMainFrame</code> is sent first, the draw follows 0.2 ms later without it.</li>
+    <li><i>4</i>That refresh is amber: presented without the pending update.</li>
+    <li><i>5</i>At the next refresh the compositor again draws first, now including the row.</li>
+    <li><i>6</i>That refresh is green.</li>
+  </ol>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>In both lists a row that the main thread renders in the frame of vsync N is on the screen at vsync N+1. During a wheel scroll the compositor does not wait for the main thread; it draws its scrolled layers immediately. The colour differs only by bookkeeping. In the fixed list every frame has an update, the pipeline settles into "draw, then ask the main thread", and each main frame is counted complete when it is presented, a refresh late. In the dynamic list most frames have nothing new (rows are tall, so a row enters only every few frames), the compositor asks first and draws immediately, and the one frame that does have an update is recorded as a refresh that missed it.</p>
+    <p>What the measured list adds is pins 4 and 5: <b data-m="u-tv-dynamic-scrollup/main.layouts"></b> layouts for <b data-m="u-tv-dynamic-scrollup/main.scrollEvents"></b> scroll events, and 51 scroll-position writes from the <code>ResizeObserver</code> callback during a gesture the compositor is driving. The main thread is busy for <b data-m="u-tv-dynamic-scrollup/threads.mainUtilPct" data-unit="%"></b> of the trace.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/packages/virtual-core/src/index.ts#L2072-L2078">TanStack Virtual packages/virtual-core/src/index.ts:2072–2078, 2122–2123</a>
+      <p>The rule behind pin 4 of the first chart:</p>
+<pre><span class="n">2072</span>      const scrollOffset = this.getScrollOffset()
+<span class="n">2073</span>      const isFirstMeasure = !this.itemSizeCache.has(key)
+<span class="n">2074</span>      const defaultShouldAdjust = isFirstMeasure
+<span class="n">2078</span>          <mark>itemStart &lt; scrollOffset</mark>
+<span class="n">2122</span>        } else if (shouldAdjustScroll) {
+<span class="n">2123</span>          adjustedSync = <mark>this.applyScrollAdjustment(delta)</mark></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Immediate deadline</dt><dd>While a compositor scroll is in progress, the compositor's scheduler draws as soon as it has something of its own to show. Every <code>Scheduler::ScheduleBeginImplFrameDeadline</code> event between the first and last input of these scrolls says <code>IMMEDIATE</code>. <a href="frames.html">Module 2</a> has the scheduler's rules.</dd>
+      <dt>What the frame colours count</dt><dd>Green: the main thread's update for this vsync was eventually presented and no compositor-only frame went out while it was owed. Amber: one did. Neither says how late the update was; the lane's hover text does ("presented N ms after its vsync").</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read 82 amber frames against 2 as "the dynamic example keeps missing frames". The row reaches the screen one refresh after its scroll position in both examples. The amber count depends on how often the main thread has something new, not on how late it is. The rule I keep: do not compare "frames without main" between workloads with different update patterns; compare how long after its vsync the main thread's content was presented.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> during a compositor scroll, rows from the main thread trail the scroll position by one refresh in both examples; overscan exists to cover that refresh.</p>
+    <p><b>No:</b> that the scroll-position corrections are invisible. They happen before paint in the main frame, which argues for it, but I have no pixels of this scroll.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-tv-dynamic-scrollup tree 333.3 336 main 8</code>: inside <code>WebFrameWidgetImpl::UpdateLifecycle</code>, after the first <code>Layout</code>, a <code>FunctionCall</code> containing <code>ScrollableArea::SetScrollOffset</code>, then a second <code>UpdateLayoutTree</code> and <code>Layout</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Scrolling up into unmeasured rows: each entering row is measured by a ResizeObserver callback inside the same main frame, which writes the scroll position (51 times in this scroll) and causes a second small layout.</li>
+    <li data-kind="measured">In both the fixed and the dynamic list the main thread's rows are presented one refresh after the compositor's scroll position; the frame records label this "with main" in one and "without main" in the other.</li>
+    <li data-kind="rejected">"82 frames without the main update against 2 means the dynamic list is less smooth": the count follows how often there is an update, not how late it is.</li>
+  </ul>
+  <p class="next" data-answer="late"><b>Next question →</b> TanStack's repository also has a benchmark that reports "60 fps, 0 long frames" for scrolling. What is on the screen while it runs?</p>
+</section>
+
+<section class="step" data-part="D · TanStack Virtual's examples" data-title="TanStack's benchmark: sixty frames a second of nothing" data-node="bench frame present">
+  <p class="holding"><span class="label">Question I hold</span><span>The harness scrolls a list from top to bottom in 1.5 s and reports "scrollFps". What does that number see, and what would a person see?</span></p>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/benchmarks/src/lib/harness.ts#L93-L118">TanStack Virtual benchmarks/src/lib/harness.ts:93–97, 103–109, 113–118</a>
+      <p>The drive and the metric. One <code>scrollTop</code> write per animation frame; the metric is the mean gap between rAF timestamps:</p>
+<pre><span class="n"> 93</span>  const onFrame = (t: number) =&gt; {
+<span class="n"> 94</span>    <mark>frames.push(t - lastT)</mark>
+<span class="n"> 96</span>    if (!stop) requestAnimationFrame(onFrame)
+<span class="n">104</span>  while (performance.now() - startT &lt; durationMs) {
+<span class="n">107</span>    <mark>el.scrollTop = startOffset + (targetOffset - startOffset) * t</mark>
+<span class="n">108</span>    await nextFrame()
+<span class="n">113</span>  const longFrames = frames.filter((f) =&gt; f &gt; 32).length
+<span class="n">118</span>  const fps = avgFrame &gt; 0 ? 1000 / avgFrame : 0</pre>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/11b48e4ab8b08d483c8fe29a31ef11261ffbda04/benchmarks/README.md">benchmarks/README.md:125–132</a>
+      <p>The published result, for four libraries: 60 fps and 0 long frames in every cell, with this caveat:</p>
+<pre><span class="n">130</span>  &gt; **Caveat:** at 10k items, none of these libraries even break a sweat.
+<span class="n">131</span>  &gt; A 1.5 s rAF-paced scroll is too gentle to expose perf differences.</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>The benchmark's workload</dt><dd>10,000 rows of 30 px in a 600 px scroller, overscan 5 (<code>scenarios/types.ts:109–115</code>, <code>TanstackPage.tsx</code>): 300,000 px in 1.5 s, about 3,300 px per frame.</dd>
+      <dt>What I traced</dt><dd>The benchmark's own pages are not in the lab. <code>u-tv-bench-drive</code> runs a copy of <code>measureScrollFps</code> against the <code>fixed</code> example's row list (10,000 rows of 35 px, 200 px high, overscan 5). I added a measure per rAF gap, and after each write a mark that says whether the rows in the DOM cover the position just written.</dd>
+      <dt>When a scroll event fires</dt><dd>Once per frame, before the animation-frame callbacks. A scroll position written <em>inside</em> a rAF callback is reported by the <code>scroll</code> event of the next frame.</dd>
+    </dl></div>
+  </div>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The run reports 60 fps, 0 long frames, 0 jank. During those 1.5 s, what does the list show?</p>
+    <div class="opts"><button data-k="a">Rows, perhaps a few pixels behind.</button><button data-k="b">An empty box.</button><button data-k="c">Rows on some frames, blank on others.</button></div>
+    <div class="reveal"><p><b>An empty box.</b> Of the positions written, <b data-m="u-tv-bench-drive/marks.bench frame blank"></b> had no rendered row covering them when the frame went to paint; <b data-m="u-tv-bench-drive/marks.bench frame with rows"></b> did (the first two, near the top).</p></div>
+  </div>
+  <div class="tracelink" data-trace="u-tv-bench-drive"></div>
+  <div class="lanes" data-lanes='{"traces":["u-tv-bench-drive"],"from":99.5,"to":121,"rows":["frames","mainFrames","main","app","marks"],"pins":[[1,100.87,"main.js"],[2,101.57,"main.js"],[3,101.68,"main.layout"],[4,101.96,"marks"],[5,108,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The <code>scroll</code> event of this frame. It reports the position written in the <em>previous</em> frame; React renders rows for that position.</li>
+    <li><i>2</i>Then the animation-frame callbacks: the gap recorder, and the driver, which writes the next position, about 3,900 px further.</li>
+    <li><i>3</i>The write needs layout for the rows just rendered (a forced layout, 0.2 ms).</li>
+    <li><i>4</i>My mark: the DOM holds rows for the old position; the new one is a hundred rows away. Paint follows.</li>
+    <li><i>5</i>One rAF gap, 16.67 ms: the only thing the harness measures.</li>
+  </ol>
+  <div class="filmstrip" style="grid-template-columns:repeat(4,minmax(0,1fr))">
+    <figure><img alt="the list at rest: rows 0 to 5" src="data:image/png;base64,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"><figcaption>before the run</figcaption></figure>
+    <figure><img alt="an empty list with a scrollbar" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZIAAADKCAIAAAAASlGDAAAD9UlEQVR4nOzcPUpkWRiA4epp0w46aEFMRANXoIkrcAWuw5W4HnNNzQV/wVER/EEzsWAcBLkzlkNn3nd4Hiio890Tv9wTnDt3eXE0AeiYe/0tLK5MAL7IdDr9/c0312d/TABSZAuIkS0gRraAGNkCYmQLGKOdnZ3PHskWMDpvzfqsXLIFjMuwVjPLJVvAiHzs1MeJbAFj8dmp8F/zb5cXRy73AF/I5R7gf062gBjZAmJkC4iRLSBGtoAY2QJiZAuIkS0gRraAGNkCYmQLiJEtIEa2gBjZAmJkC4iRLSBGtoAY2QJiZAuIkS0gRraAGNkCYmQLiJEtIEa2gBjZAmJkC4iRLSBGtoAY2QJiZAuIkS0gRraAGNkCYmQLiJEtIEa2gBjZAmJkC4iRLSBGtoAY2QJiZAuIkS0gRraAGNkCYmQLiJEtIEa2gBjZAmJkC4iRLSBGtoAY2QJiZAuIkS0gRraAGNkCYmQLiJEtIEa2gBjZAmJkC4iRLSBGtoAY2QJiZAuIkS0gRraAGNkCYmQLiJEtIEa2gBjZAmJkC4iRLSBGtoAY2QJi5iYAo/Hy8rK3t3d6evr09PTjx4/l5eWNjY25uX+USraAsbi6utrd3b2/v39bPjw8HBwcnJ2dbW5uzs/Pv29zSATG4rVQ7816d3d3d3x8PJzIFjAWh4eHM+fn5+fDpUMiMBaPj48z57e3t8OlbAFjMZ1OZ86fn5+HS4dEIEa2gBjZAmJkC4iRLSBGtoAY2QJiZAsYi58/f86cLywsDJeyBYzF6urqzPnS0tJwKVvAWKyvrw+/9PDm169fa2trw4nLPcBYfP/+fWtra39//+TkZPi9rdf5cNu3y4ujhcWVCcAX+ewq4kw312cOiUCMbAExsgXEyBYQI1tAjGwBMbIFxMgWECNbQIxsATGyBcTIFhAjW0CMbAExsgXEyBYQI1tAjGwBMbIFxMgWECNbQIxsATGyBcTIFhAjW0CMbAExsgXEyBYQI1tAjGwBMbIFxMgWECNbQIxsATGyBcTIFhAjW0CMbAExsgXEyBYQI1tAjGwBMbIFxMgWECNbQIxsATGyBcTIFhAjW0CMbAExsgXEyBYQI1tAjGwBMbIFxMgWECNbQIxsATGyBcTIFhAjW0CMbAExsgXEyBYQI1tAjGwBMbIFxMgWECNbQIxsATGyBcTIFhAjW0CMbAExsgXEyBYQI1tAjGwBMbIFxMxNAMZhZ2fns0fb29vv/71tAWMxbNN/zGULGJGP5fo4kS1gXIadmvn+JVvA6LzV6rMz47fLi6OFxZUJwBeZTqe/v/nm+szbFhAjW0CMbAExsgXEyBYQI1tAzN93Eq/+PJ4ARPwFAAD///IYIeYAAAAGSURBVAMA4n2I4MVt6eUAAAAASUVORK5CYII="><figcaption>harness drive, mid-run (all five samples look like this)</figcaption></figure>
+    <figure><img alt="rows 9966 to 9971" src="data:image/png;base64,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"><figcaption>after the run has stopped</figcaption></figure>
+    <figure><img alt="rows 43 to 48" src="data:image/png;base64,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"><figcaption>control: wheel input at 2,400 px/s, mid-scroll</figcaption></figure>
+  </div>
+  <p class="note">The four pictures are not from the trace. They are <code>page.screenshot()</code> captures of the list in a separate probe run of the same drive (five during the run, 220 ms apart, all blank), and of a wheel scroll as control.</p>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The harness's own result for this run: <b data-m="u-tv-bench-drive/app.bench rAF gap.n"></b> gaps with a mean of <b data-m="u-tv-bench-drive/app.bench rAF gap.mean" data-unit="ms"></b> and a maximum of <b data-m="u-tv-bench-drive/app.bench rAF gap.max" data-unit="ms"></b>, which is 60 fps, no long frame, no jank. The compositor agrees on the frames: <b data-m="u-tv-bench-drive/frames.all"></b> presented with the main thread's update, <b data-m="u-tv-bench-drive/frames.dropped"></b> dropped. Every one of them is a correct, punctual frame of an empty list.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The drive and the library are one frame out of step. The write happens after this frame's <code>scroll</code> event, so the library learns of it in the next frame, by which time the driver has moved another 3,900 px. Rows are always rendered for a position the scroller has already left, and at this speed the old position is more than a viewport away. The same harness drives the four libraries the README compares, each of which also renders from a scroll event, so the scroll rows of its table compare how fast each library renders rows that are never seen. That last sentence is an inference: I traced TanStack's example, not the benchmark's pages.</p>
+    <p>One more claim in that README does not match the pinned source. It explains a slow mount at 100,000 rows by "we eagerly populate <code>measurementsCache</code> (one object per item)". At 3.19.11 single-lane lists keep sizes in a <code>Float64Array</code> and create item objects lazily; <a href="anatomy.html">Module 3</a> reads that code.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed that a steady 60 from a rAF counter, with the compositor's frame records all green, meant a smooth scroll. Both instruments were right and the list was blank. A frame rate measures that frames were made on time. It does not measure that the frame showed the right thing. The rule I keep: a scroll benchmark needs a content check, at the moment of paint, next to its frame count.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: Tablelab's scroll benchmark records, per presented frame, whether the rows in the frame match the scroll position (the lab's "content complete" mark is this check) and how old the data is, and drives the scroll with input events so that the compositor and the frontend are in their real order. A frame count alone would have passed this run.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> driven as TanStack's harness drives a list, the fixed example shows no rows during the scroll while every frame metric is perfect.</p>
+    <p><b>No:</b> that TanStack Virtual shows blank lists to users. Under wheel input at 2,400 px/s (the control picture, and step 9) the rows are there. The blank frames belong to this way of driving.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs u-tv-bench-drive marks . 95 125</code> shows two frames: a 16.66 ms <code>bench rAF gap</code> and a <code>bench frame blank</code> mark in each. <code>node lab/harness/q.mjs u-tv-bench-drive raw 'app: bench result' 1</code> prints the harness's numbers: <code>fps</code> 60.0, <code>longFrames</code> 0, <code>jankMs</code> 0. On the lab page, <code>window.__lab.programScroll(3900, 90)</code> in the console drives any panel the same way.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">TanStack's benchmark harness writes scrollTop once per animation frame and reports 1000 ÷ the mean rAF gap as scrollFps (harness.ts:93–118).</li>
+    <li data-kind="measured">Driven that way, the fixed example reports 60 fps with no long frame while 89 of 91 written positions had no rendered row; screenshots of a probe run show an empty list.</li>
+    <li data-kind="inferred">The scroll event for a write made in a rAF callback fires in the next frame, so the library renders for a position the driver has already left; at about 3,900 px per frame that is always off screen.</li>
+    <li data-kind="rejected">"60 fps from a rAF counter, confirmed by the compositor's frame records, means the scroll was smooth."</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Six showcases, four ways to print a frame rate. What does each number mean, and what does each showcase leave out?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · What a number means" data-title="What a benchmark number means" data-node="bench method">
+  <p class="holding"><span class="label">Question I hold</span><span>Faced with a library's demo or its benchmark table: what do I ask before I believe, or compare, a number?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>I put the fifteen traces in one table and write down the questions that separated a meaningful number from a misleading one.</p></div></div>
+  <div class="scroll"><table>
+    <tr><th>Showcase</th><th>Workload it really is</th><th>Unit of work</th><th>Dominant cost here</th><th>What it does not exercise</th></tr>
+    <tr><td>rt <code>two_billion_rows</code></td><td>about 1,000 cells, every one rewritten every frame (200 rows per pixel), data generated synchronously</td><td>one main frame per refresh, about 11 ms</td><td>style and layout of the whole table</td><td>partial updates (a row or two entering), slow or remote data, stored data, row-accurate positioning</td></tr>
+    <tr><td>rt benchmark, protocol calls</td><td>the same table shape plus a style listener; scroll position written by script</td><td>one protocol round trip (about 2 ms of JavaScript), usually followed by one main frame</td><td>style and layout, in the frame between calls</td><td>input, compositor scrolling, the rAF commit path as the first draw, any check of presented frames</td></tr>
+    <tr><td>rt benchmark, rAF loop</td><td>script scroll, 10 px across and 20 px down per frame</td><td>one main frame</td><td>style and layout</td><td>input and compositor scroll; its library counter misses the scroll path</td></tr>
+    <tr><td>tv <code>fixed</code></td><td>about 17 one-line rows, or a few hundred one-line cells, constant sizes</td><td>one scroll event, 1–2 ms</td><td>React render of the visible window</td><td>any cell cost, measurement, data, more than a small viewport</td></tr>
+    <tr><td>tv <code>table</code></td><td>58 rows × 8 text cells re-rendered to add one row; 50,000 rows in memory</td><td>one scroll event, about 3 ms; one click, 23 to 117 ms</td><td>React render; the sort in the click task</td><td>wide tables, costly cells, sorting off the main thread, remote data</td></tr>
+    <tr><td>tv <code>dynamic</code></td><td>a few tall text rows, measured on entry</td><td>one scroll event; a measuring lap per entering row</td><td>almost nothing (about 4% of the main thread)</td><td>many measured cells per row, measurement of costly content, large viewports</td></tr>
+    <tr><td>tv benchmark harness</td><td>thousands of pixels per frame by script, one frame out of step with the library</td><td>one rAF gap</td><td>rendering rows that are not shown</td><td>anything visible during the scroll</td></tr>
+  </table></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p><b>1. Which clock ticked?</b> Protocol round trips, a library's draw counter, rAF callbacks and presented frames are four different counts. Only the last is about the screen, and steps 6 to 8 and 14 show each of the others reading "about 60" for a different reason.</p>
+    <p><b>2. Who moved the scroller, and when in the frame?</b> An input goes to the compositor first and reaches the page as a <code>scroll</code> event at the start of a frame. A script write goes to the main thread only, and if it is made in a rAF callback the page hears of it a frame later. Same pixels of travel, different pipeline.</p>
+    <p><b>3. What did one unit contain?</b> JavaScript only (an awaited draw), or style and layout too (if something forced them, or a frame ran), or paint and raster (only if a frame was produced). Step 7's two bars are the same sixty iterations with and without the last two.</p>
+    <p><b>4. What was on the screen?</b> A frame can be on time and wrong: blank (step 14), one refresh behind (steps 6 and 13), or stale. A benchmark has to look.</p>
+    <p><b>5. What workload was it?</b> Cells on screen, what a step changes, where the data is. The showcases differ by a hundred times in cells, and each is the favourable case for its library's design: regular-table's shows a full rewrite fitting in a frame, TanStack's show a small window with almost nothing in it.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal for Tablelab's published numbers: drive with input events through the browser; report the compositor's frame outcomes and the main thread's presentation delay rather than a mean rate; mark content-complete per frame and report data age; state cells on screen and cells changed per step; and keep one run that is deliberately unfavourable (a full rewrite, a wide viewport, a slow source) next to the favourable one.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> for these pinned versions, in these recordings, what each showcase exercises and what each printed number counts.</p>
+    <p><b>No:</b> a ranking of the two libraries, or a statement about other machines. Headless Chrome with software raster, one run each. Where the comparison matters, <a href="javascript.html">Modules 4</a> and <a href="rendering.html">5</a> hold cell counts equal, and <code>f-variance</code> in <a href="frames.html">Module 2</a> shows how far repeat runs move.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Pick a virtualization library you use and find its benchmark or demo. Answer the five questions from its source before running it; then record it with <code>lab/harness/record.mjs</code> by adding an entry to <code>lab/harness/extra/</code> (the entries in <code>showcases.mjs</code> are a model).</div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">A frame-rate figure is comparable only with its clock (round trips, draw calls, rAF, presented frames), its driver (input or script, and when in the frame), the contents of one unit, and a check of what was shown.</li>
+    <li data-kind="inferred">Each showcase is the favourable case of its library's design; none exercises slow data, costly cells or a partial update on a large viewport.</li>
+  </ul>
+  <p class="next" data-answer="number"><b>Next question →</b> Can you answer the questions of this module without scrolling back?</p>
+</section>
+
+<section class="step" data-part="E · What a number means" data-title="Check yourself" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>What should I now be able to say without looking?</span></p>
+  <div class="exercise"><span class="label">1</span>regular-table's benchmark prints "Throughput (fps)". What event increments it, and why can it be higher than the display's refresh rate?
+    <details><summary>Answer</summary><p>One returned <code>page.evaluate</code> call (benchmark.mjs:125–129, 166). The call resolves when the awaited <code>draw()</code> has written the DOM; nothing waits for a frame. When two calls reach the main thread within one refresh the second runs at once: 60 calls in 881 ms in <code>u-rt-bench-steps</code>.</p></details></div>
+  <div class="exercise"><span class="label">2</span>The same sixty iterations cost about the same layout time as one loop and as sixty protocol calls, but paint almost vanishes in the loop. Why?
+    <details><summary>Answer</summary><p>In the loop, the read in <code>scrollTop += 100</code> forces style and layout for the previous draw, so that work happens anyway. Paint happens only in a frame, and the loop never yields for one: one task, one frame. With protocol calls a <code>BeginMainFrame</code> runs between most iterations.</p></details></div>
+  <div class="exercise"><span class="label">3</span>In <code>two_billion_rows</code>, why does a 39 px wheel step change every cell, and what three costs follow?
+    <details><summary>Answer</summary><p>The scroller is capped at 10,000,000 px and position maps to rows by proportion, about 200 rows per pixel. So every text changes (a thousand text shapings per frame), the four custom properties written on the table restyle every element, and the automatic table layout runs over the whole table.</p></details></div>
+  <div class="exercise"><span class="label">4</span>A trace shows 127 forced layouts in a two-second scroll. What do you check before calling it thrashing?
+    <details><summary>Answer</summary><p>Layouts per frame and the frame's length, against a run without them. In the diagonal scroll each forced layout replaced the frame's own layout; the median frame was about a millisecond longer.</p></details></div>
+  <div class="exercise"><span class="label">5</span>TanStack's table example uses <code>overscan: 20</code>. What does that change about renders per scroll event, and why?
+    <details><summary>Answer</summary><p>Nothing about how often: the notification is keyed on the first and last <em>visible</em> index (virtual-core index.ts:1021–1024). It changes how many rows each render produces: about 58 instead of about 20.</p></details></div>
+  <div class="exercise"><span class="label">6</span>A scroll benchmark writes <code>scrollTop</code> in a rAF callback and reports 60 fps with no long frame; the compositor's records are all "presented with the main update". Name the thing neither measured, and the mechanism that hid it.
+    <details><summary>Answer</summary><p>Whether the frame contained rows. The <code>scroll</code> event for a write made in a rAF callback fires in the next frame, so the library renders for a position the driver has already left. At thousands of pixels per frame, those rows are off screen: an empty list, on time, sixty times a second.</p></details></div>
+  <div class="exercise"><span class="label">7</span>Two traces: one has 2 frames "without the main update", the other 82. In which did rows reach the screen later after their scroll position?
+    <details><summary>Answer</summary><p>Neither: one refresh in both (<code>u-tv-fixed-rows</code> and <code>u-tv-dynamic-scrollup</code>). The count follows how often the main thread had an update and whether the compositor asked before or after drawing. Compare presentation delay, not the colour count.</p></details></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> if these seven come easily, you can read a library's benchmark table with the right suspicion.</p>
+    <p><b>No:</b> that the same answers hold for other versions. Both libraries changed their scroll paths within the last few releases; re-read the source at the version you use.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">The method of this module: read the example's code for the workload, find the line that increments the printed number, trace it as its own driver drives it, then again with input, and check the screen.</li>
+  </ul>
+  <p class="next"><b>Next →</b> <a href="clinic.html">Module 11</a> hands you traces without a walkthrough.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>

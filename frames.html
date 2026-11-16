@@ -1,0 +1,1160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What happened to each frame? · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">2 · What happened to each frame?</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="vsync">vsync</span><span class="sep">→</span><span data-node="input">input</span><span class="sep">→</span>
+    <span data-node="scheduler">scheduler + deadline</span><span class="sep">→</span><span data-node="main">main frame</span><span class="sep">→</span>
+    <span data-node="commit">commit</span><span class="sep">→</span><span data-node="activate">activate</span><span class="sep">→</span>
+    <span data-node="draw">draw + submit</span><span class="sep">→</span><span data-node="present">presented</span>
+    <span class="sep">·</span><span data-node="reporter">frame records</span><span class="sep">·</span><span data-node="method">instruments</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 2 · recorded 2026-11-16</p>
+  <h1>Sixty times a second the display asks for a picture. What did the user get each time, and how do I know?</h1>
+  <p class="lede">Module 1 followed one scroll through the main thread: event, JavaScript, style, layout, paint, commit. This module stands on the other side of that commit, on the compositor thread, which answers every vsync whether the main thread is ready or not. We take one vsync apart event by event, then use the compositor's own record of each frame to say exactly what was shown: the main thread's update, an older one, or nothing.</p>
+  <p>The module's centre is a contrast. The same table code is scrolled three ways: by a steady wheel gesture, by a scrollbar click that the compositor animates, and by single wheel notches. Chrome labels almost every frame of the first "presented", almost every frame of the second "presented without the main thread's update" and half the frames of the third, with a main thread that needs one or two milliseconds per frame in all of them; and in all three the rows reach the screen one vsync after the position they belong to. Working out why makes the words exact, and they are the words every later module reports: frames with the main thread's update, without it, dropped.</p>
+  <p><b>Why this matters for Tablelab.</b> Our goal names four observation points that must not be confused: DOM written, requestAnimationFrame, commit, presented. This module pins each to a trace event and measures the gaps between them. It also measures what a late draw costs in whole vsyncs, which is the budget our view core and painters have to share.</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>) for the trace vocabulary and the order of work inside one main frame. Each step links the trace it reads; every command shown was run on these traces. From the repository root: <code>node lab/harness/q.mjs &lt;id&gt; frames</code> prints one line per vsync.</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57 on Linux, device scale factor 1.75, one traced run per scenario unless stated. Headless Chrome has no display: its vsync is a 60 Hz timer and a frame counts as presented a fraction of a millisecond after it is drawn (step 1 shows both). Orders of events and counts of frames carry over to a real screen; times from draw to light do not. Chromium source is quoted at revision 73c14f6 (M154), DevTools frontend at 66df492.</p>
+  <div class="foot"><button class="primary" data-start>Start: 18 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · One vsync, end to end" data-title="A vsync arrives: what the compositor does first" data-node="vsync input scheduler draw present"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>A steady wheel scroll, nothing wrong. For one tick of the display's clock: which events does the compositor thread write, in what order, before the main thread is asked anything?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I take <code>f-scroll-tanstack</code>: a constant 2400 px/s wheel scroll over the TanStack table of Module 1. (The recording holds two such gestures of one second each, 67 ms apart; that pause becomes useful in step 5.) I pick one ordinary tick in the middle of the motion: the one the trace numbers <b>77</b>, at 99.89 ms. Then I list everything the frame machinery wrote in the next 0.7 ms, on two threads in two processes. The command prints 30 lines; these twelve are the ones to read:</p>
+<pre>node lab/harness/q.mjs f-scroll-tanstack slices \
+  'Scheduler::|^BeginFrame$|OnTimerTick|OnBeginFrame|HandleGestureScrollUpdate$|ScheduledActionDraw|DrawFrame|SendBeginMainFrame|Display::' 99.8 100.6</pre>
+  </div></div>
+  <div class="tracelink" data-trace="f-scroll-tanstack">In Perfetto: pin <code>Compositor</code> and <code>CrRendererMain</code> of the Renderer process and <code>VizCompositorThread</code> of the GPU Process; search <code>Scheduler::BeginImplFrame</code> and step through the hits with the arrow keys.</div>
+<pre>  ms     event                                              thread (process)
+<span class="cp">1</span> 99.89  BeginFrame {frameSeqId: 77}                         Compositor (Renderer)     <span class="c">an instant stamped with the frame time</span>
+   99.96  DelayBasedBeginFrameSource::OnTimerTick            VizCompositorThread (GPU) <span class="c">headless Chrome's "vsync" is this timer</span>
+   99.99  ExternalBeginFrameSource::OnBeginFrame             Compositor                <span class="c">the tick arrives in the renderer</span>
+<span class="cp">2</span>100.00  <mark>Scheduler::BeginImplFrame</mark> {sequence_number: 77, interval_us: 16666, main_thread_missed_last_deadline: true}
+<span class="cp">3</span>100.02  InputHandlerProxy::HandleGestureScrollUpdate {dy: 39}                        <span class="c">the wheel's 39 px, applied here</span>
+<span class="cp">4</span>100.06  <mark>Scheduler::ScheduleBeginImplFrameDeadline</mark> {deadline mode: IMMEDIATE}
+  100.07  Scheduler::OnBeginImplFrameDeadline
+<span class="cp">5</span>100.07  ProxyImpl::ScheduledActionDraw   0.10 ms
+  100.17  <mark>DrawFrame</mark> {frameSeqId: 77}                                                      <span class="c">a compositor frame left for the GPU process</span>
+<span class="cp">6</span>100.18  SendBeginMainFrame · RequestMainThreadFrame                                  <span class="c">only now is the main thread asked</span>
+<span class="cp">7</span>100.19  Display::DrawAndSwap   0.36 ms                     VizCompositorThread (GPU)
+<span class="cp">8</span>100.56  Display::FrameDisplayed                            VizCompositorThread (GPU) <span class="c">the presentation timestamp</span></pre>
+  <div class="lanes" data-lanes='{"traces":["f-scroll-tanstack"],"from":99.75,"to":101.75,"rows":["inputs","compositor","viz","mainFrames","main","app"],"pins":[[1,99.99,"inputs"],[3,100.03,"compositor"],[5,100.12,"compositor"],[6,100.2,"mainFrames"],[7,100.37,"viz"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>The tick.</b> <code>BeginFrame</code> is an instant written with the frame's nominal time as its timestamp, 0.1 ms before any renderer code ran for it. Its <code>frameSeqId</code> (here 77) is the number that joins every event of this vsync. On the chart, pin 1 is the wheel event the browser generated for this tick; it will matter in step 14.</li>
+    <li><i>2</i><b>The compositor's frame begins.</b> <code>Scheduler::BeginImplFrame</code> ("impl" is Chromium's old name for the compositor thread). Its argument <code>main_thread_missed_last_deadline</code> is <code>true</code>, in a trace where nothing is wrong. Hold that thought until step 9.</li>
+    <li><i>3</i><b>Input.</b> The scroll is applied on this thread: the layer's offset moves by 39 px. No JavaScript has run.</li>
+    <li><i>4</i><b>The deadline.</b> The scheduler decides when to stop waiting and draw. Here the mode is <code>IMMEDIATE</code>: now.</li>
+    <li><i>5</i><b>Draw and submit.</b> The compositor builds a frame from the layers and tiles it already has, at the new offset, and sends it to the GPU process (<code>DrawFrame</code>).</li>
+    <li><i>6</i><b>Then</b> it posts <code>ProxyMain::BeginMainFrame</code> to the main thread. The chart's "main frames" bar starts here: the frame is already on its way to the screen.</li>
+    <li><i>7</i><b>Viz</b>, the display compositor in the GPU process, combines the renderer's frame with the browser's and draws.</li>
+    <li><i>8</i><b>Presented</b>, 0.67 ms after the tick.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The whole compositor-side path, from tick to presented frame, took less than a millisecond, and the main thread had no part in it. The frame shows the table's layer moved by 39 px, with whatever rows the main thread had committed <em>before</em> this tick.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">Files I am reading, and why</span>
+      <p>To know which line writes each event, so that I can trust its timestamp and its arguments:</p>
+<pre><span class="c">event                                     written at (Chromium 73c14f6)</span>
+BeginFrame                                cc/trees/layer_tree_host_impl.cc:3655
+Scheduler::BeginImplFrame                 cc/scheduler/scheduler.cc:588
+Scheduler::ScheduleBeginImplFrameDeadline cc/scheduler/scheduler.cc:866
+Scheduler::OnBeginImplFrameDeadline       cc/scheduler/scheduler.cc:891
+ProxyImpl::ScheduledActionDraw            cc/trees/proxy_impl.cc:851
+DrawFrame                                 cc/trees/layer_tree_host_impl.cc:3028
+SendBeginMainFrame, RequestMainThreadFrame cc/trees/proxy_impl.cc:831, 847
+Display::DrawAndSwap                      components/viz/service/display/display.cc:755
+Display::FrameDisplayed                   components/viz/service/display/display.cc:1362</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler.cc;l=586">cc/scheduler/scheduler.cc:586–590</a>
+<pre><span class="n">586</span>  bool main_thread_is_in_high_latency_mode =
+<span class="n">587</span>      state_machine_->main_thread_missed_last_deadline();
+<span class="n">588</span>  <mark>TRACE_EVENT2("cc,benchmark", "Scheduler::BeginImplFrame", "args",</mark>
+<span class="n">589</span>               args.AsValue(), "main_thread_missed_last_deadline",
+<span class="n">590</span>               main_thread_is_in_high_latency_mode);</pre>
+      <p>One per started vsync, with the frame's time, interval and sequence number. This is the event to count vsyncs by.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Vsync, BeginFrame</dt><dd>The display refreshes at a fixed rate (60 Hz here: every 16.67 ms). Viz turns each refresh into a <code>BeginFrame</code> message to every compositor that asked for one. "A vsync" in this module means one such tick, identified by its sequence number.</dd>
+      <dt>Three compositing actors</dt><dd><code>CrRendererMain</code> makes content (DOM, style, layout, paint). The renderer's <code>Compositor</code> thread owns the layers, scrolls and animates them and builds a frame per vsync. <code>VizCompositorThread</code> in the GPU process puts all processes' frames on the screen.</dd>
+      <dt>Deadline</dt><dd>Inside one vsync the compositor waits until a chosen moment, then draws with what it has. Which moment, and what it waits for, is this module's main mechanism (steps 7 to 9).</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the order of work on the compositor for a change it can make alone (a scroll), and that this path does not include the main thread.</p>
+    <p><b>No:</b> anything about real display timing. Here the tick is a timer (<code>DelayBasedBeginFrameSource::OnTimerTick</code>) and "presented" follows the draw by 0.4 ms. On a screen the finished frame waits for the next refresh. Times after pin 5 are a floor, not a measurement of a device.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Run the command above for the next tick (<code>116.4 117.4</code>). Expected: again 30 lines, the same events in the same order, with <code>frameSeqId: 78</code>, the draw at 116.84 and presentation at 117.33 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Wheel scroll, one vsync: BeginImplFrame → scroll applied → deadline (IMMEDIATE) → draw → submit → viz draw → presented, all within 0.7 ms and before the main thread is asked.</li>
+    <li data-kind="read">Each vsync starts with Scheduler::BeginImplFrame (scheduler.cc:588); frameSeqId / sequence_number joins a vsync's events across threads.</li>
+    <li data-kind="measured">Headless Chrome: vsync is a timer in viz, and a frame is "presented" about 0.4 ms after it is submitted.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The compositor asked the main thread for a frame <em>after</em> it had drawn. So where do the rows that the main thread now produces go?</p>
+</section>
+
+<section class="step" data-part="A · One vsync, end to end" data-title="The main thread's turn, and where its work lands" data-node="main commit activate draw present"
+  data-ask="which|For one vsync: whose work is in the picture the user gets, and from which vsync is the main thread's part?">
+  <p class="holding"><span class="label">Question I hold</span><span>The main thread starts its frame for vsync 77 at 100.2 ms and needs about 1 ms. Which presented frame contains its rows?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The main thread's frame for vsync 77 commits at 101.15 ms, 1.3 ms after the tick, with 15 ms of the interval left. When are its rows on the screen?</p>
+    <div class="opts"><button data-k="a">Within vsync 77: the compositor draws again as soon as the commit arrives.</button><button data-k="b">They were already in the frame presented at 100.56 ms.</button><button data-k="c">In the frame of vsync 78, about 17 ms after tick 77.</button></div>
+    <div class="reveal"><p><b>In the frame of vsync 78.</b> The compositor draws once per vsync, and it had already drawn for 77. The commit is activated at 101.4 ms and then waits 15.5 ms for the next draw. Presented at 117.33 ms: 17.4 ms after tick 77, although the work took 1 ms.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div><p>I continue the listing of step 1 on the main thread, then follow the result back to the compositor (<code>q.mjs f-scroll-tanstack slices '…' 100.1 117.4</code>, adding <code>ProxyMain::BeginMainFrame$|^Commit$|NotifyReadyToCommit|CommitComplete|ActivateLayerTree</code>).</p></div></div>
+<pre>  ms     event                                              thread
+<span class="cp">1</span>100.20  <mark>ProxyMain::BeginMainFrame</mark> {begin_frame_id: 77}  0.95 ms   CrRendererMain   <span class="c">waited 0.02 ms in the queue</span>
+  100.33    EventDispatch {type: scroll}  0.49 ms                                 <span class="c">TanStack renders rows here (Module 1)</span>
+<span class="cp">2</span>101.10    <mark>Commit</mark> {frameSeqId: 77}  0.04 ms                 CrRendererMain
+  101.15  Scheduler::NotifyReadyToCommit                     Compositor
+  101.19  LayerTreeHostImpl::CommitComplete  0.08 ms         Compositor       <span class="c">the new tree is the "pending" tree</span>
+<span class="cp">3</span>101.38  <mark>ActivateLayerTree</mark> {frameId: 10}                   Compositor       <span class="c">it becomes the tree that is drawn</span>
+          <span class="c">… 15.5 ms in which nothing is drawn …</span>
+  116.56  BeginFrame {frameSeqId: 78}
+<span class="cp">4</span>116.84  ProxyImpl::ScheduledActionDraw → DrawFrame {frameSeqId: 78}  Compositor  <span class="c">first draw of the tree from frame 77</span>
+<span class="cp">5</span>117.33  Display::FrameDisplayed                            VizCompositorThread</pre>
+  <div class="lanes" data-lanes='{"traces":["f-scroll-tanstack"],"from":97,"to":136,"rows":["frames","compositor","mainFrames","main","viz"],"pins":[[1,100.6,"mainFrames"],[3,101.37,"compositor"],[4,116.93,"compositor"],[5,117.16,"viz"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The main frame for vsync 77: one task on <code>CrRendererMain</code>, containing the scroll event, style, layout, paint and <span class="cp">2</span> the main-thread side of the commit.</li>
+    <li><i>3</i>Commit copies the main thread's result to the compositor's <b>pending tree</b>; <b>activation</b> makes it the <b>active tree</b>, the one draws use. Raster of new tiles happens between the two (0.2 ms here).</li>
+    <li><i>4</i>The next draw, in vsync 78. It combines two things from different ticks: the scroll offset of tick 78 and the rows rendered for tick 77.</li>
+    <li><i>5</i>Presented. On the "frames" row each box is one vsync, 16.67 ms wide; hover one to see when its main-thread update was presented.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>In a healthy wheel scroll the picture for vsync N contains the compositor's scroll for N and the main thread's rows for N−1. The rows are one frame behind the position they were computed for, by construction: the compositor does not wait for them.</p>
+    <p>For a virtualized table this is the reason overscan exists. The picture of vsync N is filled only if the rows rendered for N−1 reach at least one frame's scroll distance (39 px here) beyond the viewport. Module 1 showed what happens when the main thread falls further behind than the overscan.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=1615">cc/scheduler/scheduler_state_machine.cc:1615–1622</a>
+      <p>Is "one frame behind" an accident of this trace? The scheduler says it is policy while a scroll has smoothness priority:</p>
+<pre><span class="n">1615</span>bool SchedulerStateMachine::ImplLatencyTakesPriority() const {
+<span class="n">1616</span>  // Don't wait for the main thread if we are prioritizing smoothness.
+<span class="n">1617</span>  <mark>// We do not attempt to synchronize with the main thread for scroll handlers.</mark>
+<span class="n">1621</span>  if (SMOOTHNESS_TAKES_PRIORITY == tree_priority_)
+<span class="n">1622</span>    return true;</pre>
+      <p>Event sites for this step: <code>ProxyMain::BeginMainFrame</code> <code>cc/trees/proxy_main.cc:216</code>; <code>Commit</code> <code>proxy_main.cc:434</code>; <code>ActivateLayerTree</code> <code>cc/trees/layer_tree_impl.cc:2090</code>.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>BeginMainFrame</dt><dd>The compositor's request to the main thread: "produce a frame for this vsync". It runs as one main-thread task and ends with a commit (or an abort when nothing changed).</dd>
+      <dt>Pending and active tree</dt><dd>The compositor keeps two copies of the layer tree. Commits go to the pending one, so the active one can keep being drawn and scrolled while new tiles are rastered.</dd>
+      <dt>One draw per vsync</dt><dd>A compositor frame is produced at most once per tick, at the deadline. What misses it waits for the next tick.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in this wheel scroll, main-thread content computed for vsync N is presented with vsync N+1, about 17.4 ms after tick N on every frame (the "frames" row's hover text; <code>q.mjs f-scroll-tanstack frames 90 140</code>, last column).</p>
+    <p><b>No:</b> that every frame works this way. Step 3 shows a frame where the compositor waits for the main thread; step 7 a scroll where the request leaves before the draw.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed that a main thread which finishes in 1 ms gets its rows into the current frame, and that "one frame late" was a symptom of slowness. The trace shows the request itself is sent after the draw. During a compositor scroll the main thread's rows are always at least one vsync behind the scrolled position. <b>Rule I keep:</b> before calling a main thread late, find out when it was asked.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-scroll-tanstack frames 90 140</code>. Expected: every vsync <code>all</code> with "presented-after-ms" between 17.3 and 17.8, and under it one main frame per vsync of about 1 ms with a queue wait near 0.02 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Wheel scroll: BeginMainFrame is sent after the compositor's draw; its commit is activated ~1.5 ms after the tick and first drawn at the next tick: rows for vsync N are presented with vsync N+1 (17.4 ms after tick N).</li>
+    <li data-kind="read">While smoothness has priority the scheduler does "not attempt to synchronize with the main thread for scroll handlers" (scheduler_state_machine.cc:1617).</li>
+    <li data-kind="rejected">"A 1 ms main frame lands in the frame of its own vsync": not during a compositor-driven scroll.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> What does a frame look like when nothing moves on the compositor and the change comes from the main thread alone?</p>
+</section>
+
+<section class="step" data-part="A · One vsync, end to end" data-title="The contrast: a frame the main thread leads" data-node="main scheduler commit activate draw present">
+  <p class="holding"><span class="label">Question I hold</span><span>One cell's text changes while the page is idle. In what order do the same events come now, and does the compositor wait?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>f-obs-msg</code>: no input; a WebSocket message changes one cell five times a second, and the handler writes the new text at once. Between updates the compositor is not even subscribed to vsyncs. I list one update, the one at 349 ms.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-obs-msg">In Perfetto: search <code>NeedsBeginFrameChanged</code>; each hit with <code>needsBeginFrame: 1</code> starts one of these frames.</div>
+<pre>  ms     event                                              thread
+<span class="cp">1</span>349.02  app: tick apply  0.17 ms   <span class="c">(our measure: one cell's textContent is written)</span>     CrRendererMain
+  349.13  ProxyMain::SetNeedsAnimate · ScheduleStyleRecalculation               CrRendererMain
+  349.16  NeedsBeginFrameChanged {needsBeginFrame: 1}                            Compositor   <span class="c">"send me ticks again"</span>
+<span class="cp">2</span>349.26  Scheduler::BeginImplFrame {sequence_number: 89, subtype: MISSED}       Compositor   <span class="c">frame time 343.98: the tick already in progress</span>
+<span class="cp">3</span>349.28  <mark>SendBeginMainFrame</mark> · RequestMainThreadFrame                           Compositor   <span class="c">first action this time</span>
+  349.28  Scheduler::ScheduleBeginImplFrameDeadline {deadline mode: <mark>LATE</mark>}        Compositor   <span class="c">wait for the main thread until the next tick</span>
+<span class="cp">4</span>349.29  ProxyMain::BeginMainFrame  0.50 ms: style, layout, paint               CrRendererMain
+  349.75    Commit {frameSeqId: 89}                                              CrRendererMain
+<span class="cp">5</span>349.98  ActivateLayerTree                                                      Compositor
+  349.99  Scheduler::ScheduleBeginImplFrameDeadline {deadline mode: <mark>IMMEDIATE</mark>}   Compositor   <span class="c">a new tree is ready: stop waiting</span>
+<span class="cp">6</span>349.99  ProxyImpl::ScheduledActionDraw → 350.05 DrawFrame {frameSeqId: 89}     Compositor
+<span class="cp">7</span>350.14  Display::DrawAndSwap  0.10 ms → 350.25 Display::FrameDisplayed          VizCompositorThread</pre>
+  <div class="lanes" data-lanes='{"traces":["f-obs-msg"],"from":348.6,"to":350.6,"rows":["app","compositor","mainFrames","main","viz"],"pins":[[1,349.1,"app"],[3,349.28,"compositor"],[4,349.42,"main"],[5,349.97,"compositor"],[6,350.03,"compositor"],[7,350.19,"viz"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The DOM write, in the WebSocket message's task. It marks style dirty, which makes Blink ask the compositor for a frame.</li>
+    <li><i>2</i>The compositor subscribes to ticks and is handed the one in progress at once (<code>subtype: MISSED</code>): its frame time is 5.3 ms in the past.</li>
+    <li><i>3</i>With nothing of its own to draw, the compositor's first action is to ask the main thread, and its deadline mode is <code>LATE</code>: wait until the next tick if need be.</li>
+    <li><i>4</i>The main frame: no JavaScript at all this time, only style, layout (5 of 184 objects), paint and commit.</li>
+    <li><i>5</i>Activation changes the deadline to <code>IMMEDIATE</code>, and <span class="cp">6</span> the draw follows in the same 0.01 ms.</li>
+    <li><i>7</i>Presented 1.2 ms after the DOM write began.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The same events as in steps 1 and 2, in the other order. A <b>compositor-led</b> frame draws first and asks the main thread afterwards. A <b>main-led</b> frame asks first, waits, and draws the moment the main thread's tree is active. The first never contains this vsync's main-thread work; the second always does.</p>
+    <table>
+      <tr><th></th><th>Compositor-led (steps 1–2)</th><th>Main-led (this step)</th></tr>
+      <tr><td>Who changed something</td><td>the compositor (scroll offset)</td><td>the main thread (DOM)</td></tr>
+      <tr><td>Deadline mode</td><td><code>IMMEDIATE</code></td><td><code>LATE</code>, then <code>IMMEDIATE</code> on activation</td></tr>
+      <tr><td>Order</td><td>draw → BeginMainFrame → commit → activate</td><td>BeginMainFrame → commit → activate → draw</td></tr>
+      <tr><td>Main-thread work for this vsync is shown</td><td>with the next vsync</td><td>in this vsync's frame</td></tr>
+    </table>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=1336">cc/scheduler/scheduler_state_machine.cc:1347–1364</a>
+      <p>The deadline mode is recomputed after every scheduler action. This function is the whole decision:</p>
+<pre><span class="n">1347</span>  } else if (ShouldTriggerBeginImplFrameDeadlineImmediately()) {
+<span class="n">1348</span>    if (ShouldWaitForScrollEvent()) {
+<span class="n">1351</span>      return BeginImplFrameDeadlineMode::WAIT_FOR_SCROLL;
+<span class="n">1352</span>    }
+<span class="n">1353</span>    // We are ready to draw a new active tree immediately because there's no
+<span class="n">1354</span>    // commit expected or we're prioritizing active tree latency.
+<span class="n">1355</span>    return BeginImplFrameDeadlineMode::<mark>IMMEDIATE</mark>;
+<span class="n">1356</span>  } else if (needs_redraw_) {
+<span class="n">1357</span>    // We have an animation or fast input path on the impl thread that wants
+<span class="n">1358</span>    // to draw, so don't wait too long for a new active tree.
+<span class="n">1359</span>    return BeginImplFrameDeadlineMode::<mark>REGULAR</mark>;
+<span class="n">1360</span>  } else {
+<span class="n">1361</span>    // The impl thread doesn't have anything it wants to draw and we are just
+<span class="n">1362</span>    // waiting for a new active tree.
+<span class="n">1363</span>    return BeginImplFrameDeadlineMode::<mark>LATE</mark>;</pre>
+      <p>Line 1400 of the same file makes a freshly activated tree immediate: <code>if (active_tree_needs_first_draw_) return true;</code>. That is pin 5.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Four deadline modes</dt><dd><code>IMMEDIATE</code>: draw now. <code>WAIT_FOR_SCROLL</code>: draw after a third of the interval (step 7). <code>REGULAR</code>: the compositor has something to draw but a commit is expected: wait until shortly before the next tick (step 12). <code>LATE</code>: nothing to draw but the commit: wait until the next tick.</dd>
+      <dt>Idle compositor</dt><dd>A compositor with nothing to do unsubscribes from ticks (<code>NeedsBeginFrameChanged {needsBeginFrame: 0}</code>). The first change subscribes again and starts in the middle of an interval.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> two orders of the same events exist, and the deadline mode on <code>Scheduler::ScheduleBeginImplFrameDeadline</code> says which one a frame followed. The last mode written before <code>Scheduler::OnBeginImplFrameDeadline</code> is why the compositor stopped waiting.</p>
+    <p><b>No:</b> that an idle page always answers in 1.2 ms. On a real display this frame would be shown at the next refresh, up to one interval later. Step 13 returns to this trace for the observation points.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-obs-msg slices 'ScheduleBeginImplFrameDeadline' Compositor 300 400</code>. Expected: three lines: <code>LATE</code> then <code>IMMEDIATE</code> at 349.28 and 349.99 (the frame above), and one more <code>LATE</code> for the following tick, in which nothing is drawn.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Main-led frame (idle page, one DOM write): BeginMainFrame is the compositor's first action, deadline mode LATE, draw the moment the commit is activated; the write is presented 1.2 ms later in headless Chrome.</li>
+    <li data-kind="read">The deadline mode is IMMEDIATE, WAIT_FOR_SCROLL, REGULAR or LATE (scheduler_state_machine.cc:1347–1364); a newly activated tree forces IMMEDIATE (:1400).</li>
+  </ul>
+  <p class="next" data-answer="which"><b>Next question →</b> I can now read one frame by hand. A scroll has 120 of them. Where does Chrome keep its own verdict on each?</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · Four outcomes" data-title="Chrome's own record of every frame" data-node="reporter present"
+  data-ask="partial|Does “presented without the main thread's update” mean the main thread was slow?">
+  <p class="holding"><span class="label">Question I hold</span><span>The compositor knows, for each vsync, whether a frame was presented and what was in it. Where does it write that down, and what exactly does one record say?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Every vsync the compositor starts gets a <code>CompositorFrameReporter</code> object. When its frame is presented, dropped, or found unnecessary, the reporter writes itself into the trace as an async slice named <code>PipelineReporter</code>, with child slices for the stages it went through. I print the reporters of two vsyncs from <code>f-scroll-tanstack</code>: 72, the first frame of the gesture, and 77, the ordinary frame of steps 1 and 2.</p>
+<pre>node lab/harness/q.mjs f-scroll-tanstack raw '^PipelineReporter$' 4     <span class="c"># the JSON, with every argument</span>
+node lab/harness/q.mjs f-scroll-tanstack slices \
+  'PipelineReporter|BeginImplFrameToSend|SendBeginMainFrameToCommit|^Commit$|EndCommitToActivation|^Activation$|EndActivateToSubmit|SubmitCompositorFrameToPres' Compositor 99.8 117.4</pre>
+  </div></div>
+  <div class="tracelink" data-trace="f-scroll-tanstack">In Perfetto the reporters are the tracks named <code>PipelineReporter</code> under the Renderer process; click a slice and read <code>args.frame_reporter</code>.</div>
+<pre>vsync  begins   ends     state                    stages, each "start + duration" in ms
+<span class="cp">1</span> 72   16.57    17.48   STATE_PRESENTED_PARTIAL  BeginImplFrameToSendBeginMainFrame 16.67+0.07 · EndActivateToSubmitCompositorFrame 16.75+0.06
+       <span class="c">frame_type: FORKED</span>                        · SubmitCompositorFrameToPresentationCompositorFrame 16.80+0.68
+<span class="cp">2</span> 72   16.57    33.93   STATE_PRESENTED_ALL      BeginImplFrameToSendBeginMainFrame 16.67+0.06 · <mark>SendBeginMainFrameToCommit 16.73+1.58</mark> · Commit 18.31+0.03
+                                                  · EndCommitToActivation 18.34+0.20 · Activation 18.54+0.03
+                                                  · <mark>EndActivateToSubmitCompositorFrame 18.56+14.89</mark> · Submit…Presentation 33.45+0.48
+<span class="cp">3</span> 77   99.89   100.56   STATE_PRESENTED_ALL      BeginImplFrameToSendBeginMainFrame 100.01+0.06 · EndActivateToSubmitCompositorFrame 100.07+0.04
+                                                  · SubmitCompositorFrameToPresentationCompositorFrame 100.11+0.44
+<span class="cp">4</span> 77   99.89   117.33   STATE_PRESENTED_ALL      SendBeginMainFrameToCommit 100.18+0.97 · Commit 101.15+0.04 · EndCommitToActivation 101.19+0.17
+                                                  · Activation 101.36+0.03 · <mark>EndActivateToSubmitCompositorFrame 101.39+15.53</mark> · Submit…Presentation 116.92+0.41</pre>
+  <ol class="pins">
+    <li><i>1</i><span class="cp">2</span> <b>Two reporters for vsync 72.</b> Both begin at the frame time. One follows the compositor's own frame and ends when that is presented (17.48). The other follows the main thread's frame for the same vsync and ends when <em>its</em> content is presented (33.93, with the next vsync).</li>
+    <li><i>3</i><span class="cp">4</span> <b>Two reporters for vsync 77 as well</b>, with the same two lifetimes: 0.7 ms and 17.4 ms.</li>
+    <li>The main reporter's stages are steps 2's events as durations. <code>SendBeginMainFrameToCommit</code> is the main thread's whole frame (queue wait included). <code>EndActivateToSubmitCompositorFrame</code> is the wait from activation to the next draw: 15 ms of the 17.</li>
+    <li>The first reporter of 72 says <code>STATE_PRESENTED_PARTIAL</code>; the first reporter of 77 says <code>STATE_PRESENTED_ALL</code>. Yet both describe a compositor frame that left without the rows of its own vsync. Step 8 finds the difference.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>A reporter is not "a frame on the screen". It is the life of one <em>update</em>: the compositor's for this vsync, or the main thread's for this vsync. One presented picture can end two reporters that began at different vsyncs: the frame presented at 117.33 ms ends the main reporter of 77 and the compositor reporter of 78.</p>
+    <p>Over the whole scroll: <b data-m="f-scroll-tanstack/frames.reporters"></b> reporters for <b data-m="f-scroll-tanstack/frames.vsyncs"></b> vsyncs.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/metrics/compositor_frame_reporting_controller.cc;l=302">cc/metrics/compositor_frame_reporting_controller.cc:302–306, 197–201</a>
+      <p>To learn why there are two. At every submit the controller may hand over two reporters:</p>
+<pre><span class="n">302</span>  <mark>// It is possible to submit a CompositorFrame containing outputs from two</mark>
+<span class="n">303</span>  <mark>// different begin-frames: an begin-main-frame that was blocked on the</mark>
+<span class="n">304</span>  <mark>// main-thread, and another one for the compositor thread.</mark>
+<span class="n">305</span>  std::unique_ptr&lt;CompositorFrameReporter&gt; main_reporter;
+<span class="n">306</span>  std::unique_ptr&lt;CompositorFrameReporter&gt; impl_reporter;</pre>
+      <p>And when a BeginMainFrame is sent after the compositor's frame has already been submitted (step 1's order), a second reporter is started for the same vsync:</p>
+<pre><span class="n">198</span>    // In this case we have already submitted the ImplFrame, but we received
+<span class="n">199</span>    // beginMain frame before next BeginImplFrame (Not reached the ImplFrame
+<span class="n">200</span>    // deadline yet). So will start a new reporter at BeginMainFrame, and use
+<span class="n">201</span>    // the state(s) from the ImplFrame where necessary.</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/metrics/compositor_frame_reporter.cc;l=1634">cc/metrics/compositor_frame_reporter.cc:1634–1635, 1823</a>
+<pre><span class="n">1634</span>  TRACE_EVENT_BEGIN(
+<span class="n">1635</span>      kTraceCategory, "PipelineReporter", trace_track, <mark>args_.frame_time</mark>,
+<span class="n">1823</span>  TRACE_EVENT_END(kTraceCategory, trace_track, <mark>frame_termination_time_</mark>);</pre>
+      <p>The slice is written afterwards, from the frame time to the termination time (presentation, for a presented frame). Stages of zero length are skipped (<code>:1723</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Reporter arguments</dt><dd><code>frame_sequence</code>: the vsync. <code>state</code>: the verdict (next step). <code>frame_type</code>: absent, or <code>FORKED</code> for a compositor-only copy made when the main thread's frame for this vsync was still out. <code>scroll_state</code>, <code>affects_smoothness</code>, <code>has_main_animation</code>, <code>has_compositor_animation</code>: what was going on. <code>has_high_latency</code>: more than 75 ms from tick to end (<code>:122</code>).</dd>
+      <dt>Is there a commit in it?</dt><dd>A reporter with a <code>Commit</code> stage carried main-thread work. One with only <code>BeginImplFrameToSendBeginMainFrame</code>, <code>EndActivateToSubmitCompositorFrame</code> and <code>Submit…Presentation</code> is the compositor's own frame.</dd>
+      <dt>The wait number</dt><dd><code>SendBeginMainFrameToCommit</code> carries a breakdown; its <code>begin_main_sent_to_started_us</code> is how long the BeginMainFrame task waited for the main thread. The lab reports it as <code>frames.mainQueueMs</code> and in the hover text of the "main frames" row.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> for each vsync, when the compositor's update and when the main thread's update for it reached the screen, and where the main thread's time went by stage.</p>
+    <p><b>No:</b> "one reporter = one frame", and not "state PRESENTED_ALL = everything for this vsync was in one picture". Count reporters and you count updates.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>In Perfetto's query box (the trace of step 11 is more interesting, so use <code>f-budget-250</code>):
+<pre>SELECT a.string_value AS state, COUNT(*) AS reporters
+FROM slice s JOIN args a USING (arg_set_id)
+WHERE s.name = 'PipelineReporter' AND a.key LIKE '%frame_reporter.state'
+GROUP BY state ORDER BY reporters DESC;</pre>
+  Expected for <code>f-budget-250</code>, over the whole file: 126 <code>STATE_PRESENTED_ALL</code>, 62 <code>STATE_PRESENTED_PARTIAL</code>, 17 <code>STATE_NO_UPDATE_DESIRED</code>. The lab's numbers are slightly lower because they count only between the trace's start and end marks.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">PipelineReporter is one update's life from its vsync's frame time to presentation, written afterwards (compositor_frame_reporter.cc:1634, 1823); one submitted frame can end a compositor reporter and a main reporter of different vsyncs (reporting_controller.cc:302).</li>
+    <li data-kind="measured">f-scroll-tanstack: two reporters per scrolling vsync; the compositor's ends 0.7 ms after the tick, the main thread's 17.4 ms after, 15 ms of it in EndActivateToSubmitCompositorFrame.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Four states exist. What does each claim, and how do I get from two reporters to one answer per vsync?</p>
+</section>
+
+<section class="step" data-part="B · Four outcomes" data-title="Four states, and one answer per vsync" data-node="reporter draw present">
+  <p class="holding"><span class="label">Question I hold</span><span>What does each <code>state</code> mean precisely, and how does this course turn reporters into the coloured "frames" row?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read where the state is decided, then look for a place in my traces where all four occur close together. <code>f-budget-600</code> (regular-table, every draw made to take about 49 ms) has one near 1050 ms, where the scroll input pauses for four vsyncs between two gestures.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-budget-600"></div>
+  <div class="lanes" data-lanes='{"traces":["f-budget-600"],"from":990,"to":1136,"rows":["inputs","frames","compositor","mainFrames","main"],"pins":[[1,1026,"frames"],[2,1043,"frames"],[3,1060,"frames"],[4,1076,"frames"],[5,1093,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>Vsync 133: presented without the pending main update</b> (<code>STATE_PRESENTED_PARTIAL</code>, amber). The compositor drew; the main thread's frame sent at 983.5 ms was still running.</li>
+    <li><i>2</i><b>Vsync 134: presented</b> (<code>STATE_PRESENTED_ALL</code>, green). That main frame was activated at 1032.8, in time for this draw. Right after the draw a new BeginMainFrame goes out; it will take 45 ms.</li>
+    <li><i>3</i><b>Vsync 135: dropped</b> (<code>STATE_DROPPED</code>, red). The wheel input has stopped, so the compositor has nothing of its own to show; the main thread owes a frame and does not deliver within the interval. Nothing is submitted. The trace says why: <code>DidNotSubmitInLastFrame {is_waiting_on_main: true}</code> and <code>LayerTreeHostImpl::DidNotProduceFrame {FrameSkippedReason: kWaitingOnMain}</code> at 1066.7.</li>
+    <li><i>4</i><b>Vsync 136: presented</b>, 13 ms after its tick, the moment the late main frame was activated. A main-led frame, as in step 3.</li>
+    <li><i>5</i><b>Vsync 137: no update wanted</b> (<code>STATE_NO_UPDATE_DESIRED</code>, grey). Nothing changed anywhere (<code>FrameSkippedReason: kNoDamage</code>). Not a failure.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <table>
+      <tr><th>State</th><th>The page's words</th><th>What it claims</th><th>What it does not claim</th></tr>
+      <tr><td><code>STATE_PRESENTED_ALL</code></td><td>presented with the main thread's update</td><td>A frame was presented and no main-thread update was <em>outstanding</em> when it was submitted.</td><td>That it contains main-thread work made for this vsync (step 2: it usually contains the previous vsync's).</td></tr>
+      <tr><td><code>STATE_PRESENTED_PARTIAL</code></td><td>presented without the pending main update</td><td>A frame was presented while a BeginMainFrame was out and not yet committed.</td><td>That the main thread was slow, or that the picture was wrong (steps 7–9).</td></tr>
+      <tr><td><code>STATE_DROPPED</code></td><td>dropped</td><td>An update was wanted and no frame was presented for this vsync.</td><td>That the user saw a freeze: if nothing was moving, they saw the previous picture of an unchanged page.</td></tr>
+      <tr><td><code>STATE_NO_UPDATE_DESIRED</code></td><td>no update wanted</td><td>Nobody had anything new.</td><td>—</td></tr>
+    </table>
+    <p>Dropped is rare during a compositor-driven scroll for a simple reason: the compositor always has its own change to show, so a late main thread produces "partial", not "dropped". Drops appear where the compositor has nothing: in the pause at pin 3, at the end of a gesture, or in an animation that only the main thread drives.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">Files I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/metrics/frame_info.h;l=22">cc/metrics/frame_info.h:22–33</a>
+      <p>Chromium's own definitions, which are narrower than the names suggest:</p>
+<pre><span class="n">22</span>    // A `presented all` frame contains all the desired update for this vsync.
+<span class="n">23</span>    <mark>// Note that this doesn't necessarily mean the frame included updates from</mark>
+<span class="n">24</span>    <mark>// both the main and the compositor thread.</mark> …
+<span class="n">30</span>    // A `partial update` frame contains updates from a compositor frame, but
+<span class="n">31</span>    // misses the update from the main-thread for the same vsync. However, it is
+<span class="n">32</span>    // still possible for such a `partial update` frame to contain new update
+<span class="n">33</span>    // from an earlier main-thread.</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/metrics/compositor_frame_reporting_controller.cc;l=357">cc/metrics/compositor_frame_reporting_controller.cc:357–360, 860–866</a>
+      <p>"Partial" is set at submit time, when an older main frame is still in flight:</p>
+<pre><span class="n">357</span>    CompositorFrameReporter* partial_update_decider =
+<span class="n">358</span>        <mark>GetOutstandingUpdatesFromMain(current_frame_id);</mark>
+<span class="n">359</span>    if (partial_update_decider)
+<span class="n">360</span>      impl_reporter->SetPartialUpdateDecider(partial_update_decider);
+<span class="n">860</span>  // Any unterminated reporter in the 'main frame', or 'commit' stages, then
+<span class="n">861</span>  // that indicates some pending updates from the main thread.</pre>
+      <p>or when the compositor's reporter is forked off a main frame for the same vsync (<code>compositor_frame_reporter.cc:912–918</code>). If that main frame later ends with nothing to commit, the fork's partial flag is cleared again (<code>:1152–1161</code>).</p>
+      <span class="path">lab/harness/analyze-lib.mjs:338–347</span>
+      <p>How the course's "frames" row and the <code>frames.all / partial / dropped / noUpdate</code> metrics are made:</p>
+<pre><span class="n">338</span>  // One vsync can have several reporters (a main-thread frame and a
+<span class="n">339</span>  // compositor-only one, or a forked pair). Per vsync, the worst outcome
+<span class="n">340</span>  // among its reporters is what the user got at that vsync.
+<span class="n">343</span>  const rank = { dropped: 3, partial: 2, all: 1, none: 0 };
+<span class="n">345</span>    const worst = rs.reduce((a, b) => (rank[b.state] > rank[a.state] ? b : a));</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>One box per vsync</dt><dd>The lab groups reporters by <code>frame_sequence</code> and colours the vsync by the worst state among them. Its hover text gives "presented after": the latest end among the vsync's presented reporters, which is when the main thread's part arrived. Chromium merges the two reporters of a vsync in a similar spirit for its own metrics (<code>FrameInfo::MergeWith</code>, <code>cc/metrics/frame_info.cc:57–113</code>).</dd>
+      <dt>What the row cannot show</dt><dd>A green box says "nothing was outstanding at submit". It does not say how old the rows in the picture were. For that, read "presented after", or the main reporter's end.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> per vsync, whether a frame was presented and whether a requested main-thread update was still out at that moment.</p>
+    <p><b>No:</b> how stale the content was, or whether the user noticed. Those need the reporter's end time and knowledge of what was moving.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-budget-600 frames 1000 1130</code>. Expected, in order: <code>partial</code> 133, <code>all</code> 134 (presented after 46.4 ms), <code>dropped</code> 135, <code>all</code> 136 (13.1 ms), <code>none</code> 137, <code>all</code> 138, <code>partial</code> 139.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">PRESENTED_ALL = no main update outstanding at submit; PARTIAL = submitted while a BeginMainFrame was unfinished (reporting_controller.cc:357, 860); neither says which vsync's main-thread work is in the picture (frame_info.h:22–33).</li>
+    <li data-kind="measured">f-budget-600 near 1050 ms shows all four states within five vsyncs; the dropped one is a vsync where the compositor had nothing to draw and the main thread's frame was still running (kWaitingOnMain).</li>
+    <li data-kind="read">The course's per-vsync outcome is the worst state among a vsync's reporters (analyze-lib.mjs:338–347).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> DevTools draws a Frames track with "dropped" and "partially presented" frames. Does it show the same thing?</p>
+</section>
+
+<section class="step" data-part="B · Four outcomes" data-title="What DevTools' Frames track shows, and what it leaves out" data-node="reporter method">
+  <p class="holding"><span class="label">Question I hold</span><span>If I open these traces in DevTools, which of the amber and red vsyncs will the Frames track mark?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p><code>f-slow-tanstack</code>: a TanStack table whose main frames take up to 290 ms during a scroll. Its reporters say <b data-m="f-slow-tanstack/frames.partial"></b> vsyncs presented without the main update and <b data-m="f-slow-tanstack/frames.dropped"></b> dropped. How many frames does DevTools' Frames track mark as dropped or partially presented?</p>
+    <div class="opts"><button data-k="a">All of them.</button><button data-k="b">None.</button><button data-k="c">Only the dropped ones.</button></div>
+    <div class="reveal"><p><b>None.</b> The trace contains no <code>DroppedFrame</code> event, and that event is DevTools' only source for both marks. Chromium writes it only for frames that "affect smoothness", and a page that renders in a scroll handler has no main-thread effect that counts.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read how DevTools builds the track, then count the event it depends on in six traces. The lab reports the counts as <code>frames.devtoolsPartial</code> and <code>frames.devtoolsDropped</code>.</p>
+  </div></div>
+  <table class="mtable" data-rows="f-click-tanstack,f-wheel-tanstack,f-slow-tanstack,f-longtask-tanstack,f-budget-250,f-budget-600" data-names="scrollbar click · TanStack,wheel notches · TanStack,slow cells · TanStack,250 ms task · TanStack,slow cells (250 µs) · regular-table,slow cells (600 µs) · regular-table" data-head="Trace" data-cols="frames.partial|reporters: without main,frames.dropped|reporters: dropped,frames.devtoolsPartial|DevTools: partially presented,frames.devtoolsDropped|DevTools: dropped,main.rafCallbacks|rAF callbacks run" data-hi="f-slow-tanstack:frames.devtoolsPartial,f-slow-tanstack:frames.devtoolsDropped,f-budget-250:frames.devtoolsPartial,f-budget-600:frames.devtoolsPartial"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The four TanStack traces have between eight and more than a hundred partial vsyncs and not one mark. The two regular-table traces have almost all of theirs marked. The last column is the difference: regular-table commits its rows in a <code>requestAnimationFrame</code> callback, TanStack's adapter renders inside the <code>scroll</code> event. A page with rAF callbacks running has, in Chromium's bookkeeping, a main-thread animation whose smoothness can be hurt. A scroll handler is not one.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">Files I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/metrics/compositor_frame_reporter.cc;l=1617">cc/metrics/compositor_frame_reporter.cc:1617–1621</a>
+      <p>When is <code>DroppedFrame</code> written?</p>
+<pre><span class="n">1617</span>  if (<mark>info.IsDroppedAffectingSmoothness()</mark>) {
+<span class="n">1618</span>    devtools_instrumentation::DidDropSmoothnessFrame(
+<span class="n">1619</span>        layer_tree_host_id_, args_.frame_time, args_.frame_id.sequence_number,
+<span class="n">1620</span>        <mark>has_partial_update_</mark>);
+<span class="n">1621</span>  }</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/metrics/frame_info.cc;l=48">cc/metrics/frame_info.cc:48–54 · frame_sequence_metrics.cc:210–215</a>
+<pre><span class="n"> 51</span>  if (smooth_thread == SmoothThread::kSmoothNone)
+<span class="n"> 52</span>    return false;
+<span class="n"> 54</span>  return WasSmoothMainUpdateDropped() || WasSmoothCompositorUpdateDropped();
+
+<span class="n">210</span>    case FrameSequenceTrackerType::kMainThreadAnimation:
+<span class="n">212</span>    case FrameSequenceTrackerType::<mark>kRAF</mark>:
+<span class="n">214</span>    case FrameSequenceTrackerType::kJSAnimation:
+<span class="n">215</span>      return SmoothEffectDrivingThread::<mark>kMain</mark>;</pre>
+      <p>A missed main-thread update counts only if a tracker of one of these kinds is active. Scrolls are attributed to the thread that scrolls (<code>:217–220</code>), here the compositor, whose update was not missed.</p>
+      <a class="path" href="https://github.com/ChromeDevTools/devtools-frontend/blob/66df492aaa0129d090937e933dd44c5389ab24d2/front_end/models/trace/handlers/FramesHandler.ts#L160">devtools-frontend front_end/models/trace/handlers/FramesHandler.ts:160–170, 179–181</a>
+<pre><span class="n">160</span>  #handleDroppedFrame(startTime: Types.Timing.Micro, seqId: number, isPartial: boolean): void {
+<span class="n">169</span>    this.#beginFrameQueue.<mark>setDropped(seqId, true)</mark>;
+<span class="n">170</span>    this.#beginFrameQueue.<mark>setPartial(seqId, isPartial)</mark>;
+<span class="n">179</span>    // - if it wasn't drawn, it didn't happen!
+<span class="n">180</span>    // - only show frames that either did not wait for the main thread frame or had one committed.
+<span class="n">181</span>    if (this.#mainFrameCommitted || !this.#mainFrameRequested) {</pre>
+      <p>The handler reads <code>BeginFrame</code>, <code>DrawFrame</code>, <code>RequestMainThreadFrame</code>, <code>ActivateLayerTree</code>, <code>Commit</code> and <code>DroppedFrame</code> (<code>:29–44</code>). It never reads <code>PipelineReporter</code>. A draw made while a main frame is requested and not committed starts no new frame box (line 181): it is absorbed into the current one.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt><code>DroppedFrame</code></dt><dd>An instant at the frame time, with <code>hasPartialUpdate</code>. <code>true</code> becomes DevTools' "Partially presented frame", <code>false</code> its "Dropped frame". Despite the name, most of them in these traces are frames that <em>were</em> presented.</dd>
+      <dt>Smooth effect</dt><dd>Chromium tracks sequences during which the user expects motion: a scroll, a CSS or JavaScript animation, rAF. A frame "affects smoothness" if the thread driving such a sequence missed its update.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a marked frame in DevTools is a real partial or dropped vsync during a tracked effect. In <code>f-budget-250</code> DevTools marks <b data-m="f-budget-250/frames.devtoolsPartial"></b> of the <b data-m="f-budget-250/frames.partial"></b>.</p>
+    <p><b>No:</b> an unmarked Frames track does not mean the main thread kept up. For a table that draws in event handlers it stays clean however late the rows are. I did not open these traces in DevTools' UI for this step; the statement rests on the event counts and on <code>FramesHandler.ts</code>.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I took DevTools' green Frames track as evidence that every frame was whole. It is evidence that no <em>tracked</em> effect missed an update. The same lateness is marked for regular-table and invisible for TanStack, because one of them happens to call <code>requestAnimationFrame</code>. <b>Rule I keep:</b> count frame outcomes from <code>PipelineReporter</code>; use DevTools' marks as a pointer, never as a clean bill.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Tablelab's own frame accounting should not depend on which browser callback the painter happens to use. A proposal: report per-vsync outcomes from <code>PipelineReporter</code> in the trace harness, and treat "rows presented N vsyncs after the position they belong to" as the number that matters, since both labels can hide it.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-budget-250 slices '^DroppedFrame$' Compositor 100 250</code>. Expected: four instants, one on every second vsync (133.21, 166.54, 199.87, 233.20), each with <code>"hasPartialUpdate":true</code>. The same command on <code>f-slow-tanstack</code> prints <code>0 events</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">DevTools builds "dropped" and "partially presented" frames only from DroppedFrame instants (FramesHandler.ts:160–170), which cc writes only when a tracked smooth effect missed an update (compositor_frame_reporter.cc:1617; frame_info.cc:48–54).</li>
+    <li data-kind="measured">f-slow-tanstack: 112 partial and 33 dropped vsyncs by PipelineReporter, zero DroppedFrame events; f-budget-250 and -600 (regular-table, which uses rAF) have nearly all partial vsyncs marked.</li>
+    <li data-kind="rejected">"A clean Frames track in DevTools means the main thread kept up."</li>
+  </ul>
+  <p class="next"><b>Next question →</b> One row of that table is strange: a scrollbar click with a main thread that needs 1.2 ms per frame, and eight of nine frames "without the main update". Why?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · Who drives the scroll" data-title="A scrollbar click: a 1 ms main thread, and every frame “without the main update”" data-node="input scheduler main draw">
+  <p class="holding"><span class="label">Question I hold</span><span>Module 1's first case: one click on the scrollbar track, which the compositor turns into a 157 ms scroll animation. The main frames take about 1.2 ms. Why does the compositor's record say the main thread missed almost every frame?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>f-click-tanstack</code>. First the counts: <b data-m="f-click-tanstack/frames.partial"></b> vsyncs presented without the pending main update, <b data-m="f-click-tanstack/frames.all"></b> with; median main frame <b data-m="f-click-tanstack/frames.mainFrameMs.p50" data-unit="ms"></b>, longest queue wait <b data-m="f-click-tanstack/frames.mainQueueMs.max" data-unit="ms"></b>. Nothing is slow. So I read one vsync of the animation, number 69, the way step 1 read vsync 77.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-click-tanstack">In Perfetto: search <code>Scheduler::ScheduleBeginImplFrameDeadline</code> and read <code>deadline mode</code> in each hit's arguments.</div>
+<pre>  ms     event                                                              thread
+  14.82  BeginFrame {frameSeqId: 69}                                        Compositor
+  14.98  Scheduler::BeginImplFrame {sequence_number: 69}
+<span class="cp">1</span> 15.02  Scheduler::ScheduleBeginImplFrameDeadline {deadline mode: <mark>WAIT_FOR_SCROLL</mark>}   <span class="c">deadline = frame time + 5.55 ms</span>
+          <span class="c">… 6 ms: nothing happens on either thread …</span>
+<span class="cp">2</span> 21.09  Scheduler::OnBeginImplFrameDeadline
+<span class="cp">3</span> 21.09  <mark>SendBeginMainFrame</mark> · RequestMainThreadFrame                         <span class="c">first action at the deadline</span>
+<span class="cp">4</span> 21.11  ProxyImpl::ScheduledActionDraw → 21.31 DrawFrame {frameSeqId: 69}   <span class="c">0.02 ms later, without waiting</span>
+  21.12  ProxyMain::BeginMainFrame {begin_frame_id: 69}  1.21 ms            CrRendererMain
+  21.95  Display::FrameDisplayed                                            <span class="c">the animation's frame, 7.1 ms after the tick</span>
+  22.27  Commit {frameSeqId: 69} → 22.59 ActivateLayerTree
+<span class="cp">5</span> 37.76  ProxyImpl::ScheduledActionDraw (vsync 70) → 38.51 presented         <span class="c">rows of 69: 23.7 ms after tick 69</span></pre>
+  <div class="lanes" data-lanes='{"traces":["f-click-tanstack"],"from":-4,"to":176,"rows":["inputs","frames","compositor","mainFrames","main","app"],"pins":[[1,18,"frames"],[3,21.1,"compositor"],[5,37.8,"compositor"],[6,1.2,"mainFrames"],[7,156,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>The compositor waits.</b> The deadline mode is one this module has not met: <code>WAIT_FOR_SCROLL</code>. It postpones the draw by a third of the interval, in case a scroll event for this frame is still on its way. In a click animation none will come: the compositor is moving the content by itself.</li>
+    <li><i>2</i>The deadline fires 6.3 ms after the tick, and <span class="cp">3</span> only then is the main thread asked.</li>
+    <li><i>4</i>The draw follows at once. Since a BeginMainFrame is now out and uncommitted, the reporter for this frame is forked and marked partial.</li>
+    <li><i>5</i>The main thread's rows for vsync 69 are first drawn at vsync 70's deadline: 23.7 ms after their tick.</li>
+    <li><i>6</i>The exception at the start: for the click's own vsync the compositor asked the main thread first and waited for it (<code>REGULAR</code>, then <code>IMMEDIATE</code> on activation), so that one frame is green.</li>
+    <li><i>7</i>And at the end: the last BeginMainFrame found nothing to commit, so that vsync's fork lost its partial flag (step 5's source note) and is green too.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Every amber frame of this trace has the same shape: wait 6 ms, ask the main thread, draw 20 µs later. The main thread could not have been in time; it was asked at the last moment on purpose.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">Files I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/trees/layer_tree_host_impl.cc;l=3634">cc/trees/layer_tree_host_impl.cc:3634–3638</a>
+      <p>Who decides to wait? At the start of every compositor frame:</p>
+<pre><span class="n">3636</span>    delegate_->SetWaitingForScrollEvent(
+<span class="n">3637</span>        input_delegate_ &amp;&amp; input_delegate_-><mark>IsCurrentlyScrolling()</mark> &amp;&amp;
+<span class="n">3638</span>        <mark>!input_delegate_->HasQueuedInput()</mark>);</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=623">cc/scheduler/scheduler_state_machine.cc:623–628</a>
+      <p>While waiting, both the draw (step 3's excerpt, line 1348) and the BeginMainFrame are held back:</p>
+<pre><span class="n">623</span>  // We should wait for scroll events to arrive before sending the
+<span class="n">624</span>  // BeginMainFrame. So that the most up to date scroll positions are available
+<span class="n">625</span>  // for main-thread effects.
+<span class="n">626</span>  if (<mark>ShouldWaitForScrollEvent()</mark>) {
+<span class="n">627</span>    return false;
+<span class="n">628</span>  }</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler.cc;l=855">cc/scheduler/scheduler.cc:855–858 · scheduler_settings.h:60</a>
+<pre><span class="n">855</span>    case DeadlineMode::WAIT_FOR_SCROLL:
+<span class="n">856</span>      new_deadline = begin_impl_frame_tracker_.Current().frame_time +
+<span class="n">857</span>                     begin_impl_frame_tracker_.Current().interval *
+<span class="n">858</span>                         settings_.<mark>scroll_deadline_ratio</mark>;
+<span class="n"> 60</span>  double scroll_deadline_ratio = 0.333;</pre>
+      <p>16.666 ms × 0.333 = 5.55 ms, the "new deadline" in the trace. The mode exists only when a feature is on (<code>cc/trees/layer_tree_settings.cc:61–71</code>); it is on in this build, as the trace shows.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Why wait for a scroll event at all</dt><dd>With real input, the event for this frame may arrive a little after the tick. Drawing at once would show the previous position; waiting a third of a frame lets the latest input in, and lets the main thread see the latest offset. The cost is 5.5 ms of latency on every frame in which no event arrives.</dd>
+      <dt>Timer lateness</dt><dd>The deadline is set for 5.55 ms after the frame time and runs at 6.2–6.3 ms in this recording. I did not look for the cause of the 0.7 ms.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in this click animation "presented without the main update" is produced by the scheduler's order of actions, on every frame, with a main thread that is busy <b data-m="f-click-tanstack/threads.mainUtilPct"></b>% of the time.</p>
+    <p><b>No:</b> not yet that this is harmless, and not why the wheel scroll of step 2, where the main thread is also asked too late, gets the green label. Next step.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-click-tanstack slices 'ScheduleBeginImplFrameDeadline|OnBeginImplFrameDeadline|SendBeginMainFrame$|DrawFrame' Compositor 10 40</code>. Expected for each of the two vsyncs: <code>WAIT_FOR_SCROLL</code>, then about 6 ms later the deadline, <code>SendBeginMainFrame</code> and <code>DrawFrame</code> within 0.3 ms of each other.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">f-click-tanstack: 8 of 9 animation frames are PRESENTED_PARTIAL with main frames of ~1.2 ms; each waits ~6 ms (WAIT_FOR_SCROLL), sends BeginMainFrame at the deadline and draws 0.02 ms later.</li>
+    <li data-kind="read">While a scroll is in progress and no input is queued, the scheduler holds both the draw and the BeginMainFrame until frame time + interval × 0.333 (layer_tree_host_impl.cc:3636; scheduler_state_machine.cc:626, 1348; scheduler.cc:855).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> In the wheel scroll the main thread is asked late as well, and its rows are a frame behind as well. Why is that one green?</p>
+</section>
+
+<section class="step" data-part="C · Who drives the scroll" data-title="Same lateness, different label" data-node="scheduler main draw reporter">
+  <p class="holding"><span class="label">Question I hold</span><span>Wheel gesture: <b data-m="f-scroll-tanstack/frames.all"></b> green vsyncs and <b data-m="f-scroll-tanstack/frames.partial"></b> amber. Scrollbar click: <b data-m="f-click-tanstack/frames.all"></b> green and <b data-m="f-click-tanstack/frames.partial"></b> amber. In both, the rows for vsync N are presented with vsync N+1. What differs?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I put the two traces on one time axis with a third, <code>f-wheel-tanstack</code>: single wheel notches of 100 px, one every 33 ms, each a complete little scroll gesture. Three ways to move the same table. Then I compare, per vsync, the order of two events: <code>SendBeginMainFrame</code> and the draw.</p>
+  </div></div>
+  <div class="lanes" data-lanes='{"traces":["f-scroll-tanstack","f-click-tanstack","f-wheel-tanstack"],"titles":["wheel gesture, steady (f-scroll-tanstack)","scrollbar click, animated by the compositor (f-click-tanstack)","wheel notches, one every 33 ms (f-wheel-tanstack)"],"from":80,"to":142,"rows":["frames","compositor","mainFrames"],"pins":[[1,100.12,"compositor",0],[2,100.6,"mainFrames",0],[3,104.4,"compositor",1],[4,88.9,"compositor",2],[5,105.6,"compositor",2]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>Wheel gesture:</b> draw at +0.2 ms, then <span class="cp">2</span> BeginMainFrame at +0.3 ms. When the frame was submitted, no main frame was out: <b>green</b>.</li>
+    <li><i>3</i><b>Click:</b> BeginMainFrame at +6.24 ms, the draw 0.01 ms later. Submitted with a main frame out: <b>amber</b>.</li>
+    <li><i>4</i><b>Wheel notch:</b> the frame that shows a notch's scroll sends BeginMainFrame at +0.22 ms and draws at +0.26 ms: <b>amber</b>. <span class="cp">5</span> The frame after it draws the rows first and asks afterwards: <b>green</b>. Half the presented frames of this trace are amber (<b data-m="f-wheel-tanstack/frames.partial"></b> against <b data-m="f-wheel-tanstack/frames.all"></b>).</li>
+  </ol>
+  <table class="mtable" data-rows="f-scroll-tanstack,f-click-tanstack,f-wheel-tanstack" data-names="wheel gesture,scrollbar click,wheel notches" data-head="Who drives the scroll" data-cols="frames.all|vsyncs: with main,frames.partial|vsyncs: without main,frames.mainFrameMs.p50|main frame p50|ms,frames.mainQueueMs.p95|queue wait p95|ms,frames.devtoolsPartial|marked in DevTools"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The label follows one thing: <b>whether the BeginMainFrame for this vsync left before or after the draw.</b> Before: the compositor's frame is submitted while a main-thread update is outstanding, and is recorded as partial. After: nothing is outstanding at that instant, and the same kind of frame is recorded as presented.</p>
+    <p>What the user gets is the same in all three. Rows computed for a scroll position are presented one vsync after the picture that first shows that position: 17.4 ms after its tick in the wheel gesture, 17.8 ms for a notch, 23.7 ms in the click (one interval, plus the 6.3 ms that the next draw waits, plus presentation).</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">Files I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=738">cc/scheduler/scheduler_state_machine.cc:738–747, 585–592</a>
+      <p>What decides the order? The scheduler always prefers sending to drawing:</p>
+<pre><span class="n">738</span>SchedulerStateMachine::Action SchedulerStateMachine::NextAction() const {
+<span class="n">739</span>  if (ShouldSendBeginMainFrame())
+<span class="n">740</span>    return Action::<mark>SEND_BEGIN_MAIN_FRAME</mark>;
+<span class="n">747</span>  if (ShouldDraw()) {</pre>
+      <p>unless one rule holds the send back:</p>
+<pre><span class="n">585</span>  // Don't send BeginMainFrame early if we are prioritizing a committed
+<span class="n">586</span>  // active tree because of ImplLatencyTakesPriority.
+<span class="n">587</span>  if (<mark>ImplLatencyTakesPriority()</mark> &amp;&amp;
+<span class="n">588</span>      ((has_pending_tree_ &amp;&amp; !current_pending_tree_is_impl_side_) ||
+<span class="n">589</span>       (<mark>active_tree_needs_first_draw_</mark> &amp;&amp;
+<span class="n">590</span>        !previous_pending_tree_was_impl_side_))) {
+<span class="n">591</span>    return false;
+<span class="n">592</span>  }</pre>
+      <p>Two conditions. <b>Smoothness has priority</b> (step 2's excerpt): true for a scroll that follows input directly, which Chromium calls precise, and false for an animated one (<code>cc/trees/proxy_impl.cc:598–599, 616–627</code>; <code>cc/input/input_handler.cc:1616–1623</code>). And <b>a tree activated since the last draw is waiting for its first draw</b>: true on every tick of a steady scroll, because the previous vsync's main frame was activated just after the previous draw.</p>
+      <p>Wheel gesture: both hold, so draw first: green. Click: an animated scroll, no smoothness priority, so send first: amber. Wheel notch: smoothness priority, but the previous vsync's main frame committed nothing, no tree is waiting, so send first: amber. The same holds for the first frame of each steady gesture, which is where that trace's two amber vsyncs are.</p>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler.cc;l=629">cc/scheduler/scheduler.cc:629</a>
+<pre><span class="n">629</span>  begin_main_frame_args_.<mark>on_critical_path</mark> = !ImplLatencyTakesPriority();</pre>
+      <p>This is how the trace shows the first condition. The main thread's <code>MainThreadSchedulerImpl::WillBeginFrame</code> event prints the arguments it was sent: <code>on_critical_path: false</code> on every frame of the wheel gesture and of the notches, <code>true</code> on every frame of the click.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Tree priority</dt><dd>During a precise scroll or pinch, and for 250 ms after, the compositor runs with <code>SMOOTHNESS_TAKES_PRIORITY</code>: draw what you have, never wait for the main thread.</dd>
+      <dt>Chromium's own second opinion</dt><dd>The reporter computes a newer verdict next to the one in the trace. A partial frame whose deadline mode was <code>IMMEDIATE</code> or <code>WAIT_FOR_SCROLL</code> (<code>cc/scheduler/scheduler.cc:903–909</code>), and whose active tree is at most one frame old, becomes <code>kPresentedPartialWithoutWaiting</code> (<code>cc/metrics/compositor_frame_reporter.cc:2061–2071</code>: "we do not expect its update to accompany the Compositor thread effect … We allow one frame of staleness"), and does not count as a dropped main update in the "v4" metrics (<code>cc/metrics/frame_info.cc:260–270</code>). The <code>state</code> argument in the trace is the older verdict.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in a compositor-driven scroll, green and amber distinguish the order of two scheduler actions inside one vsync. Neither colour means the main thread's rows for this vsync are in the picture; in all three traces they arrive one vsync later.</p>
+    <p><b>No:</b> that amber never matters. When a main frame takes longer than one interval, amber frames are the ones shown with rows two or more vsyncs old (step 11). The colour alone cannot tell the two apart; the main reporter's length can.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read "presented without the main thread's update" as "the main thread was too slow for this frame", and a green row as "the main thread kept up". Three traces of one table with a 1–2 ms main thread give <b data-m="f-scroll-tanstack/frames.partial"></b>, <b data-m="f-click-tanstack/frames.partial"></b> and <b data-m="f-wheel-tanstack/frames.partial"></b> amber vsyncs. <b>Rule I keep:</b> the colour tells me what was outstanding at submit; to learn whether the main thread is late I read how long its update took to reach the screen, in vsyncs.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-wheel-tanstack slices 'MainThreadSchedulerImpl::WillBeginFrame' main 80 130</code> and the same on <code>f-click-tanstack</code> with <code>0 60</code>. Expected: <code>"on_critical_path":false</code> in the first, <code>true</code> in the second.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One table, three drivers, main frames of 1–2 ms: wheel gesture 2 partial vsyncs, click 8, wheel notches 28. In all three the rows for vsync N are presented with vsync N+1.</li>
+    <li data-kind="read">A compositor frame is recorded partial when BeginMainFrame was sent before the draw of the same vsync; the send is held until after the draw only with smoothness priority and a newly activated tree awaiting its first draw (scheduler_state_machine.cc:587–592, 738–747).</li>
+    <li data-kind="rejected">"Partial means the main thread was slow; green means its update is in the frame."</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Four deadline modes have appeared. Can I put them on one map, with the other signals the scheduler writes about a late main thread?</p>
+</section>
+
+<section class="step" data-part="C · Who drives the scroll" data-title="The scheduler's signals on one map" data-node="scheduler method">
+  <p class="holding"><span class="label">Question I hold</span><span>Which scheduler events tell me that the main thread is really behind, and which only look like it?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I collect, from the traces read so far and from the long-task trace of step 12, where each deadline mode occurs and what two other signals say there: the flag <code>main_thread_missed_last_deadline</code> on <code>Scheduler::BeginImplFrame</code>, and the priority at which the BeginMainFrame task ran on the main thread.</p>
+  </div></div>
+  <table>
+    <tr><th>Deadline mode</th><th>Draws at</th><th>Seen in</th><th>The compositor…</th></tr>
+    <tr><td><code>IMMEDIATE</code></td><td>now</td><td>every frame of the wheel gesture and of the notches; in any frame, the moment a commit is activated</td><td>has what it wants, or has smoothness priority and will not wait</td></tr>
+    <tr><td><code>WAIT_FOR_SCROLL</code></td><td>tick + 5.55 ms (interval × 0.333)</td><td>every frame of the click animation</td><td>is scrolling, has no input for this frame yet</td></tr>
+    <tr><td><code>REGULAR</code></td><td>tick + about 15.5 ms</td><td>the click's first frame; every frame while a long task blocks the main thread (step 12)</td><td>has something to draw, expects a commit, no smoothness priority: waits for the main thread almost the whole interval</td></tr>
+    <tr><td><code>LATE</code></td><td>tick + 16.67 ms</td><td>the idle-page update of step 3; vsyncs with nothing to do</td><td>has nothing to draw but the commit</td></tr>
+  </table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>The <code>REGULAR</code> deadline is the "frame budget" people quote, and it is not 16.7 ms.</b> The scheduler takes the tick's deadline (the next tick) and subtracts its estimate of its own draw time and 1 ms. In these traces that is 15.4–15.5 ms after the tick. It applies only when the compositor waits; in a wheel scroll it does not wait at all, and step 10 shows the budget that applies there.</p>
+    <p><b><code>main_thread_missed_last_deadline</code> is <code>true</code> on every frame of the healthy wheel scroll</b> (pin 2 of step 1) and of the click, and <code>false</code> in the idle-page trace. It does not say the main thread was slow. It says that when the last compositor frame ended, something from the main thread was still on its way: a BeginMainFrame out, a pending tree, or an active tree not yet drawn. In a compositor-led scroll that is the normal state.</p>
+    <p><b>The BeginMainFrame task's priority changes with the input.</b> <code>q.mjs f-scroll-tanstack tasks 0 400 0.5</code> prints one main-thread task per frame, on queue <code>COMPOSITOR_TQ</code>: the first six run at <code>HIGHEST_PRIORITY</code>, and from about 100 ms into the gesture every one runs at <code>LOW_PRIORITY</code>. In the click they go from <code>HIGHEST_PRIORITY</code> to <code>NORMAL_PRIORITY</code>. During a scroll the compositor does not need, Blink lets other main-thread work go first. Nothing competes here, so the queue wait stays near 0.02 ms; <a href="streaming.html">Module 7</a> shows what that priority costs when WebSocket messages compete, and reads the policy in source.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">Files I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler.cc;l=606">cc/scheduler/scheduler.cc:47, 606–608, 845–847</a>
+      <p>Where the 15.5 ms comes from:</p>
+<pre><span class="n"> 47</span>const base::TimeDelta kDeadlineFudgeFactor = base::Microseconds(1000);
+<span class="n">606</span>  viz::BeginFrameArgs adjusted_args = args;
+<span class="n">607</span>  adjusted_args.deadline -= compositor_timing_history_-><mark>DrawDurationEstimate()</mark>;
+<span class="n">608</span>  adjusted_args.deadline -= <mark>kDeadlineFudgeFactor</mark>;
+<span class="n">845</span>    case DeadlineMode::REGULAR:
+<span class="n">846</span>      // We are animating the active tree but we're also waiting for commit.
+<span class="n">847</span>      new_deadline = begin_impl_frame_tracker_.Current().deadline;</pre>
+      <p>In the trace: <code>Scheduler::BeginImplFrame</code> has <code>deadline_us − frame_time_us = 16666</code>; the same arguments as the main thread receives them (<code>WillBeginFrame</code>) have 15485 for the click's frame 69. The 181 µs beyond the fudge factor are the draw estimate.</p>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=1325">cc/scheduler/scheduler_state_machine.cc:1325–1328</a>
+      <p>What the "missed" flag is made of:</p>
+<pre><span class="n">1325</span>  // If a new or undrawn active tree is pending after the deadline,
+<span class="n">1326</span>  // then the main thread is in a high latency mode.
+<span class="n">1327</span>  main_thread_missed_last_deadline_ =
+<span class="n">1328</span>      CommitPending() || has_pending_tree_ || <mark>active_tree_needs_first_draw_</mark>;</pre>
+      <p>The third term is true after every frame of step 2: the tree is activated 1.5 ms after the tick and its first draw is 15 ms away.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>High latency mode</dt><dd>The scheduler's name for "main-thread content is shown a frame after it was requested". It is a steady state, not an alarm. The alarm is the number of vsyncs between request and presentation growing beyond one.</dd>
+      <dt>What I use instead</dt><dd>Three numbers from the reporters. <code>frames.mainFrameMs</code>: BeginMainFrame sent to commit. <code>frames.mainQueueMs</code>: how long that task waited for the main thread. And "presented after" per vsync. The first says how long the work was, the second whether the thread was busy with something else, the third what the user got.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the deadline mode identifies which of the four situations a frame was in, and the BeginMainFrame arguments show the deadline the main thread was given.</p>
+    <p><b>No:</b> <code>main_thread_missed_last_deadline: true</code> and an amber frame are not, on their own, findings. Both occur on every frame of traces in which the main thread is busy a few percent of the time.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Which scroll a user performs changes when our scroll handler runs relative to the tick: right after it (the wheel gesture here; by the source, any scroll that follows input directly) or a third of a frame in (the scrollbar click; by the source, other scrolls the compositor animates, which I did not record). In both the rows we render are shown one vsync after the position they belong to. A proposal for Tablelab: size overscan from "pixels scrolled in one vsync at the fastest speed we promise to keep filled", and treat it as a property of the compositor contract, not as slack for slow frames.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-click-tanstack tasks -5 200 0.5</code>. Expected: nine <code>COMPOSITOR_TQ</code> tasks, the first six at <code>HIGHEST_PRIORITY</code>, the last three at <code>NORMAL_PRIORITY</code>, each posted by <code>ScheduledActionSendBeginMainFrame</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">Deadline times: IMMEDIATE now; WAIT_FOR_SCROLL tick + interval × 0.333; REGULAR the tick's deadline minus the draw estimate minus 1 ms; LATE the next tick (scheduler.cc:606–608, 831–858).</li>
+    <li data-kind="measured">main_thread_missed_last_deadline is true on every frame of a healthy wheel scroll: it reports an undrawn active tree, not a slow main thread (scheduler_state_machine.cc:1327).</li>
+    <li data-kind="measured">The BeginMainFrame task runs on COMPOSITOR_TQ; during the wheel gesture its priority goes from HIGHEST to LOW after about 100 ms, during the click from HIGHEST to NORMAL.</li>
+  </ul>
+  <p class="next" data-answer="partial"><b>Next question →</b> So far every main frame took a millisecond or two. How long may one take before the user gets less?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · Budgets" data-title="How long may a main frame take?" data-node="main commit activate draw"
+  data-ask="budget|How long may a main frame take, and what does the user lose when it takes longer?">
+  <p class="holding"><span class="label">Question I hold</span><span>I make the main thread's frame longer in steps. When do the rows reach the screen, and at what length does that change?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>regular-table draws 78 visible cells per frame. I add 150 µs of formatting to each cell: 11.7 ms more JavaScript in every frame of the wheel scroll, so a main frame grows from about 1.5 ms to about 13.5 ms. How much later do the rows of each frame reach the screen?</p>
+    <div class="opts"><button data-k="a">About 12 ms later.</button><button data-k="b">Not at all.</button><button data-k="c">One vsync later.</button></div>
+    <div class="reveal"><p><b>Not at all.</b> With 0, 50 and 150 µs per cell the rows for vsync N are presented with vsync N+1, 17.3–17.4 ms after tick N, in every case. A finished commit waits for the next draw; a longer frame only shortens that wait.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The <code>f-budget-*</code> traces: the wheel gesture over regular-table, with <code>formatUs</code> = 0, 50, 150 (and 250, 600 in the next step). <code>formatUs=N</code> makes the lab's cell formatter spin for N µs (<code>lab/pages/src/format.ts:20–25</code>), a stand-in for any per-cell cost. I compare the same vsyncs at 0 and at 150.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-budget-150">Perfetto: select a <code>ProxyMain::BeginMainFrame</code> slice on <code>CrRendererMain</code> and compare its end with the next <code>ProxyImpl::ScheduledActionDraw</code> on <code>Compositor</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["f-budget-0","f-budget-150"],"titles":["0 µs per cell (f-budget-0)","150 µs per cell: 11.7 ms of formatting per draw (f-budget-150)"],"from":98,"to":152,"rows":["frames","compositor","mainFrames","main","app"],"pins":[[1,117,"mainFrames",0],[2,124,"mainFrames",1],[3,129.6,"main",1],[4,131.75,"compositor",1],[5,133.5,"compositor",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>At 0 µs a main frame is a sliver right after each tick; its commit then waits about 15 ms for the next draw.</li>
+    <li><i>2</i>At 150 µs the main frame fills most of the interval: 12 ms inside the <code>scroll</code> event, where regular-table calls our data listener and we format 78 cells.</li>
+    <li><i>3</i>The <code>requestAnimationFrame</code> callback regular-table waits for before it writes the cells (0.6 ms), still inside the same BeginMainFrame, followed by style, layout, paint and commit.</li>
+    <li><i>4</i>Activation at 131.7 ms, and <span class="cp">5</span> the next draw at 133.5 ms. The commit made it with 1.7 ms to spare.</li>
+  </ol>
+  <table class="mtable" data-rows="f-budget-0,f-budget-50,f-budget-150" data-names="0 µs per cell,50 µs,150 µs" data-head="regular-table, 78 cells per draw" data-cols="frames.mainFrameMs.p50|main frame p50|ms,frames.mainFrameMs.p95|p95|ms,frames.all|vsyncs: with main,frames.partial|without main,threads.mainUtilPct|main thread busy|%,main.scriptMs|script|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Nine times the main-thread work, the same frames, the same arrival time. In this mode the main thread has almost exactly <b>one interval</b>: its BeginMainFrame leaves about 0.35 ms after tick N, and its commit must be activated before the draw about 0.2 ms after tick N+1. That is 16.5 ms for JavaScript, style, layout, paint, commit and the raster needed for activation. The rows then appear at tick N+1 whether the frame took 1.5 ms or 14 ms.</p>
+    <p>The <code>requestAnimationFrame</code> wait in regular-table costs nothing here. Blink dispatches the <code>scroll</code> event from the same routine that runs rAF callbacks, events first, so a callback requested in the scroll handler runs in the same frame.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">Files I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf/src/ts/events.ts#L77">regular-table src/ts/events.ts:77–89 (v0.9.2)</a>
+      <p>The draw the scroll event starts: compute and fetch (<code>predraw</code>, which awaits our data listener), then wait for a frame, then write the DOM.</p>
+<pre><span class="n">77</span>                    const commit = await this.predraw(width, height, {
+<span class="n">86</span>                    if (!commit.inline) {
+<span class="n">87</span>                        <mark>await new Promise(requestAnimationFrame);</mark>
+<span class="n">88</span>                        commit();
+<span class="n">89</span>                    }</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/core/page/page_animator.cc;l=294">third_party/blink/renderer/core/page/page_animator.cc:294, 337</a>
+      <p>Why that rAF fires in the same frame as the scroll event:</p>
+<pre><span class="n">294</span>        [&amp;](wtf_size_t i) { active_controllers[i]-><mark>DispatchEvents()</mark>; });
+<span class="n">337</span>    active_controllers[i]-><mark>ExecuteFrameCallbacks()</mark>;</pre>
+      <p>Both lines are in <code>PageAnimator::ServiceScriptedAnimations</code>, the "animate" phase at the start of a main frame; the trace shows them as <code>EventDispatch {type: scroll}</code> followed by <code>FireAnimationFrame</code> under one <code>PageAnimator::serviceScriptedAnimations</code>. <a href="anatomy.html">Module 3</a> reads regular-table's draw loop in full.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>The budget depends on who waits</dt><dd>Compositor-led scroll with smoothness priority: from "BeginMainFrame sent" (just after the draw) to the next draw: one interval. Compositor waits for the main thread (<code>REGULAR</code>): until about 15.5 ms after the tick (step 9). Main-led (<code>LATE</code>): until the next tick. In none of them is the number 16.7 ms of main-thread time.</dd>
+      <dt>Slack</dt><dd>The reporter stage <code>EndActivateToSubmitCompositorFrame</code> is the time a finished main frame waited for the draw. It is the budget that was left: 15 ms at 0 µs, about 2 ms at 150 µs.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> under a wheel scroll, any main frame that is activated before the next tick's draw puts its rows on the screen at the same moment. Making a 6 ms frame 3 ms does not make rows appear sooner; it buys slack.</p>
+    <p><b>No:</b> that 14 ms frames are safe. The slack is what absorbs a garbage collection, a larger layout or a slower machine. At 150 µs one frame in this recording took <b data-m="f-budget-150/frames.mainFrameMs.max" data-unit="ms"></b>.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-budget-150 tree 116.5 133.5 main 150</code>. Expected: one task of about 14.6 ms on <code>COMPOSITOR_TQ</code>; inside it <code>EventDispatch {type: scroll}</code> of about 12 ms, then <code>FireAnimationFrame</code> 0.6 ms, <code>UpdateLayoutTree</code>, <code>Layout</code>, <code>Commit</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Wheel scroll, regular-table: main frames of 1.5, 5.7 and 13.5 ms all put their rows on screen with the next vsync, 17.3–17.4 ms after their tick; only the wait between activation and draw shrinks (15 → 2 ms).</li>
+    <li data-kind="read">A requestAnimationFrame requested inside a scroll handler runs in the same main frame: events are dispatched before frame callbacks (page_animator.cc:294, 337).</li>
+    <li data-kind="inferred">The main thread's budget in a compositor-led scroll is one interval measured from the draw, about 16.5 ms including commit and activation.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> And when a frame does not make it?</p>
+</section>
+
+<section class="step" data-part="D · Budgets" data-title="Past the budget: a staircase, one vsync per step" data-node="main draw present reporter">
+  <p class="holding"><span class="label">Question I hold</span><span>At 250 µs per cell a draw takes 21 ms; at 600 µs, 49 ms. What happens to frames, to the rows' arrival, and to the main thread itself?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>From 150 to 250 µs per cell the work per draw grows from 13.5 to 21 ms. Over the whole scroll, what happens to the share of time the main thread is busy?</p>
+    <div class="opts"><button data-k="a">It rises towards 100%: the thread cannot keep up.</button><button data-k="b">It stays about the same.</button><button data-k="c">It falls.</button></div>
+    <div class="reveal"><p><b>It falls</b>, from <b data-m="f-budget-150/threads.mainUtilPct"></b>% to <b data-m="f-budget-250/threads.mainUtilPct"></b>%. The main thread now makes one frame per two vsyncs, and after each one it sits idle for about 11 ms until the compositor asks again.</p></div>
+  </div>
+  <div class="tracelink" data-trace="f-budget-250"></div>
+  <div class="lanes" data-lanes='{"traces":["f-budget-150","f-budget-250","f-budget-600"],"titles":["150 µs per cell: main frame 13.5 ms","250 µs per cell: main frame 21 ms","600 µs per cell: main frame 49 ms"],"from":82,"to":190,"rows":["frames","compositor","mainFrames","app"],"pins":[[1,127,"mainFrames",1],[2,138.75,"compositor",1],[3,144,"mainFrames",1],[4,150.1,"compositor",1],[5,108,"frames",1],[6,110,"mainFrames",2]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>250 µs.</b> The main frame for vsync 77 is sent at 116.9 ms and needs 21.6 ms. It misses the draw of vsync 78.</li>
+    <li><i>2</i>Commit and activation at 138.7 ms, 5.5 ms into vsync 78's interval.</li>
+    <li><i>3</i><b>The idle gap.</b> No new BeginMainFrame is sent on activation: the scheduler first wants the new tree drawn (step 8's rule). The main thread waits 11 ms.</li>
+    <li><i>4</i>Vsync 79's draw shows the rows of 77, 34 ms after tick 77, and only then asks for the next frame.</li>
+    <li><i>5</i>The vsyncs in between are amber: a draw with a BeginMainFrame still out. Here the label does mean a late main thread.</li>
+    <li><i>6</i><b>600 µs.</b> The same shape with a period of three vsyncs: rows 50.6 ms after their tick.</li>
+  </ol>
+  <table class="mtable" data-rows="f-budget-150,f-budget-250,f-budget-600,f-cpu-4x,f-cpu-8x,f-cpu-20x" data-names="150 µs per cell,250 µs per cell,600 µs per cell,CPU 4× slower,CPU 8× slower,CPU 20× slower" data-head="Scenario" data-cols="frames.mainFrameMs.p50|main frame p50|ms,frames.mainFrames|main frames,frames.all|vsyncs: with main,frames.partial|without main,frames.dropped|dropped,frames.mainQueueMs.p95|queue wait p95|ms,threads.mainUtilPct|main busy|%,main.longTasks|tasks ≥ 50 ms"></table>
+  <div class="bars" data-bars='{"ids":["f-budget-0","f-budget-50","f-budget-150","f-budget-250","f-budget-600"],"labels":["0 µs per cell","50 µs","150 µs","250 µs","600 µs"],"series":[{"path":"threads.mainUtilPct","label":"main thread busy","color":"#d9a800"}],"unit":"%","max":100,"title":"Main thread busy during the recording, by per-cell cost"}'></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Arrival is quantized.</b> A main frame of length <i>d</i> puts its rows on the screen at the first draw after it is activated: one interval after its tick if it fits, two if it takes up to about 33 ms, three up to about 50 ms. The medians in these recordings: 17.3 ms (150 µs), 34.0 ms (250 µs), 50.6 ms (600 µs). There is no "a bit late".</p>
+    <p><b>The rate is quantized too.</b> Main frames per scroll: <b data-m="f-budget-150/frames.mainFrames"></b>, <b data-m="f-budget-250/frames.mainFrames"></b>, <b data-m="f-budget-600/frames.mainFrames"></b>. Crossing the budget by 5 ms halves the row update rate, and the main thread spends the difference idle.</p>
+    <p><b>A slower CPU draws the same staircase.</b> The <code>f-cpu-*</code> rows are a larger regular-table (33 rows × 6 columns, 198 cells per draw) with no added work and the main thread throttled 4×, 8× and 20×. At 4× a frame takes 10.6 ms and every frame is whole; at 8×, 25 ms and every second vsync is amber; at 20×, 68 ms, one main frame per four to five vsyncs, and the BeginMainFrame tasks are themselves long tasks (last column). The queue wait stays at a few milliseconds at most: the time is inside the frame, not in front of it.</p>
+    <p><b>Drops need a silent compositor.</b> The few red vsyncs (<b data-m="f-budget-600/frames.dropped"></b> at 600 µs, <b data-m="f-cpu-20x/frames.dropped"></b> at 20×) are all in the pause between the two wheel gestures or just after the last one, where the compositor had no scroll of its own to show (step 5).</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">What the user sees</span>
+      <p>The scroll position moves at 60 Hz in every one of these traces; the compositor never misses. What degrades is how often and how late the rows follow. With regular-table the table element is sticky inside the scroller and changes only when a draw commits (Module 3 reads this in source), so at 250 µs the visible rows step at 30 Hz, each step showing a position two frames old, while the scrollbar thumb moves smoothly. <b>I could not check this against pictures:</b> these traces were recorded with the screenshot category on and contain no <code>Screenshot</code> events.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>One BeginMainFrame at a time</dt><dd>While one is out, no other is sent (<code>cc/scheduler/scheduler_state_machine.cc:561–562</code>: <code>case BeginMainFrameState::SENT: return false;</code>). A main thread that is behind is never asked for frames it cannot make; the vsyncs it misses are simply not requested.</dd>
+      <dt>Constant work or growing work</dt><dd>regular-table writes its 78 cells per draw however far the scroll moved, so its frame length is constant and it settles on a stair. A table that pays per <em>new</em> row behaves differently when overloaded: in <code>f-slow-tanstack</code> (2.5 ms per cell written) the successive main frames take 32, 47, 77, 123, 213, 248 ms. The longer a frame, the more rows scrolled in meanwhile, the longer the next. <a href="javascript.html">Module 4</a> compares the reuse policies.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in a wheel scroll the cost of a main frame that is too long is counted in whole vsyncs, for both the age of the rows and their update rate; and the first stair is at about one interval, not at some fraction of it.</p>
+    <p><b>No:</b> where exactly the edge lies. Between 13.5 ms (whole) and 21 ms (half) there is no trace. From step 10's arithmetic it should be near 16 ms; a sweep at 170–200 µs would show it, and would show frames alternating near the edge.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A draw of 17 ms is not 6% worse than one of 16 ms; it is half the frame rate. Two proposals for Tablelab follow. Budget the DOM painter's draw (query reply handling, formatting, DOM writes, style, layout, paint) against about 12 ms, leaving a third of the interval as slack. And when a draw cannot fit, prefer a policy that keeps work per draw constant (draw the newest window, skip the intermediate ones) over one whose work grows with the backlog.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-budget-250 frames 60 330</code>. Expected: vsyncs alternating <code>partial</code> (presented after about 0.6 ms: the compositor's own frame) and <code>all</code> (about 34 ms: the main thread's rows), and below it one main frame of about 21.4 ms every 33.3 ms with a queue wait near 0.01 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Main frames of 21 ms and 49 ms put rows on screen 34 and 50.6 ms after their tick, at one frame per two and per three vsyncs; the main thread is idle between activation and the next draw, so its utilisation falls when the budget is crossed.</li>
+    <li data-kind="measured">Throttling the CPU 4×, 8×, 20× reproduces the staircase (10.6, 25, 68 ms frames); queue wait stays small; dropped vsyncs occur only where the compositor had nothing of its own to draw.</li>
+    <li data-kind="read">Only one BeginMainFrame is outstanding at a time (scheduler_state_machine.cc:561).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> In all of this the main thread was slow <em>inside</em> its frame. What do the records say when it is busy with something else and cannot start the frame at all?</p>
+</section>
+
+<section class="step" data-part="D · Budgets" data-title="A long task: the compositor waits for it, every frame" data-node="scheduler main draw reporter">
+  <p class="holding"><span class="label">Question I hold</span><span>A 250 ms task occupies the main thread while a scrollbar click animates. Module 1 showed that the animation continues. What does the frame record show, and does the animation pay anything?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>f-longtask-tanstack</code>: the task starts 51 ms before the click and ends 199 ms after it. I read the same three numbers as before, then the deadline mode of each vsync.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-longtask-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["f-longtask-tanstack"],"from":-60,"to":236,"rows":["inputs","tasks","frames","compositor","mainFrames","main","app"],"pins":[[1,60,"tasks"],[2,90,"mainFrames"],[3,28.75,"compositor"],[4,172,"frames"],[5,201.95,"compositor"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The long task: <b data-m="f-longtask-tanstack/main.maxTaskMs" data-unit="ms"></b> on the main thread.</li>
+    <li><i>2</i>The BeginMainFrame for the click's vsync, sent at 0.4 ms. Its reporter stage <code>SendBeginMainFrameToCommit</code> lasts 201 ms, of which <b data-m="f-longtask-tanstack/frames.mainQueueMs.max" data-unit="ms"></b> is <code>begin_main_sent_to_started_us</code>: waiting in the queue. The work itself took 1.5 ms.</li>
+    <li><i>3</i>One of nine animation frames the compositor draws meanwhile. Each is drawn about 16 ms after its tick: the deadline mode is <code>REGULAR</code>, so the compositor waits for the main thread until the last moment, every frame, and then draws without it.</li>
+    <li><i>4</i>The animation has ended, the task has not: two vsyncs with nothing to draw and a main frame owed. Dropped (<code>FrameSkippedReason: kWaitingOnMain</code>).</li>
+    <li><i>5</i>The task ends at 199.5 ms; the waiting BeginMainFrame runs, commits, and is drawn at 201.9 ms: the rows for the click arrive 206.7 ms after its tick.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Queue wait is the number that names this case.</b> In every budget trace it was under 0.1 ms at the 95th percentile; here it is 199.6 ms. A long <code>SendBeginMainFrameToCommit</code> with a long queue wait is a main thread busy with something else; a long one with no queue wait is a slow frame.</p>
+    <p><b>The animation pays about 10 ms per frame.</b> In the undisturbed click (step 7) the compositor's frames were presented 7 ms after their tick. Here they are presented 16.2–17.3 ms after it, because with a BeginMainFrame outstanding and no smoothness priority the scheduler chooses <code>REGULAR</code> and waits for a commit that cannot come. The main thread's task delays frames it has no part in.</p>
+    <p><b>No instrument marks it.</b> By reporter: <b data-m="f-longtask-tanstack/frames.partial"></b> partial and <b data-m="f-longtask-tanstack/frames.dropped"></b> dropped vsyncs. <code>DroppedFrame</code> events for DevTools: <b data-m="f-longtask-tanstack/frames.devtoolsPartial"></b> and <b data-m="f-longtask-tanstack/frames.devtoolsDropped"></b>. <code>main_thread_missed_last_deadline</code>: <code>true</code>, as in a healthy scroll.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=1410">cc/scheduler/scheduler_state_machine.cc:1412–1432</a>
+      <p>Why <code>REGULAR</code> here and <code>WAIT_FOR_SCROLL</code> in step 7? Both start from the test "may I draw immediately?":</p>
+<pre><span class="n">1412</span>  bool <mark>wait_for_main = CommitPending() || has_pending_tree_;</mark>
+<span class="n">1424</span>  if (!wait_for_main) {
+<span class="n">1425</span>    return true;
+<span class="n">1426</span>  }
+<span class="n">1428</span>  // Prioritize impl-thread draws in ImplLatencyTakesPriority mode.
+<span class="n">1429</span>  if (<mark>ImplLatencyTakesPriority()</mark>)
+<span class="n">1430</span>    return true;
+<span class="n">1432</span>  return false;</pre>
+      <p>In step 7 no commit was pending when each tick began, so the answer was yes (and the scroll wait then turned "immediately" into "after a third of the interval"). Here a commit is pending all the time and an animated scroll has no smoothness priority: the answer is no, and a compositor with something to draw gets <code>REGULAR</code>.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>What is not recorded here</dt><dd>A long task under a <em>precise</em> scroll (the wheel gesture). By line 1429 the compositor would not wait there. <code>r-wheel-none</code>, a trace of <a href="rendering.html">Module 5</a> with wheel notches against a busy main thread, draws its scrolling frames with <code>IMMEDIATE</code> (twice <code>WAIT_FOR_SCROLL</code>) and never <code>REGULAR</code>; I did not record a clean pair.</dd>
+      <dt><code>has_high_latency</code></dt><dd>The reporter argument set when an update took more than 75 ms from tick to presentation. It is <code>true</code> on the click's main reporter here: a cheap filter for "some main-thread update was very late".</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a blocked main thread shows as queue wait on the BeginMainFrame, as <code>REGULAR</code> deadlines that expire, and, for this animated scroll, as compositor frames presented most of an interval later than they could be.</p>
+    <p><b>No:</b> that the user saw a stutter in the motion. Every animation frame was presented, at an even 16.7 ms spacing; what was lost is 10 ms of latency and, for 200 ms, the rows.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-longtask-tanstack frames</code>. Expected: eleven <code>partial</code> and two <code>dropped</code> vsyncs, the first partial with "presented after" 206.73 ms; and under "main frames" a first line of 200.97 ms with a queue wait of 199.58 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Long task under a click animation: the BeginMainFrame waits 199.6 ms in the queue (begin_main_sent_to_started_us); nine animation frames are drawn at a REGULAR deadline about 16 ms after their ticks instead of 6.3 ms; two vsyncs after the animation are dropped (kWaitingOnMain).</li>
+    <li data-kind="measured">Neither DevTools' DroppedFrame events nor main_thread_missed_last_deadline distinguish this trace from a healthy one; frames.mainQueueMs does.</li>
+    <li data-kind="read">With a commit pending and no smoothness priority the compositor does not draw immediately (scheduler_state_machine.cc:1412–1432) and waits until the REGULAR deadline.</li>
+  </ul>
+  <p class="next" data-answer="budget"><b>Next question →</b> I keep saying "the rows reach the screen". For one update, which events are the moments it is in the DOM, committed, drawn, presented?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · When is it on screen?" data-title="Four observation points on one update" data-node="main commit activate draw present"
+  data-ask="screen|When I say an update “is on screen”, which event do I mean, and how far is it from “in the DOM”?">
+  <p class="holding"><span class="label">Question I hold</span><span>One cell changes. Which trace event marks each moment a person might call "done": the DOM has it, requestAnimationFrame ran, the frame is committed, the pixels are presented?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Two traces of the idle-page update from step 3, with the server stamping each message with its send time on the trace clock. <code>f-obs-msg</code> writes the cell in the WebSocket message handler. <code>f-obs-raf</code> stores the value there and writes it in a <code>requestAnimationFrame</code> callback (<code>lab/pages/src/ticks.ts:81–88</code>). I line up one update of each.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-obs-raf">Perfetto: search <code>app: tick apply</code> on the user-timing track, then widen the selection by 2 ms on <code>CrRendererMain</code>, <code>Compositor</code> and <code>VizCompositorThread</code>.</div>
+<pre>                                              <b>f-obs-msg</b>    <b>f-obs-raf</b>   event, thread
+   the server sends                           348.69       357.69      <span class="c">sentUs in our mark's detail (backend clock = trace clock)</span>
+   message delivered to the page              348.96       357.94      WebSocketReceive, CrRendererMain
+   handler runs                               348.98       357.96      FunctionCall socket.onmessage
+<span class="cp">1</span>  <mark>DOM written</mark>                                349.18       358.63      end of app: tick apply (our measure)
+<span class="cp">2</span>  <mark>requestAnimationFrame callback</mark>               —          358.52      FireAnimationFrame, inside ProxyMain::BeginMainFrame
+   main frame starts                          349.29       358.35      ProxyMain::BeginMainFrame
+   style · layout · paint                     349.32–.70   358.68–9.07 UpdateLayoutTree, Layout, Paint
+<span class="cp">3</span>  <mark>commit</mark>                                     349.75       359.15      Commit {frameSeqId}, CrRendererMain
+   activated                                  349.98       359.46      ActivateLayerTree, Compositor
+   drawn and submitted                        350.05       359.56      DrawFrame, Compositor
+<span class="cp">4</span>  <mark>presented</mark>                                  350.25       359.74      Display::FrameDisplayed, VizCompositorThread;
+                                                                       <span class="c">also the end of the PipelineReporter that has the Commit stage</span>
+   server send → presented                    1.56 ms      2.05 ms</pre>
+  <div class="lanes" data-lanes='{"traces":["f-obs-raf"],"from":357.6,"to":360,"rows":["marks","app","compositor","mainFrames","main","viz"],"pins":[[1,358.63,"app"],[2,358.55,"main"],[3,359.19,"main"],[4,359.69,"viz"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>DOM written.</b> The moment <code>textContent</code> is set. A test that reads the DOM, or our own "applied" measure, sees the value from here on. Nothing is on the screen.</li>
+    <li><i>2</i><b>rAF.</b> The callback runs at the start of a main frame, before style and layout. In <code>f-obs-raf</code> it is where the DOM write happens; code that only <em>reads</em> in rAF sees the DOM as written, still unpainted.</li>
+    <li><i>3</i><b>Commit.</b> Style, layout and paint are done and the result is handed to the compositor. From here the main thread is out of the picture; it may be busy again without delaying this frame.</li>
+    <li><i>4</i><b>Presented.</b> The compositor has drawn, viz has drawn, and the frame has a presentation timestamp. Only this is "on screen".</li>
+  </ol>
+  <table class="mtable" data-rows="f-obs-msg,f-obs-raf" data-names="write in the message handler,write in requestAnimationFrame" data-head="Age of the data (ms since the server sent it), p50 of 8 updates" data-cols="ticks.ageWhenHandled.p50|message handled,ticks.ageWhenApplied.p50|DOM written,ticks.ageOnScreen.p50|presented,ticks.ageOnScreen.max|presented (max),frames.mainFrameMs.p50|main frame|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The DOM has the value about half a millisecond after the server sent it; the screen has it more than a millisecond later still, and that is on an idle page in a browser without a display. Between the two lie a task switch, a main frame, a commit, an activation and two draws.</p>
+    <p>Both policies reach the screen <b>in the same frame</b>. Writing in rAF is later by a fraction of a millisecond here: the write moves inside the main frame, behind the frame's own start-up. Nothing is gained and nothing lost in vsyncs. A write made in any task is picked up by the next main frame; a rAF callback <em>is</em> in the next main frame.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/harness/analyze-lib.mjs:375–381, 445–452</span>
+      <p>How the lab computes "age on screen", so I know what the table's third column is:</p>
+<pre><span class="n">378</span>    // The main frame that picks up a change made at `ts` is the first whose BeginMainFrame work ends after ts.
+<span class="n">379</span>    for (const f of mainFrames) if (f.main[1] >= ts) return f.end;</pre>
+      <p>For each <code>tick apply</code> measure it takes the first presented reporter whose <code>SendBeginMainFrameToCommit</code> stage ends after the write, and uses that reporter's end (the presentation time) minus the oldest send time in the batch. It is exact when one main frame follows each write, as here.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Why name the point</dt><dd>"Update latency 0.5 ms" and "update latency 1.7 ms" are both true of this trace. Under load the two diverge by whole frames (next step). A latency number without its observation point cannot be compared with another.</dd>
+      <dt>What rAF is for</dt><dd>Not for getting to the screen sooner. For doing a piece of work once per frame however many messages arrived, and for reading layout at a moment when it is clean. <a href="streaming.html">Module 7</a> measures that with thousands of messages a second.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the four points are four different events on three threads, and for a single write on an idle page either policy gets it presented in the frame that follows.</p>
+    <p><b>No:</b> the 0.4 ms difference between the policies is not a finding: eight updates, one run each (step 17). And 1.6 ms is not what a user's screen does. Headless Chrome hands the page the tick already in progress and counts the frame presented 0.2 ms after it is drawn; a display shows it at its next refresh, up to one interval later.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-obs-raf slices 'WebSocketReceive|RequestAnimationFrame|FireAnimationFrame|tick apply|^Commit$|ActivateLayerTree|DrawFrame|FrameDisplayed' 357.5 360</code>. Expected: thirteen lines from 357.94 to 359.74 ms: <code>WebSocketReceive</code>, <code>RequestAnimationFrame</code>, <code>FireAnimationFrame</code> with the begin and end of <code>app: tick apply</code> inside it, <code>Commit</code> on the main thread and the reporter's <code>Commit</code> stage on the compositor, <code>ActivateLayerTree</code>, <code>DrawFrame</code>, viz's <code>DirectRenderer::DrawFrame</code>, <code>Display::FrameDisplayed</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One update on an idle page: DOM written 0.5 ms after the server sent it, presented 1.6–2.1 ms after; commit, activation, compositor draw and viz draw lie between.</li>
+    <li data-kind="measured">Writing in the message handler or in requestAnimationFrame reaches the screen in the same frame; rAF is later by a fraction of a millisecond in these eight updates.</li>
+    <li data-kind="read">Observation points and their events: DOM written = end of our measure; rAF = FireAnimationFrame; commit = Commit (proxy_main.cc:434); presented = Display::FrameDisplayed (display.cc:1362) or the end of the PipelineReporter with a Commit stage.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> On an idle page the points are a millisecond apart. How far apart are they while frames are being produced one after another?</p>
+</section>
+
+<section class="step" data-part="E · When is it on screen?" data-title="DOM done is not on screen; input is further still" data-node="input main commit present">
+  <p class="holding"><span class="label">Question I hold</span><span>During a scroll, how long after the rows are in the DOM are they presented? And how long after the wheel moved?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Three of the wheel-scroll traces: regular-table with 0 µs, 150 µs and 600 µs of formatting per cell (main frames of 1.5, 13.5 and 49 ms). In which is a finished DOM presented soonest after it is finished?</p>
+    <div class="opts"><button data-k="a">0 µs: the fastest main thread.</button><button data-k="b">150 µs.</button><button data-k="c">600 µs: the slowest.</button></div>
+    <div class="reveal"><p><b>600 µs.</b> There the DOM is complete about 2.5 ms before the draw that shows it; at 0 µs it waits about 16.5 ms. The wait is set by where on the vsync grid the commit happens to land, not by speed. The slow table's rows are of course far older when they appear: look at the "presented" column.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The lab page marks <code>app: content complete</code> when the rows in the DOM match the scroll position. For every main frame of the first wheel gesture I take four times relative to the frame's tick: BeginMainFrame sent, that mark, commit, and presentation of the reporter. The table below computes the medians in your browser from <code>data/&lt;id&gt;.js</code> (lanes <code>mainFrames</code>, <code>marks</code>, <code>frames</code>; main frames starting between 100 and 950 ms).</p>
+  </div></div>
+  <table class="mtable" id="dom-to-screen" data-traces="f-scroll-tanstack,f-budget-0,f-budget-150,f-budget-250,f-budget-600,f-cpu-4x,f-cpu-20x" data-names="TanStack,regular-table · 0 µs per cell,regular-table · 150 µs,regular-table · 250 µs,regular-table · 600 µs,regular-table · CPU 4× slower,regular-table · CPU 20× slower"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>DOM written to presented: anywhere from 2.5 to more than 60 ms</b> in these recordings, with no simple relation to how fast the code is. The rule from step 11 explains every row: the commit waits for the next draw, and draws happen once per tick.</p>
+    <p><b>DOM written is not commit either.</b> With the CPU throttled the DOM is complete early in the frame, and style, layout and paint take the rest: at 20× the rows are in the DOM about 20 ms after the tick and the commit comes 48 ms after that. A measurement that stops at "DOM complete" would report this table as several times faster than the user finds it.</p>
+    <p><b>And the wheel moved earlier still.</b> Chromium records each input event's path to the screen as an <code>EventLatency</code> slice. For the wheel event generated at 99.99 ms in <code>f-scroll-tanstack</code>:</p>
+<pre>  99.99  wheel event generated                 <span class="c">EventLatency begins (GESTURE_SCROLL_UPDATE)</span>
+ 100.20  arrives at the renderer's compositor  <span class="c">0.13 ms after vsync 77's frame was drawn</span>
+          <span class="c">… RendererCompositorQueueingDelay: 16.5 ms in the queue …</span>
+ 116.72  applied to the scroll offset          <span class="c">HandleGestureScrollUpdate, vsync 78</span>
+ 117.33  <mark>scrolled position presented</mark>           <span class="c">EventLatency ends: 17.3 ms</span>
+ 133.93  <mark>rows for that position presented</mark>      <span class="c">main frame of vsync 78: 33.9 ms after the wheel event</span></pre>
+    <p>Two vsyncs from wheel to matching rows when everything is healthy. Each stair of step 11 adds one.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/metrics/event_latency_tracing_recorder.cc;l=254">cc/metrics/event_latency_tracing_recorder.cc:254–255</a>
+<pre><span class="n">254</span>  TRACE_EVENT_BEGIN(
+<span class="n">255</span>      kTracingCategory, "EventLatency", trace_track, <mark>generated_timestamp</mark>,</pre>
+      <p>The slice starts at the input's own timestamp and, for an event that caused a frame, ends at that frame's presentation, with child slices for each hop (<code>GenerationToBrowserMain</code>, <code>BrowserMainToRendererCompositor</code>, <code>RendererCompositorQueueingDelay</code>, … <code>SubmitCompositorFrameToPresentationCompositorFrame</code>). The lab's <code>eventLatency.*</code> metrics are these slices' lengths by event type.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>What EventLatency does not see</dt><dd>It ends when the <em>compositor's</em> response is presented. For a compositor scroll that is the moved layer, not the rows. Its 95th percentile is <b data-m="f-scroll-tanstack/eventLatency.GESTURE_SCROLL_UPDATE.p95" data-unit="ms"></b> in the healthy TanStack scroll and <b data-m="f-budget-600/eventLatency.GESTURE_SCROLL_UPDATE.p95" data-unit="ms"></b> at 600 µs per cell, where rows are three frames behind.</dd>
+      <dt>A median to distrust</dt><dd>The lab's gesture sends two wheel events per vsync. The one generated at the tick waits a whole frame (17 ms); the one generated mid-interval is merged into it and its slice ends when it is processed (about 9 ms), without a presentation. Half the slices are near 9 ms and half near 17 ms, so the reported median is one or the other by chance: <b data-m="f-scroll-tanstack/eventLatency.GESTURE_SCROLL_UPDATE.p50" data-unit="ms"></b> in this trace, <b data-m="f-scroll-regular/eventLatency.GESTURE_SCROLL_UPDATE.p50" data-unit="ms"></b> in <code>f-scroll-regular</code>. Step 17 shows it flip between identical runs.</dd>
+      <dt>Synthetic input</dt><dd>The gesture is generated by the browser in step with its own ticks, so the tick-aligned event misses its frame by a constant 0.1 ms. A hand on a wheel is not synchronized with the display; real events land anywhere in the interval.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> during continuous frame production the four observation points are separated by amounts that are multiples of the vsync interval and depend on phase. "Rows correct in the DOM" precedes "rows presented" by up to a full interval even when everything is fast.</p>
+    <p><b>No:</b> the absolute values for a real display, where presentation itself waits for the refresh; and not the input-to-rows time under slow frames, which I inferred from the frame times instead of measuring per event.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Tablelab's study plan asks for data age and latency tails. This step says where to stop the clock: at presentation, from the trace, never at DOM completion in page code. A proposal: every latency Tablelab reports names its two ends from this list (server send, message handled, DOM written, commit, presented), and the default end is "presented".</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-budget-150 marks 'content complete' 110 140</code> prints two marks, the second at 129.87 ms; <code>node lab/harness/q.mjs f-budget-150 frames 110 120</code> shows vsync 76 at 116.55 ms presented after 17.41 ms, that is at 133.96 ms. The DOM was complete 4.1 ms before it was shown.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">During a wheel scroll, DOM completion precedes presentation by 2.5 to over 60 ms depending on where the commit lands on the vsync grid; with a throttled CPU the commit itself comes tens of milliseconds after DOM completion.</li>
+    <li data-kind="measured">Healthy wheel scroll: wheel event → scrolled position presented 17.3 ms → matching rows presented 33.9 ms (one event followed through EventLatency and the reporters).</li>
+    <li data-kind="measured">EventLatency for scroll updates ends at the compositor's frame; its p95 is the same with rows one frame or three frames behind.</li>
+  </ul>
+  <p class="next" data-answer="screen"><b>Next question →</b> Every number so far came from instruments that run inside the thing they measure. What do they cost?</p>
+</section>
+
+<!-- ═════════════════════════ PART F ═════════════════════════ -->
+
+<section class="step" data-part="F · Trusting the instruments" data-title="What our own marks cost" data-node="method"
+  data-ask="trust|How small a difference between two traces may I believe?">
+  <p class="holding"><span class="label">Question I hold</span><span>The lab page calls <code>performance.measure</code> and <code>performance.mark</code> once per render so that its work shows up in traces. How much of the measured JavaScript is those calls?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Two recordings of the same TanStack scroll (large table): <code>f-marks-on</code>, and <code>f-marks-off</code> with <code>marks=0</code>, which replaces both functions by empty ones (<code>lab/pages/src/timing.ts:5–10</code>). I estimate the cost three ways: from V8's samples, from the difference of the two traces, and from that difference corrected for something the marks cannot touch.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-marks-on"></div>
+  <div class="prof" data-prof="f-marks-on" data-top="6" data-by="self"></div>
+  <table class="mtable" data-rows="f-marks-on,f-marks-off" data-names="with measure + mark,marks=0" data-head="One run each" data-cols="main.scriptMs|script|ms,frames.mainFrameMs.p50|main frame p50|ms,main.layoutMs|layout|ms,main.paintMs|paint|ms,threads.mainBusyMs|main busy|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Estimate 1, sampling.</b> In the profile, the native <code>measure</code> and <code>mark</code> are the second and third largest self times, directly after TanStack's scroll handler. Together they are more than a third of all sampled JavaScript that is not idle or "(program)". One <code>measure</code> with a detail object and one <code>mark</code> per frame: by samples about 0.23 ms per frame.</p>
+    <p><b>Estimate 2, subtraction.</b> Script time falls by a third when the marks are removed, and the median main frame by 0.3 ms. That agrees with the lead's "a third".</p>
+    <p><b>Estimate 3, the control.</b> But layout and paint also fell, each by 18%, and the marks have nothing to do with layout or paint. The run without marks was simply a faster run. Scaling by paint, the part of the script difference that belongs to the marks is roughly half of what subtraction says.</p>
+    <p>So the instrument costs roughly 0.1 to 0.2 ms per frame with tracing on. Against this table's 0.5 ms scroll handler that is between a sixth and a third of what I am measuring; against a 16.7 ms frame it is about 1%.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Why a measure costs anything</dt><dd>Each call creates a <code>PerformanceMeasure</code> entry, serializes its <code>detail</code>, stores it in the page's performance timeline and, with tracing on, writes a begin and an end event (Module 1, step 4, reads that code). None of it is free, and all of it runs on the thread being measured.</dd>
+      <dt>Three estimates, three answers</dt><dd>Sampling attributes whole sample intervals (about 0.15 ms here) to whatever function a sample lands in, which flatters nothing and can inflate short native calls. Subtraction of two runs includes the difference between the runs. A control quantity measured in the same run removes most of that difference. When they disagree by a factor of two, the honest result is the range.</dd>
+    </dl></div>
+    <div class="box"><span class="label">Limit of this step</span>
+      <p>One run per side. Step 17 shows that two runs of the <em>same</em> configuration differ in script time by up to a quarter. The direction (marks cost script time) is supported by the profile; the size is not established better than the range above. Without tracing the calls are cheaper; I did not measure by how much, because without tracing I have no trace.</p>
+    </div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> our marks are visible in our own measurements, and when the code under study runs for half a millisecond they are a large part of it.</p>
+    <p><b>No:</b> "the marks cost 33%". That number came from two runs that also differ by 18% in something unrelated.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Keep the spans (they are how a trace is tied to intent) but budget them: one measure per draw, not per row or cell, with a small <code>detail</code>. A proposal for Tablelab's harness: every benchmark configuration has a <code>marks=0</code> twin, and a per-cell cost is only reported from runs where instrumentation is per draw.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-marks-on prof 0 2200</code>. Expected under "self time", after <code>(idle)</code> and <code>(program)</code>: the anonymous function at <code>index-….js:384</code> (TanStack's scroll handler) with about 34 ms, then <code>measure</code> about 22 ms and <code>mark</code> about 7 ms. The same command on <code>f-marks-off</code> shows neither.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">f-marks-on: native measure + mark are the 2nd and 3rd largest sampled self times, over a third of sampled JavaScript; removing them lowers script time by a third in a pair of runs that also differ by 18% in layout and paint.</li>
+    <li data-kind="inferred">One measure and one mark per frame cost roughly 0.1–0.2 ms per frame with tracing on; the three estimates disagree by more than 2×.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> And the trace itself? Tens of thousands of events a second are being written by the threads I am timing.</p>
+</section>
+
+<section class="step" data-part="F · Trusting the instruments" data-title="What the trace itself costs" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>This course records about twenty trace categories and samples JavaScript every 0.1 ms. How much of the measured style, layout and script time is the recording?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>First the three traces planned for this question: the same regular-table scroll (18 × 33 cells) with a minimal category set and no sampling (<code>f-observer-min</code>), with the course's default set (<code>f-observer-default</code>), and with Blink's internal category added on top (<code>f-observer-blink</code>).</p>
+  </div></div>
+  <table class="mtable" data-rows="f-observer-min,f-observer-default,f-observer-blink" data-names="minimal categories,default categories,default + “blink”" data-head="One run each" data-cols="traceBytes|trace size|bytes gz,main.scriptMs|script|ms,main.styleMs|style|ms,main.layoutMs|layout|ms,main.paintMs|paint|ms,threads.mainBusyMs|main busy|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The default set costs something: more script, a little more style and paint, and clearly more layout than the minimal set. And adding <code>blink</code> costs nothing at all: the second and third rows agree to a fraction of a percent. A category that writes an event for every piece of text Blink shapes, free?</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I took the last two rows as evidence that Blink's internal category adds almost nothing "despite tens of thousands of events". They are the same configuration recorded twice. The harness's default list already contains <code>"blink"</code> (<code>lab/harness/browser.mjs:27</code>), so asking for it again (<code>scenarios.mjs:33</code>) changes nothing: both traces hold about 74,000 events of that category, 67,000 of them <code>InlineNode::ShapeTextIncludingFirstLine</code>. I had compared a thing with itself and read the agreement as a result. <b>Rule I keep:</b> before interpreting "no difference", check in the artifacts that the two sides differ in the input: here, <code>metadata.lab.categories</code> in each trace file.</p></div>
+  <div class="beat"><span class="label">What I do next</span><div>
+    <p>I record the question properly: four category sets, <b>five runs each</b> (<code>lab/harness/extra/frames.mjs</code>: <code>f-cat-min</code>, <code>f-cat-default</code>, <code>f-cat-noblink</code> = default minus <code>blink</code>, <code>f-cat-nosampling</code> = default minus V8's two profiler categories). Because whole runs are faster or slower than each other (next step), I also divide each run's layout and script time by the same run's paint time, which none of the removed categories instruments heavily. The table is computed in your browser from the twenty runs in <code>data/index.js</code>; each cell is the median with the range in brackets.</p>
+  </div></div>
+  <table class="mtable" id="cat-ratios" data-runs="f-cat-min,f-cat-default,f-cat-noblink,f-cat-nosampling" data-names="minimal,default,default − blink,default − sampling" data-cols="main.layoutMs|layout ms,main.scriptMs|script ms,main.paintMs|paint ms,main.layoutMs/main.paintMs|layout ÷ paint,main.scriptMs/main.paintMs|script ÷ paint"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>In milliseconds the sets overlap.</b> The minimal set's five runs alone span a range as wide as the difference between any two sets. From these columns I could argue for almost any ordering.</p>
+    <p><b>As ratios they separate.</b> Layout ÷ paint is about 1.1 for the two sets without <code>blink</code> and about 1.25 for the two with it, and the ranges do not touch. Script ÷ paint is about 0.66 for the two sets without sampling and 0.71 to 0.74 for the two with it, with a small overlap.</p>
+    <p>So, in this recording: <b>the <code>blink</code> category adds about 15% to measured layout, and nothing visible to script. The 0.1 ms sampler adds about 10% to measured script, and nothing visible to layout.</b> The lead was wrong in the interesting direction: the cheap-looking category is the expensive one for exactly the phase a table engine studies.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/core/layout/inline/inline_node.cc;l=1888">third_party/blink/renderer/core/layout/inline/inline_node.cc:1888–1894</a>
+      <p>Where the layout cost comes from: one complete event per inline formatting context shaped, which for a table is one per cell per layout.</p>
+<pre><span class="n">1888</span>void InlineNode::ShapeTextIncludingFirstLine(
+<span class="n">1892</span>  <mark>TRACE_EVENT0("blink", "InlineNode::ShapeTextIncludingFirstLine");</mark>
+<span class="n">1893</span>  InlineItem::UpdateIndex(data->items);
+<span class="n">1894</span>  ShapeText(data, previous_text, previous_items);</pre>
+      <p>594 cells × 122 draws is about 72,000 cell layouts; <code>f-cat-default</code> has 67,021 of these events, all inside <code>Layout</code>. The medians put the added layout time at about 36 ms: roughly half a microsecond per event, each needing two timestamps and a buffer write.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Observer effect</dt><dd>An instrument that runs on the measured thread adds its own time to the measurement, and adds it unevenly: where the events are. A category that is silent during JavaScript and chatty during layout inflates layout only.</dd>
+      <dt>A within-run control</dt><dd>Dividing by a quantity from the same run that the treatment should not change cancels whatever made the whole run fast or slow. It is only as good as that "should not": paint here is recorded by the same <code>devtools.timeline</code> and <code>cc</code> events in all four sets.</dd>
+      <dt>What I still do not know</dt><dd>The cost of the remaining default categories (<code>toplevel</code>, <code>cc</code>, <code>viz</code>, …) against no tracing at all. Without tracing there is nothing to compare with; that needs counters inside the page.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with this course's default categories, measured layout is inflated by text-shaping events and measured script by the sampler, each by the order of a tenth. Comparisons between traces recorded with the same categories are unaffected in ratio; absolute milliseconds are upper bounds.</p>
+    <p><b>No:</b> exact percentages. Five runs per set, recorded set after set, not interleaved; a drift during the two minutes of recording would bias the sets against each other, and the ratio only removes what scales both phases alike.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>For locating DOM and CSS rendering cost (a stated Tablelab goal), a proposal: record layout studies without the <code>blink</code> category unless its events are the thing being read, record per-function JavaScript studies with the sampler and quote totals from a run without it, and state the category set with every number.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-cat-default names main | grep -n ShapeText</code> and the same on <code>f-cat-noblink</code>. Expected: one line with about 67,000 events and 36 ms for the first; no output for the second.</div>
+  <ul class="add" hidden>
+    <li data-kind="rejected">"Blink's internal category adds almost nothing": the two traces compared had identical categories (browser.mjs:27).</li>
+    <li data-kind="measured">Five runs per category set: layout ÷ paint is ~1.1 without the blink category and ~1.25 with it (ranges disjoint); script ÷ paint ~0.66 without the sampler and 0.71–0.74 with it.</li>
+    <li data-kind="inferred">The blink category inflates measured layout by about 15% for a table of 594 cells (one ShapeText event per cell per layout, inline_node.cc:1892); the 0.1 ms sampler inflates script by about 10%.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> That table needed five runs to say anything. How much does one run move?</p>
+</section>
+
+<section class="step" data-part="F · Trusting the instruments" data-title="How much one run moves" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>Every scenario in this course was recorded once. If I record one of them ten times, which numbers repeat and which do not?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Ten recordings of one regular-table scroll, nothing changed between them. Which number differs most between the lowest and the highest run?</p>
+    <div class="opts"><button data-k="a">The number of vsyncs presented with the main thread's update.</button><button data-k="b">Total script time.</button><button data-k="c">The longest single task.</button></div>
+    <div class="reveal"><p><b>The longest task</b>, by a factor of about 2.6. Total script time varies by about a quarter; the frame count by one or two frames in 123. A maximum is one event, and one event is whatever happened to that run.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>f-variance</code>: ten runs, the first trace kept, every run's metrics kept (<code>data/runs.jsonl</code>). I look at counts, at totals, at extremes, and at the within-run ratios of the previous step.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-variance">This is the trace of the first of the ten runs.</div>
+  <table class="mtable runs" data-runs="f-variance" data-cols="frames.all|vsyncs with the main update,frames.partial|vsyncs without,main.layouts|layouts,raster.tasks|raster tasks,main.scriptMs|script|ms,main.layoutMs|layout|ms,main.paintMs|paint|ms,threads.mainBusyMs|main thread busy|ms,frames.mainFrameMs.p50|main frame p50|ms,frames.mainFrameMs.max|main frame max|ms,main.maxTaskMs|longest task|ms,frames.mainQueueMs.max|longest queue wait|ms,eventLatency.GESTURE_SCROLL_UPDATE.p50|scroll EventLatency p50|ms,eventLatency.GESTURE_SCROLL_UPDATE.p95|scroll EventLatency p95|ms"></table>
+  <table class="mtable" id="var-ratios" data-runs="f-variance" data-names="ten runs" data-cols="main.scriptMs|script ms,main.layoutMs|layout ms,main.paintMs|paint ms,main.scriptMs/main.paintMs|script ÷ paint,main.layoutMs/main.paintMs|layout ÷ paint"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Counts repeat.</b> Frames with and without the main update, layouts, raster tasks: within one or two of each other, or identical. What the scheduler did is reproducible; a count that differs between two traces is a finding.</p>
+    <p><b>Totals move by about a quarter, together.</b> Script, layout, paint and busy time each have a highest run 1.2–1.3 times the lowest, and it is the same runs that are low in all of them. The whole machine was faster or slower for a run (I did not look for the reason; the host is shared); the workload did not change. The second table shows what that implies: the ratios of two phases within a run vary two to four times less than either phase.</p>
+    <p><b>Extremes do not repeat.</b> Longest task, longest main frame, longest queue wait: factors of two and more. One run's maximum says something happened once.</p>
+    <p><b>A median can jump.</b> The scroll <code>EventLatency</code> median is about 9 ms in some runs and about 17 ms in others, while its 95th percentile holds to 2%. Step 14 explained why: the distribution has two equal peaks, and the median falls on one or the other. The summary statistic is unstable although every run is the same.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Rules I take from this</span><dl>
+      <dt>From one run per side</dt><dd>Believe differences in counts and in structure (which events, in which order, on which thread). Treat a difference in milliseconds under about 25% as not shown.</dd>
+      <dt>To claim a small difference in time</dt><dd>Repeat (five runs separated two effects in step 16 that single runs could not), compare medians, look at the ranges, and prefer a ratio against a control from the same run.</dd>
+      <dt>Before quoting a percentile</dt><dd>Look at the distribution once. A p50 between two peaks, or a maximum, is a property of the run, not of the system.</dd>
+    </dl></div>
+    <div class="box"><span class="label">Limit of this step</span>
+      <p>Ten runs of one scenario on one machine on one day, recorded back to back while other recordings had just finished. The factor of 1.25 is this lab's, not a constant; a quiet dedicated machine would be tighter. The f-observer pair of step 16 agreed to a fraction of a percent, which shows that two consecutive runs <em>can</em> be nearly identical, and that one such agreement proves nothing about the spread.</p>
+    </div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in this lab, frame outcomes and event counts are reproducible to a frame or two; time totals to within roughly ±15% of the median; maxima and bimodal medians not at all.</p>
+    <p><b>No:</b> that every scenario varies like this one. Scenarios near a cliff (a main frame close to one interval, a queue about to overflow) can flip between regimes from run to run, and there the counts move too.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Record your own repeat: <code>cd lab &amp;&amp; node harness/record.mjs f-variance</code> (ten runs, about a minute; needs Chrome and <code>npm ci &amp;&amp; npm run build</code>), then <code>node harness/analyze.mjs</code> and reload this page. Expected: the first four rows of the table unchanged to within one or two; the millisecond rows different from mine by up to tens of percent.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Ten runs of one scroll: frame outcomes and layout/raster counts identical to within 1–2; script, layout and paint totals vary by a factor of ~1.25 and move together; longest task by ~2.6×.</li>
+    <li data-kind="measured">Within-run ratios (script ÷ paint, layout ÷ paint) vary 2–4× less than the totals.</li>
+    <li data-kind="measured">The scroll EventLatency median flips between ~9 and ~17 ms across identical runs (two equal peaks); its p95 is stable.</li>
+  </ul>
+  <p class="next" data-answer="trust"><b>Next question →</b> Can I now say what happened to each frame, without scrolling back?</p>
+</section>
+
+<!-- ═════════════════════════ PART G ═════════════════════════ -->
+
+<section class="step" data-part="G · Check yourself" data-title="Seven questions" data-node="vsync scheduler main draw present reporter method">
+  <p class="holding"><span class="label">Question I hold</span><span>Can I answer these from what I now know, and say which trace events I would look at?</span></p>
+  <div class="exercise"><span class="label">1 · Order</span>
+    <p>A wheel scroll, healthy. Put in order for one vsync N: <code>DrawFrame</code>, <code>SendBeginMainFrame</code>, <code>Scheduler::BeginImplFrame</code>, <code>ActivateLayerTree</code>, <code>Commit</code>, <code>HandleGestureScrollUpdate</code>. In which vsync's frame do the rows of that commit appear?</p>
+    <details><summary>Answer</summary><p><code>Scheduler::BeginImplFrame</code> → <code>HandleGestureScrollUpdate</code> → <code>DrawFrame</code> → <code>SendBeginMainFrame</code> → <code>Commit</code> → <code>ActivateLayerTree</code>. The compositor draws before it asks. The rows appear in the frame of vsync N+1, about 17 ms after tick N (steps 1 and 2).</p></details>
+  </div>
+  <div class="exercise"><span class="label">2 · Two colours</span>
+    <p>Two traces of the same table. In one almost every vsync is "presented", in the other almost every vsync is "presented without the pending main update". Main frames take 1 ms in both. Name one cause, and the event that would confirm it.</p>
+    <details><summary>Answer</summary><p>The driver of the scroll differs. In the second the BeginMainFrame is sent before the draw in each vsync: a compositor-animated scroll (deadline mode <code>WAIT_FOR_SCROLL</code>, <code>on_critical_path: true</code>) or separate wheel notches. Confirm with <code>Scheduler::ScheduleBeginImplFrameDeadline</code>'s <code>deadline mode</code> and the order of <code>SendBeginMainFrame</code> and <code>DrawFrame</code> (steps 7 and 8).</p></details>
+  </div>
+  <div class="exercise"><span class="label">3 · A clean Frames track</span>
+    <p>A colleague shows DevTools' Frames track with no dropped and no partially presented frames during a scroll, and concludes that the table kept up. What do you ask for?</p>
+    <details><summary>Answer</summary><p>The <code>PipelineReporter</code> states, and how long the main reporters lived. DevTools marks only frames with a <code>DroppedFrame</code> event, which Chromium writes only when a tracked smooth effect (a rAF loop, a main-thread animation, the scrolling thread itself) missed its update. A table that renders in a scroll handler can be hundreds of milliseconds behind with no mark (step 6).</p></details>
+  </div>
+  <div class="exercise"><span class="label">4 · Budget</span>
+    <p>A draw takes 12 ms; an optimization brings it to 6 ms. Under a wheel scroll, how much sooner are the rows on screen? A regression takes it to 18 ms. How much later?</p>
+    <details><summary>Answer</summary><p>No sooner: both are presented with the next vsync; 6 ms buys slack. At 18 ms the frame misses the next draw: rows arrive one whole interval later (about 34 ms after their tick instead of 17) and are updated at 30 Hz, with the main thread idle for most of the second interval (steps 10 and 11).</p></details>
+  </div>
+  <div class="exercise"><span class="label">5 · Busy or slow</span>
+    <p>A main reporter's <code>SendBeginMainFrameToCommit</code> stage is 200 ms long. Which single number tells you whether the frame was slow or the main thread was busy with something else?</p>
+    <details><summary>Answer</summary><p><code>begin_main_sent_to_started_us</code> in that stage's breakdown (the lab's <code>frames.mainQueueMs</code>): the time the BeginMainFrame task waited in the queue. 199.6 of 201 ms in the long-task trace; under 0.1 ms in the slow-cell traces (step 12).</p></details>
+  </div>
+  <div class="exercise"><span class="label">6 · Observation points</span>
+    <p>"The update is applied 0.5 ms after the server sends it." "The update is visible 1.7 ms after the server sends it." Both are from one trace. Which events end each interval, and which would you report for a table under scroll?</p>
+    <details><summary>Answer</summary><p>The first ends at the end of the DOM write (our <code>app: tick apply</code> measure); the second at presentation (<code>Display::FrameDisplayed</code>, or the end of the <code>PipelineReporter</code> that carries the commit). Report the second: during frame production the two are up to a full interval apart even when the main thread is fast, and more when it is not (steps 13 and 14).</p></details>
+  </div>
+  <div class="exercise"><span class="label">7 · A small difference</span>
+    <p>Variant B shows 8% less layout time than variant A, one traced run each. What do you do before believing it?</p>
+    <details><summary>Answer</summary><p>Check that the two traces really differ in the intended input and were recorded with the same categories; repeat each at least five times; compare medians and ranges; and divide layout by a phase from the same run that the change should not affect. Identical runs here differ by up to 25% in time totals; counts (layouts, dirty objects, frames) are the numbers a single run can support (steps 15 to 17).</p></details>
+  </div>
+  <div class="beat conclude"><span class="label">What to carry on</span><div>
+    <p>Later modules report three frame outcomes per scenario. Read them with this module's limits: <b>with the main thread's update</b> means nothing was outstanding at submit; <b>without</b> means a BeginMainFrame was out, which is a late main thread only if its reporter lives longer than one interval; <b>dropped</b> means nothing was presented where something was wanted, which during a compositor scroll needs a silent compositor. And for every latency, ask which observation point ends it.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Method for frames: count vsyncs by BeginImplFrame; read each one's PipelineReporters; judge lateness by the main reporter's lifetime in intervals, busy-versus-slow by queue wait, and the cause of a label by deadline mode and the order of send and draw.</li>
+  </ul>
+  <p class="next"><b>Next →</b> <a href="anatomy.html">Module 3</a> reads the two libraries' draw paths in source; <a href="javascript.html">Module 4</a> measures what fills a main frame.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+<script>
+// Two tables of this page are computed here from the published data, so they
+// follow a re-recording like every data-m number does.
+//   #cat-ratios, #var-ratios: median [min–max] over the runs of data/runs.jsonl
+//     (window.TRACE_INDEX.__runs); a column "a/b" is the per-run ratio of two metrics.
+//   #dom-to-screen: per trace, medians over the main frames of the first wheel
+//     gesture (BeginMainFrame sent between 100 and 950 ms) of four moments
+//     relative to the frame's tick, from data/<id>.js lanes.
+(() => {
+  const get = (o, p) => p.split(".").reduce((a, k) => (a == null ? a : a[k]), o);
+  const med = (xs) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[s.length >> 1] : NaN; };
+  const f = (v) => (Number.isNaN(v) || v == null ? "—" : Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
+  for (const t of document.querySelectorAll("#cat-ratios, #var-ratios")) {
+    const ids = t.dataset.runs.split(","), names = t.dataset.names.split(",");
+    const cols = t.dataset.cols.split(",").map((c) => { const [path, label] = c.split("|"); return { path, label }; });
+    let html = `<tr><th>Category set · median [min–max] of its runs</th>${cols.map((c) => `<th>${c.label}</th>`).join("")}</tr>`;
+    ids.forEach((id, i) => {
+      const runs = window.TRACE_INDEX?.__runs?.[id] ?? [];
+      html += `<tr><td>${names[i] ?? id} <small>(${runs.length} runs)</small></td>` + cols.map((c) => {
+        const [a, b] = c.path.split("/");
+        const v = runs.map((m) => (b ? get(m, a) / get(m, b) : get(m, a))).filter((x) => typeof x === "number" && !Number.isNaN(x));
+        return `<td class="num">${v.length ? `${f(med(v))} <small>[${f(Math.min(...v))}–${f(Math.max(...v))}]</small>` : "—"}</td>`;
+      }).join("") + "</tr>";
+    });
+    t.innerHTML = html.replace("Category set", t.id === "var-ratios" ? "f-variance" : "Category set");
+  }
+  const t = document.getElementById("dom-to-screen");
+  if (!t) return;
+  const ids = t.dataset.traces.split(","), names = t.dataset.names.split(",");
+  const load = (id) => new Promise((resolve) => {
+    if (window.TRACE_DATA?.[id]) return resolve(window.TRACE_DATA[id]);
+    const s = document.createElement("script");
+    s.src = `data/${id}.js`;
+    s.onload = s.onerror = () => resolve(window.TRACE_DATA?.[id]);
+    document.head.appendChild(s);
+  });
+  const head = `<tr><th>ms after the frame's tick, median</th><th>main frames</th><th>BeginMainFrame sent</th><th>DOM complete</th><th>commit</th><th>presented</th><th>DOM complete → presented</th><th>commit → presented</th></tr>`;
+  t.innerHTML = head + ids.map((id, i) => `<tr><td>${names[i]}</td>${"<td class=\"num\">…</td>".repeat(7)}</tr>`).join("");
+  Promise.all(ids.map(load)).then((data) => {
+    t.innerHTML = head + data.map((d, i) => {
+      if (!d) return `<tr><td>${names[i]}</td>${"<td class=\"num\">—</td>".repeat(7)}</tr>`;
+      const frames = new Map(d.lanes.frames.map((x) => [x[2], x]));
+      const marks = d.lanes.marks.filter((m) => m[1] === "content complete").map((m) => m[0]);
+      const rows = [];
+      for (const [start, dur, , seq] of d.lanes.mainFrames) {
+        const fr = frames.get(seq);
+        if (!fr || fr[5] == null || start < 100 || start > 950) continue;
+        const dom = marks.find((m) => m >= start && m <= start + dur + 0.5);
+        if (dom === undefined) continue;
+        const tick = fr[0], shown = tick + fr[5];
+        rows.push([start - tick, dom - tick, start + dur - tick, fr[5], shown - dom, shown - (start + dur)]);
+      }
+      const col = (k) => f(med(rows.map((r) => r[k])));
+      return `<tr><td>${names[i]}</td><td class="num">${rows.length || "—"}</td>${[0, 1, 2, 3, 4, 5].map((k) => `<td class="num${k === 4 ? " hi" : ""}">${rows.length ? col(k) : "—"}</td>`).join("")}</tr>`;
+    }).join("");
+  });
+})();
+</script>
+</body>
+</html>

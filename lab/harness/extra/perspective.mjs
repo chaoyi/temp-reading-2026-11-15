@@ -27,13 +27,14 @@ export const scenarios = [
     ...psp({ engine: "worker", hz: 100, throttle: 100 }, [["wait", 1000]], { zero: "start", setup: quiet }),
   },
   {
-    id: "x-probe-lat50-throttle0",
-    asks: "x-stream-remote-lat50 with viewer.setThrottle(0): how much of the 0.8 s between draws was the adaptive throttle?",
-    ...psp({ engine: "remote", hz: 100, net: 1, throttle: 0 }, [["wait", 2500]], { zero: "start", netem: { latencyMs: 50 } }),
-  },
-  {
     id: "x-probe-scroll-tail",
     asks: "50 updates a second, a two-second scroll, then 1.8 s of rest: when do update draws come back?",
     ...psp({ engine: "worker", hz: 50 }, [["wait", 300], scroll(2400), ["wait", 1800]], { setup: quiet }),
+  },
+  {
+    id: "x-probe-lat50-throttle0",
+    // Last on purpose: see the note on netem in the module's report (a fresh lab server can reorder delayed chunks).
+    asks: "x-stream-remote-lat50 with viewer.setThrottle(0): how much of the 0.8 s between draws was the adaptive throttle?",
+    ...psp({ engine: "remote", hz: 100, net: 1, throttle: 0 }, [["wait", 2500]], { zero: "start", netem: { latencyMs: 50 } }),
   },
 ];

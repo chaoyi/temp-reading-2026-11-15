@@ -1,0 +1,1005 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Three designs, read in source · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+<style>
+  /* This module quotes long source lines with a comment column: boxes use the full width. */
+  .boxes > .box { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">3 · Three designs, read in source</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="event">scroll event</span><span class="sep">→</span><span data-node="range">range math</span><span class="sep">→</span>
+    <span data-node="yours">your code</span><span class="sep">→</span><span data-node="data">data request</span><span class="sep">→</span>
+    <span data-node="dom">DOM writes</span><span class="sep">→</span><span data-node="layout">style + layout</span><span class="sep">→</span><span data-node="frame">frame</span>
+    <span class="sep">·</span><span data-node="lock">lock</span><span class="sep">·</span><span data-node="sizes">sizes</span>
+    <span class="sep">·</span><span data-node="extent">scroll extent</span><span class="sep">·</span><span data-node="engine">engine</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 3 · recorded 2026-11-16</p>
+  <h1>Three virtualizers take the same scroll. What does each one own, and what does that make it do under load?</h1>
+  <p class="lede">One wheel gesture scrolls a table of 100,000 rows. TanStack Virtual, regular-table and Perspective (which puts an engine behind regular-table) all keep a few dozen rows in the DOM, yet they divide the work differently: who creates the elements, who asks for data, when your code runs relative to the scroll event, how many draws may be in flight, and what stays on screen while an answer is late. This module reads each mechanism in the library's source and then finds it firing in a trace: a function name in the sampled profile, a count that matches, a layout where the source says there has to be one.</p>
+  <p>At the end you should be able to say from memory what each design owns, and to predict from that, before opening a trace, what it will do under a given load. The last step tests exactly this with five loads.</p>
+  <p><b>Why this matters for Tablelab.</b> Tablelab's DOM frontend is regular-table today, with a Rust engine behind a socket: the shape of Perspective. Every row of the table at the end of this page (who owns the DOM, one pull in flight, what is rewritten per step, what the screen shows while late, how far the scrollbar reaches) is a decision the view core and its painters make again. Two finished designs, read down to "which line reads layout", show the consequences before we build them.</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>), steps 9 to 15, for the basic scroll path of both libraries; this module starts where those steps stop. Tablelab's earlier note <i>What a virtualizer owns</i> (<code>notes/virtualization.html</code>) names the four jobs used in step 1. Style, layout and forced layout as such belong to <a href="rendering.html">Module 5</a>; frames to <a href="frames.html">Module 2</a>.</p>
+  <p><b>How source and trace line up.</b> Source is quoted at the pinned versions with the source file's line numbers: TanStack virtual-core 3.19.11 (<code>11b48e4</code>), react-virtual 3.14.26, regular-table 0.9.2 (<code>52e86bf</code>), Perspective 5.9.2 (<code>0264ec1</code>). The lab page is built without minification, so a trace shows the same function names under built file names: <code>assets/index-….js</code> is virtual-core, <code>assets/regular-table-….js</code> is regular-table's TypeScript, <code>assets/tanstack-….js</code>, <code>regular-….js</code> and <code>react-….js</code> are the lab's own three files (<code>lab/pages/src/</code>).</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57, device scale factor 1.75, one traced run per scenario. The scroll gesture named 2400 px/s moved the tables at about <b data-m="f-scroll-tanstack/content.pxPerSec"></b> px/s for about <b data-m="f-scroll-tanstack/content.scrollMs" data-unit="ms"></b>, as two synthesized gestures of about a second each with about 70 ms between them. One run is one run: this page uses the traces to find mechanisms, not to rank libraries.</p>
+  <div class="foot"><button class="primary" data-start>Start: 17 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · What a virtualizer owns" data-title="One scroll frame, three owners" data-node="event yours dom frame"
+  data-ask="owns|What does a virtualizer own, and how do TanStack Virtual, regular-table and Perspective divide it?">
+  <p class="holding"><span class="label">Question I hold</span><span>The same wheel scroll reaches three tables. Inside one frame, when does each one change the DOM, and whose code is running at that moment?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three recordings of one scenario: the small table from Module 1 (13 rows × 6 columns visible) under a steady wheel scroll, once with TanStack Virtual and our own render (<code>lab/pages/src/tanstack.ts</code>), once with regular-table (<code>regular.ts</code>), once with TanStack's React adapter (<code>react.tsx</code>). I take the main-thread frame that begins 300 ms after the first wheel event in each and put the three under one another.</p>
+  </div></div>
+  <div class="tracelink" data-trace="f-scroll-tanstack">Pin <code>CrRendererMain</code>; zoom to 300–302 ms after the first <code>InputLatency::MouseWheel</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["f-scroll-tanstack","f-scroll-regular","f-scroll-react"],"titles":["TanStack Virtual + our render (f-scroll-tanstack)","regular-table + our data listener (f-scroll-regular)","React adapter (f-scroll-react)"],"from":300.1,"to":302.2,"rows":["main","app"],"pins":[[1,300.47,"main.js",0],[2,300.72,"main.layout",0],[3,300.57,"main.js",1],[4,300.72,"main.js",1],[5,301.25,"main.layout",1],[6,300.65,"main.js",2],[7,301.05,"main.layout",2]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>TanStack.</b> One <code>scroll</code> event, about half a millisecond. Our <code>render</code> runs inside it (the orange span below): the DOM changes here.</li>
+    <li><i>2</i>Still inside the same event: a style-and-layout pass, drawn red because JavaScript forced it. Step 6 finds the line.</li>
+    <li><i>3</i><b>regular-table.</b> The <code>scroll</code> event is a quarter as long. <code>_on_scroll</code> plans, and our data listener is called (first orange span), but nothing is written.</li>
+    <li><i>4</i>A second JavaScript bar: the animation-frame step of the same frame. The cells are written here.</li>
+    <li><i>5</i>The frame's ordinary style and layout, after all JavaScript.</li>
+    <li><i>6</i><b>React.</b> The <code>scroll</code> event holds a whole React render and commit.</li>
+    <li><i>7</i>And the same red pass as TanStack, after React wrote the DOM.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The frame is the same in all three: one <code>scroll</code> event, then (if anyone asked) animation-frame callbacks, then style, layout, paint, commit. What differs is where the table's work sits. TanStack and React change the DOM <em>inside</em> the scroll event. regular-table changes it one phase later, and in between it has asked our code a question and waited for the answer.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>"Virtualizer" names a division of labour, not one algorithm. The earlier note split it into four jobs. Under load three more questions about <em>time</em> decide what the user sees, and they are the ones this module follows:</p>
+    <div class="scroll"><table>
+      <tr><th>Job (from the note)</th><th>The question</th><th>Time question (this module)</th></tr>
+      <tr><td>A · Range math</td><td>Which rows are in view, where does each go, how tall is everything?</td><td>When does <b>my code run</b>, relative to the scroll event and to the frame?</td></tr>
+      <tr><td>B · Knowing sizes</td><td>Declared, probed once, or measured after drawing?</td><td>Which reads of layout does that cost, and when?</td></tr>
+      <tr><td>C · Scroll position</td><td>Who stores where the user is, and in what unit?</td><td>How far can the scrollbar reach?</td></tr>
+      <tr><td>D · Elements and data</td><td>Who creates rows, who fills them?</td><td>What may be <b>in flight</b> at once, and what does <b>the screen show while late</b>?</td></tr>
+    </table></div>
+    <p>TanStack Virtual does job A and part of B, and hands you a list of numbers; C stays with the browser's scroller and D is yours. regular-table does A, B and the element half of D; you supply cells for a rectangle. Perspective supplies those cells from an engine. The steps below check each of these sentences against a line of source and a trace.</p>
+  </div></div>
+  <div class="boxes"><div class="box"><span class="label">Knowledge I am using</span><dl>
+    <dt>Virtualizer</dt><dd>Code that keeps only the rows near the viewport in the DOM and makes the scrollbar behave as if all rows were there.</dd>
+    <dt>Owns</dt><dd>Whose code decides it and pays for it. What a library does not own is yours, including its cost and its mistakes.</dd>
+    <dt>Frame order (Module 1, step 8)</dt><dd>Compositor offsets applied → <code>scroll</code> events → animation-frame callbacks → style → layout → paint → commit.</dd>
+  </dl></div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in these recordings TanStack's and React's DOM writes are inside the <code>scroll</code> event's JavaScript, regular-table's are in the animation-frame step of the same frame.</p>
+    <p><b>No:</b> nothing yet about cost. The data is free here and the table is 13 rows; where a write sits only starts to matter when something is slow.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-scroll-regular tree 300 303</code> prints the nested slices of that frame. Expected: <code>EventDispatch {"type":"scroll"}</code> containing <code>FunctionCall … "functionName":"_on_scroll"</code> and a <code>RunMicrotasks</code>, then a separate <code>FireAnimationFrame</code>, then <code>UpdateLayoutTree</code> and <code>Layout</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One frame, three placements: TanStack and React write the DOM inside the scroll event; regular-table calls the data listener there and writes in the animation-frame step (f-scroll-tanstack, -regular, -react at 300 ms).</li>
+    <li data-kind="inferred">A virtualizer is a division of four jobs (range math, sizes, scroll position, elements and data); under load the deciding questions are when your code runs, what may be in flight, and what the screen shows while late.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> TanStack first. What exactly runs in its part of the scroll event, and how do I recognise those lines in a profile?</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · TanStack Virtual: numbers, inside the scroll event" data-title="The listener, the memo, and their names in a profile" data-node="event range yours"
+  data-ask="sync|TanStack calls my code inside the scroll event. What runs there on every event, what only sometimes, and what can make it expensive?">
+  <p class="holding"><span class="label">Question I hold</span><span>Which lines of virtual-core run on every scroll event, which only when the visible rows change, and under what names do they appear in a sampled profile?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Module 1 read the outline: a passive listener, a memo keyed on the visible range, <code>onChange</code>. Here I read the same forty lines for three things Module 1 left out: every DOM read, every allocation, and every function name. Then I list the sampled functions of <code>f-scroll-tanstack</code> by total time and match names to lines.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L217-L221">packages/virtual-core/src/index.ts:217–221, 1119–1250, 1017–1029</a>
+      <p>The listener, in execution order. <span class="cp">R</span> marks a read that depends on layout, <span class="cp">A</span> an allocation.</p>
+<pre><span class="n"> 217</span>  const createHandler = (isScrolling: boolean) =&gt; () =&gt; {
+<span class="n"> 218</span>    offset = <mark>readOffset(element)</mark>               <span class="c"><span class="cp">R</span> el.scrollTop, or el.scrollLeft if horizontal (247)</span>
+<span class="n"> 219</span>    fallback?.()                               <span class="c"><span class="cp">A</span> clearTimeout + setTimeout(…, 150), every event</span>
+<span class="n"> 220</span>    cb(offset, isScrolling)
+<span class="n">1123</span>          const elementMax = isScrolling ? <mark>this._elementMaxScrollOffset()</mark> : null
+                                               <span class="c"><span class="cp">R</span> el.scrollHeight - el.clientHeight (2252)</span>
+<span class="n">1132</span>          const kind = this._classifyScrollEvent(   <span class="c"><span class="cp">A</span> an argument object (1327)</span>
+<span class="n">1137</span>          if (kind === 'spurious') return       <span class="c">// the offset already held: nothing below runs</span>
+<span class="n">1192</span>          this.scrollOffset = offset
+<span class="n">1193</span>          this.isScrolling = isScrolling
+<span class="n">1226</span>            this._iosGesture.onScroll({          <span class="c"><span class="cp">A</span> another argument object</span>
+<span class="n">1250</span>          this.maybeNotify()
+<span class="n">1017</span>  private maybeNotify = memo(
+<span class="n">1018</span>    () =&gt; {
+<span class="n">1019</span>      this.calculateRange()                   <span class="c">// binary search + walk; a new {startIndex, endIndex} (2832) <span class="cp">A</span></span>
+<span class="n">1021</span>      return [                                <span class="c"><span class="cp">A</span> the dependency array</span>
+<span class="n">1022</span>        this.isScrolling,
+<span class="n">1023</span>        this.range ? this.range.startIndex : null,
+<span class="n">1024</span>        this.range ? this.range.endIndex : null,
+<span class="n">1027</span>    (isScrolling) =&gt; {
+<span class="n">1028</span>      <mark>this.notify(isScrolling)</mark>               <span class="c">// → options.onChange(this, sync) (958): your code</span></pre>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/utils.ts#L20-L44">packages/virtual-core/src/utils.ts:20–44</a>
+<pre><span class="n">20</span>  function <mark>memoizedFunction</mark>(): TResult {
+<span class="n">29</span>    const newDeps = getDeps()                   <span class="c">// runs every call</span>
+<span class="n">31</span>    const depsChanged =
+<span class="n">32</span>      newDeps.length !== deps.length ||
+<span class="n">33</span>      newDeps.some((dep: any, index: number) =&gt; deps[index] !== dep)
+<span class="n">35</span>    if (!depsChanged) {
+<span class="n">36</span>      return result!
+<span class="n">44</span>    result = fn(...newDeps)                     <span class="c">// runs only on a change</span></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Layout-dependent read</dt><dd>A property whose value the browser can only give after style and layout are up to date: <code>scrollTop</code>, <code>scrollHeight</code>, <code>clientHeight</code>, <code>offsetWidth</code>, <code>getBoundingClientRect()</code>. Free when nothing has changed since the last layout; otherwise the browser lays out first (step 6).</dd>
+      <dt>Function-name inference</dt><dd>V8 gives an anonymous function a display name from the code around it. A profile shows that name, which need not be a name anyone wrote.</dd>
+    </dl></div>
+  </div>
+  <div class="tracelink" data-trace="f-scroll-tanstack">In Perfetto select the <code>CrRendererMain</code> track and open the bottom-up view of the JavaScript samples; or use the command in "Try it".</div>
+  <div class="prof" data-prof="f-scroll-tanstack" data-top="13" data-by="total" data-skip="(program),measure,mark"></div>
+  <div class="scroll"><table>
+    <tr><th>In the profile (this build's line)</th><th>What it is</th><th>Source</th></tr>
+    <tr><td><code>(anonymous)</code> index.js:365</td><td>the scroll listener itself</td><td>index.ts:217</td></tr>
+    <tr><td><code>(anonymous)</code> index.js:384</td><td><code>readOffset</code>: the <code>scrollTop</code> / <code>scrollLeft</code> read</td><td>index.ts:245–248</td></tr>
+    <tr><td><code>(anonymous)</code> index.js:795</td><td>the offset callback: everything from 1123 to 1250</td><td>index.ts:1119</td></tr>
+    <tr><td><code>memoizedFunction</code> index.js:39</td><td>any of the six memo wrappers; the caller tells which</td><td>utils.ts:20</td></tr>
+    <tr><td><code>Virtualizer.maybeNotify.memo.key</code> index.js:731</td><td>the memo's <em>result</em> function. It is on the stack only when the range or <code>isScrolling</code> changed; its total time is everything <code>onChange</code> did</td><td>index.ts:1027</td></tr>
+    <tr><td><code>Virtualizer.calculateRange.memo.key</code> → <code>calculateRangeImpl</code> → <code>findNearestBinarySearchFlat</code></td><td>the range for a new offset</td><td>index.ts:1880, 2803, 2782</td></tr>
+    <tr><td><code>(anonymous)</code> index.js:69 → <code>clearTimeout</code>, <code>setTimeout</code></td><td>the 150 ms "scrolling stopped" debounce, re-armed on every event</td><td>utils.ts:106–108</td></tr>
+    <tr><td><code>Virtualizer._elementMaxScrollOffset</code></td><td>the <code>scrollHeight − clientHeight</code> read</td><td>index.ts:2246–2252</td></tr>
+  </table></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The table above is the stack of Module 1's step 9, with names. There were <b data-m="f-scroll-tanstack/main.scrollEvents"></b> scroll events and <b data-m="f-scroll-tanstack/app.draw.n"></b> renders in this recording. The listener's total time splits into two parts of similar size. One is our own <code>render</code>, reached through <code>Virtualizer.notify</code>. The other is neither ours nor range math: <code>(anonymous)</code> index.js:384, the offset read. A read should cost nothing. Step 6 explains why this one does.</p>
+    <p>What the library itself spends per event is small: the named range functions show a fraction of a millisecond over the whole scroll. Per event it allocates a handful of short-lived objects (two dependency arrays, a range object, two argument objects) and re-arms one timer; <code>clearTimeout</code> and <code>setTimeout</code> are in the samples. It allocates nothing per row.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected to search the profile for <code>maybeNotify</code> and find the memo. What the profile holds is <code>memoizedFunction</code> for every memo wrapper (they are one closure in <code>utils.ts</code>), and V8-invented names for the arrow functions passed to <code>memo</code>: <code>Virtualizer.maybeNotify.memo.key</code> is the function that <em>notifies</em>, <code>Virtualizer.getMeasurements.memo.count.count</code> is a dependency getter. The invented name does not say which half of a memo it is. <b>Rule: identify a library function in a profile by file and line, and check the line in source; treat an inferred name as a hint.</b></p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on every scroll event virtual-core reads <code>scrollTop</code>, <code>scrollHeight</code> and <code>clientHeight</code>, re-arms a timer and recomputes the range; it calls <code>onChange</code> only through the memo (read in source; the names are in the samples).</p>
+    <p><b>No:</b> that the listener is cheap in every page. Its own arithmetic is; what the reads cost depends on what was written before them, and what <code>onChange</code> costs is yours.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-scroll-tanstack prof 0 2100 | grep -E 'index-|Timeout'</code>. Expected: the names in the table, with <code>(anonymous) assets/index-….js:365</code> the largest total and <code>calculateRangeImpl</code> well under a millisecond.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">virtual-core's scroll listener reads scrollTop, then scrollHeight − clientHeight, on every event (index.ts:218, 1123, 2252), re-arms a 150 ms timer, and reaches onChange only through the maybeNotify memo (1017–1029).</li>
+    <li data-kind="measured">In a profile the memo wrappers are all <code>memoizedFunction</code>; V8 names the callbacks (<code>Virtualizer.maybeNotify.memo.key</code> is the notify function, index.ts:1027). Lines identify them, names only hint.</li>
+    <li data-kind="read">Per scroll event virtual-core allocates a few short-lived arrays and objects and nothing per row.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The memo turns "a scroll event" into "the visible rows changed". How often is that, really?</p>
+</section>
+
+<section class="step" data-part="B · TanStack Virtual: numbers, inside the scroll event" data-title="How often the memo lets a scroll through" data-node="event range yours">
+  <p class="holding"><span class="label">Question I hold</span><span>At a slow scroll most frames move less than one row. What fraction of scroll events reach my render?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Rows are 24 px. The scroll moves about 9.7 px per frame (<b data-m="j-speed-600-keyed/content.pxPerSec"></b> px/s). The memo's key is (isScrolling, startIndex, endIndex). Of 100 scroll events, about how many call <code>onChange</code>?</p>
+    <div class="opts"><button data-k="a">About 40: a new row every 24 ÷ 9.7 ≈ 2.5 frames.</button><button data-k="b">100: every event moves the offset.</button><button data-k="c">About 80: twice as often as a row passes.</button></div>
+    <div class="reveal"><p><b>About 80.</b> <b data-m="j-speed-600-keyed/app.draw.n"></b> renders for <b data-m="j-speed-600-keyed/main.scrollEvents"></b> scroll events. A row passes the top edge every 2.5 frames, and another passes the bottom edge every 2.5 frames, at different moments. Either one changes the key.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The large table (33 rows × 16 columns visible) scrolled at a quarter of the usual speed, with the keyed TanStack render. I look at seven consecutive scroll events and at what each render reports in its <code>app: draw</code> span (first row, last row, rows entered, cells written).</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-speed-600-keyed">Search <code>app: draw</code>; each span's arguments carry <code>first</code>, <code>last</code>, <code>entered</code>, <code>cells</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["j-speed-600-keyed"],"from":312,"to":424,"rows":["main","app"],"pins":[[1,316.97,"app",0],[2,334.01,"app",0],[3,383.9,"main.js",0],[4,400.3,"app",0]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>317 ms: render, <code>first 5, last 40</code>, one row entered, 17 cells written. The <b>bottom</b> edge crossed a row boundary.</li>
+    <li><i>2</i>334 ms: render, <code>first 6, last 40</code>, nothing entered, nothing written. The <b>top</b> edge crossed: a row left. The render ran to remove one element.</li>
+    <li><i>3</i>384 ms: a scroll event of 0.09 ms with no render. Neither edge crossed; the memo stopped it.</li>
+    <li><i>4</i>400 ms: <code>last</code> becomes 42. The pattern repeats: bottom, top, bottom, top, skip.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Renders come in two kinds that alternate. The scroller's content box is 777 px high here (792 px minus a horizontal scrollbar), which is not a whole number of 24 px rows, so the last visible row changes at a different scroll offset than the first one.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L2817-L2832">packages/virtual-core/src/index.ts:2819–2832</a>
+      <p>Where the two indices come from: two separate conditions on the offset.</p>
+<pre><span class="n">2819</span>    const startIndex = findNearestBinarySearchFlat(   <span class="c">// last row whose start ≤ offset</span>
+<span class="n">2824</span>    let endIndex = startIndex
+<span class="n">2825</span>    const limit = scrollOffset + outerSize
+<span class="n">2826</span>    while (
+<span class="n">2827</span>      endIndex &lt; lastIndex &amp;&amp;
+<span class="n">2828</span>      <mark>flat[endIndex * 2]! + flat[endIndex * 2 + 1]! &lt; limit</mark>   <span class="c">// row end below offset + viewport height</span>
+<span class="n">2830</span>      endIndex++
+<span class="n">2832</span>    return { startIndex, endIndex }</pre>
+      <p>regular-table has the same two conditions, <code>Math.floor(start_row)</code> and <code>Math.ceil(end_row)</code> (<a href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/scroll_panel.ts#L645-L661">scroll_panel.ts:651–659</a>), and the same rate: <b data-m="j-speed-600-regular/app.data listener.n"></b> data requests for <b data-m="j-speed-600-regular/main.scrollEvents"></b> scroll events at this speed.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Visible range</dt><dd>The first and last row that overlap the viewport. It changes when a row boundary crosses the top edge <em>or</em> the bottom edge.</dd>
+      <dt>Notification rate</dt><dd>How often the library tells you something changed. It bounds how often you render, not how much each render does.</dd>
+    </dl></div>
+  </div>
+  <table class="mtable" data-rows="j-speed-600-keyed,j-speed-2400-keyed,j-speed-9600-keyed" data-names="about 600 px/s (10 px per frame),about 2,400 px/s (40 px per frame),about 9,600 px/s (160 px per frame)" data-head="TanStack, keyed render" data-cols="main.scrollEvents|scroll events,app.draw.n|renders,state.counters.cellsWritten|cells written (page lifetime)"></table>
+  <div class="hard"><span class="label">Hard learning</span><p>I computed the notification rate from the row height alone: 9.7 px per frame against 24 px rows, so 40% of frames. The trace showed about 76%. The key has two indices and each edge of the viewport moves one of them. <b>Rule: a range-keyed virtualizer notifies at up to twice the row-crossing rate; the two only coincide when the viewport is a whole number of rows high.</b> Above one row per frame it makes no difference: every frame notifies.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the memo skips only events in which neither the first nor the last visible index changed; at 40 px per frame that is none of them.</p>
+    <p><b>No:</b> that a notification means work for the DOM. Half the renders at this speed wrote no cell. Whether a render is cheap when nothing entered is decided in your code, not in the library.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>A view core whose scroll position is a row (Tablelab's <code>row0</code>) has one index, not two: the window changes exactly when <code>row0</code> does. If the painter also wants "which rows overlap the viewport" in pixels, the second edge comes back. Proposal: publish window changes keyed on <code>row0</code> alone and let a partly visible last row be the painter's clipping problem.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-speed-600-keyed marks draw 300 420</code>. Expected: six renders whose details alternate between a changed <code>last</code> with <code>"entered":1</code> and a changed <code>first</code> with <code>"entered":0,"cells":0</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">At about 10 px per frame and 24 px rows, TanStack rendered on about three scroll events in four, not two in five: top-edge and bottom-edge crossings alternate (j-speed-600-keyed).</li>
+    <li data-kind="read">startIndex and endIndex are two conditions on the offset (index.ts:2819–2832); regular-table compares floor(start_row) and ceil(end_row) the same way (scroll_panel.ts:651–659).</li>
+    <li data-kind="rejected">"The notification rate is the row-crossing rate." It is up to twice that.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> If notifications are the cost, does a larger overscan buy fewer of them?</p>
+</section>
+
+<section class="step" data-part="B · TanStack Virtual: numbers, inside the scroll event" data-title="Overscan widens the render, not the interval" data-node="range yours dom">
+  <p class="holding"><span class="label">Question I hold</span><span>With ten extra rows rendered above and below the viewport, does my render run less often?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The React table scrolls at about 40 px per frame, once with <code>overscan: 1</code> and once with <code>overscan: 10</code>. Ten spare rows are 240 px, six frames of scrolling. How do the two runs compare?</p>
+    <div class="opts"><button data-k="a">Overscan 10 renders about one frame in six.</button><button data-k="b">The same number of renders; each one handles more rows.</button><button data-k="c">Overscan 10 renders more often.</button></div>
+    <div class="reveal"><p><b>The same number, more rows each.</b> <b data-m="j-cells-L-react/app.draw.n"></b> renders with overscan 1, <b data-m="j-react-overscan/app.draw.n"></b> with overscan 10; the row components ran <b data-m="j-cells-L-react/state.counters.rowRenders"></b> and <b data-m="j-react-overscan/state.counters.rowRenders"></b> times.</p></div>
+  </div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L98-L113">packages/virtual-core/src/index.ts:98–113, 1021–1025, 1917–1925</a>
+      <p>To see where overscan enters. It is applied after the range, by the extractor that lists the indices to render:</p>
+<pre><span class="n">  98</span>export const defaultRangeExtractor = (range: Range) =&gt; {
+<span class="n"> 103</span>  const overscan = range.overscan * Math.max(range.lanes ?? 1, 1)
+<span class="n"> 104</span>  <mark>const start = Math.max(range.startIndex - overscan, 0)</mark>
+<span class="n"> 105</span>  <mark>const end = Math.min(range.endIndex + overscan, range.count - 1)</mark>
+<span class="n"> 108</span>  const arr = new Array&lt;number&gt;(len)            <span class="c">// one index array per changed range</span></pre>
+      <p>The memo that decides whether to call you does not see it:</p>
+<pre><span class="n">1021</span>      return [
+<span class="n">1022</span>        this.isScrolling,
+<span class="n">1023</span>        this.range ? <mark>this.range.startIndex</mark> : null,   <span class="c">// the visible range, before overscan</span>
+<span class="n">1024</span>        this.range ? <mark>this.range.endIndex</mark> : null,</pre>
+      <p><code>getVirtualIndexes</code> is keyed on the same two indices plus the overscan value (1919–1924), so every change of the visible range produces a new list of indices and new items, whatever the overscan.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Overscan</dt><dd>Rows kept in the DOM beyond the visible ones. Their purpose is the gap between the compositor, which can scroll existing pixels at once, and the main thread, which needs a frame or more to add rows: spare rows are what the compositor shows meanwhile.</dd>
+      <dt>Notification versus content</dt><dd>How often you are called, against how much each call has to produce. Overscan in this library changes the second only.</dd>
+    </dl></div>
+  </div>
+  <table class="mtable" data-rows="j-cells-L-react,j-react-overscan" data-names="overscan 1,overscan 10" data-head="React, 33 × 16 cells visible" data-cols="main.scrollEvents|scroll events,app.draw.n|renders,state.counters.rowRenders|row components run,state.counters.cellsFormatted|cells formatted,main.scriptMs|script|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>One render per scroll event in both runs. With overscan 10 each render lists about twenty more rows, and this React table re-runs every listed row (no memo), so the per-render work grows with the list. The counters are for the page's lifetime, a few renders more than the traced window.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in virtual-core 3.19.11 overscan does not reduce how often <code>onChange</code> fires (read in source; the render counts agree).</p>
+    <p><b>No:</b> that overscan is useless. Its benefit is on screen when the main thread is late: fewer blank rows at the edge. These runs never had a late frame, so they cannot show it; <a href="frames.html">Module 2</a> has the loads that do. Nor that a library <em>could</em> not use overscan to notify less often: one that keyed its memo on the overscanned range, moved in steps, would. This one does not.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>These are two separate dials: how far ahead of the viewport rows exist (protection against a late main thread or a late backend), and how often the window is re-published. A view core can publish a window only when the viewport leaves the middle of the last one (hysteresis), which would make overscan reduce requests too. Proposal: treat "margin" and "republish threshold" as two parameters in the view core, and measure both against data age in <a href="backend.html">Module 6</a>'s terms.</p></div>
+  <div class="try"><span class="label">Try it</span>Start <code>node lab/server/main.mjs</code> and open <code>http://127.0.0.1:5199/grid.html?lib=react&amp;cols=100&amp;w=1560&amp;h=792&amp;overscan=1</code> and the same with <code>overscan=10</code>; scroll each by the same distance and compare "renders" and "row renders" in the readout under the table. Expected: equal renders, about one and a half times the row renders.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">Overscan is applied by the range extractor (index.ts:103–105); maybeNotify keys on the visible range before overscan (1021–1025).</li>
+    <li data-kind="measured">Overscan 10 against 1 in React: the same number of renders, about half as many row components again per render (j-react-overscan, j-cells-L-react).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The range needs every row's position. What does the library build to know them, for 100,000 rows or for two million?</p>
+</section>
+
+<section class="step" data-part="B · TanStack Virtual: numbers, inside the scroll event" data-title="What is built for N rows" data-node="range sizes">
+  <p class="holding"><span class="label">Question I hold</span><span>Before the first range can be computed, what does virtual-core allocate and loop over, and what makes it do that again?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read <code>getMeasurements</code>. Then, because 100,000 rows are too few to see anything, I mount the lab table with 2,000,000 rows inside a trace (the page is reloaded after tracing starts) and do the same with regular-table as the control.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L1716-L1758">packages/virtual-core/src/index.ts:1648–1649, 1703, 1716–1757</a>
+<pre><span class="n">1648</span>  private getMeasurements = memo(
+<span class="n">1649</span>    () =&gt; [this.getMeasurementOptions(), this.itemSizeCacheVersion],   <span class="c">// when it rebuilds</span>
+<span class="n">1703</span>      const min = this.lanesSettling ? 0 : (this.pendingMin ?? 0)        <span class="c">// from which index</span>
+<span class="n">1719</span>        const need = count * 2
+<span class="n">1722</span>          <mark>const next = new Float64Array(need)</mark>           <span class="c">// start and size per row: 16 bytes × N</span>
+<span class="n">1727</span>        const items: Array&lt;Key | VirtualItem&gt; =
+<span class="n">1728</span>          min === 0
+<span class="n">1729</span>            ? <mark>new Array(count)</mark>                        <span class="c">// one slot per row, holding its key</span>
+<span class="n">1730</span>            : this._singleLaneMeasurements!.items.slice()
+<span class="n">1741</span>        <mark>for (let i = min; i &lt; count; i++) {</mark>             <span class="c">// every row, eagerly</span>
+<span class="n">1742</span>          const key = getItemKey(i)
+<span class="n">1744</span>          const measuredSize = itemSizeCache.get(key)
+<span class="n">1748</span>              : this.options.estimateSize(i)          <span class="c">// your function, called N times</span>
+<span class="n">1749</span>          flat[i * 2] = runningStart
+<span class="n">1750</span>          flat[i * 2 + 1] = size
+<span class="n">1755</span>        const view = createLazyMeasurementsView(items, flat)</pre>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/lazy-measurements.ts#L19-L41">packages/virtual-core/src/lazy-measurements.ts:19–39</a>
+<pre><span class="n">19</span>  return new Proxy(cache, {
+<span class="n">20</span>    get(target, prop, receiver) {
+<span class="n">28</span>            if (typeof v !== 'object') {            <span class="c">// first read of row i:</span>
+<span class="n">30</span>              <mark>v = target[i] = {</mark>                    <span class="c">// make its VirtualItem now, keep it</span>
+<span class="n">31</span>                index: i,
+<span class="n">33</span>                start: s,</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Prefix sums</dt><dd>With sizes that may differ per row, "where does row i start" needs the sum of all sizes before it. Storing every start answers it by lookup and makes "which row is at pixel y" a binary search.</dd>
+      <dt>Lazy materialization</dt><dd>Keep compact numbers for all rows and build the per-row object only for a row someone reads.</dd>
+    </dl></div>
+  </div>
+  <div class="tracelink" data-trace="a-big-tanstack">Time zero is the reload. Search <code>getMeasurements</code> in the JavaScript samples near 20–30 ms.</div>
+  <div class="lanes" data-lanes='{"traces":["a-big-tanstack","a-big-regular"],"titles":["TanStack Virtual, 2,000,000 rows: mount (a-big-tanstack)","regular-table, 2,000,000 rows: mount (a-big-regular)"],"from":14,"to":52,"rows":["main","gc","app"],"axis":"ms after the reload","pins":[[1,26,"main.js",0],[2,32.9,"app",0],[3,48.5,"gc",0],[4,19.8,"main.js",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The mount, one run of microtasks of about 15 ms. The samples put about 11 ms of it in the function at <code>index.js:1017</code>, the loop above (<code>index.ts:1650–1757</code>), and under 1 ms in the lab's <code>estimateSize</code>, called two million times.</li>
+    <li><i>2</i>The first render: 13 rows, as for any table size.</li>
+    <li><i>3</i>A major garbage collection soon after: the JavaScript heap had grown to <b data-m="a-big-tanstack/heap.maxMb"></b> MB.</li>
+    <li><i>4</i>regular-table's mount of the same two million rows: about 3.5 ms, most of it the first draw. The red marks are that draw measuring each column, the cold path of step 9. Its heap peaks at <b data-m="a-big-regular/heap.maxMb"></b> MB.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Not one object per row: one <code>Float64Array</code> of 2 × N numbers, one array of N keys and one <code>Proxy</code>. The loop is still over every row, and it ran at about 5 ns per row here. The typed array is 2,000,000 × 2 × 8 bytes = 32 MB, held outside the JavaScript heap figure; the key array is in it. regular-table builds nothing per row: one row height, and widths per <em>column</em>.</p>
+    <p>What makes the loop run again, read from the memo's dependencies and from where <code>pendingMin</code> is set:</p>
+    <div class="scroll"><table>
+      <tr><th>Cause</th><th>Source</th><th>Rebuilt</th></tr>
+      <tr><td><code>count</code> changes (or <code>getItemKey</code>'s identity, <code>gap</code>, <code>scrollMargin</code>, …)</td><td>1598–1607, <code>this.pendingMin = null</code> at 1627</td><td>all N rows</td></tr>
+      <tr><td>a measured row turns out a different size: <code>resizeItem(index, size)</code></td><td>2107–2111: <code>pendingMin = index</code>, <code>itemSizeCacheVersion++</code></td><td>rows index … N at the next read, plus a copy of all N keys (1730)</td></tr>
+      <tr><td><code>measure()</code></td><td>2745–2748</td><td>all N rows, every measured size forgotten</td></tr>
+      <tr><td>a new <code>estimateSize</code> function alone</td><td>not among the dependencies</td><td>nothing</td></tr>
+    </table></div>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>TanStack's own benchmark notes say "we eagerly populate <code>measurementsCache</code> (one object per item) on every mount" and "we hold a <code>VirtualItem</code> object per item" (<code>benchmarks/README.md:106–107, 154–155</code> in the same repository). At this tag the source does neither for a single-lane list; the changelog entry for 3.15.0 describes the rewrite to a <code>Float64Array</code> and a <code>Proxy</code> (<code>packages/virtual-core/CHANGELOG.md:319–325</code>). <b>Rule: prose about a library's performance has a version; read the code at the version you run.</b> What stays true from the README is the word "eagerly".</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> mount is linear in the row count with a small constant (about 11 ms for two million rows in this recording), and so is every change of <code>count</code>.</p>
+    <p><b>No:</b> that this matters at 100,000 rows; by the same rate that is about half a millisecond. And not measured here: the cost when <code>count</code> changes repeatedly, for example a table that appends rows many times a second. The source says each append rebuilds from row 0; the lab has no knob that grows the table, so that stays a prediction.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>The structure exists because rows may differ in height. A table that declares one row height needs no per-row structure at all: position is a multiplication, and appending a row costs nothing in the view. That is the argument in the earlier note, here with a number attached. Proposal: keep Tablelab's row height declared, and if variable heights ever arrive, give them a structure whose update is proportional to what changed, not to N.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs a-big-tanstack prof 0 60 | grep -E 'getMeasurements|estimateSize|mountTanstack'</code>. Expected: <code>Virtualizer.getMeasurements.memo.key</code> at about 10 ms of self time inside <code>mountTanstack</code> at about 15 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">For N single-lane rows virtual-core builds one Float64Array(2N), one N-slot key array and a Proxy that creates VirtualItems on first read (index.ts:1716–1757, lazy-measurements.ts:19–39); the loop visits every row and calls estimateSize N times.</li>
+    <li data-kind="measured">Mounting 2,000,000 rows: about 11 ms in that loop for TanStack, a mount of about 3.5 ms for regular-table, which builds nothing per row (a-big-tanstack, a-big-regular).</li>
+    <li data-kind="read">A change of count rebuilds all rows; a resized row rebuilds from its index on and copies all keys; a new estimateSize alone rebuilds nothing (index.ts:1598–1627, 1730, 2107–2111).</li>
+    <li data-kind="rejected">"One object per item on every mount" (TanStack's benchmark README): not at 3.19.11.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Back to the red bar from step 1. Which line of the listener forces a layout, and what does it cost?</p>
+</section>
+
+<section class="step" data-part="B · TanStack Virtual: numbers, inside the scroll event" data-title="Two virtualizers, one scroller: a layout inside the scroll event" data-node="event yours layout">
+  <p class="holding"><span class="label">Question I hold</span><span>Every TanStack frame so far had a style-and-layout pass inside the scroll event. Nothing in our render reads layout. Who does, and is it extra work?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The lab table is a grid, so it uses two virtualizers on one scroll element, rows and columns, as TanStack's own "fixed" example does for its grid (<code>lab/pages/src/tanstack.ts:57–59</code>; the row one attaches its listener first, lines 173–176). The control, <code>r-one-virtualizer</code>, is the same table with only the row virtualizer (<code>colv=0</code>). I compare one frame of each, then look at the sampled stack during the red bar.</p>
+  </div></div>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>Removing the column virtualizer removes the red bar. What happens to the number of layouts and to the time spent in layout over the whole scroll?</p>
+    <div class="opts"><button data-k="a">Both about halve: one layout per frame is gone.</button><button data-k="b">Both stay about the same: the layout moved, it was not added.</button><button data-k="c">Fewer layouts, each larger.</button></div>
+    <div class="reveal"><p><b>The same.</b> One layout per frame either way, of the same 52 objects in the frame below. With two virtualizers it runs inside the scroll event; with one it runs after it, where the frame would have done it anyway.</p></div>
+  </div>
+  <div class="tracelink" data-trace="r-two-virtualizers">Select a <code>scroll</code> event: two <code>Function call</code> slices, the second containing <code>Document::UpdateStyleAndLayout</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["r-two-virtualizers","r-one-virtualizer"],"titles":["rows + columns virtualized (r-two-virtualizers)","rows only (r-one-virtualizer)"],"from":300.3,"to":301.6,"rows":["main","app"],"pins":[[1,300.6,"main.js",0],[2,300.95,"main.layout",0],[3,300.65,"main.js",1],[4,301.05,"main.layout",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>One scroll event, two listeners in turn. The first is the row virtualizer's: it calls our render, which adds a row.</li>
+    <li><i>2</i>The second is the column virtualizer's. Its first statement needs layout, and the DOM has just changed: style for 26 elements, layout of 52 objects, inside the event.</li>
+    <li><i>3</i>The control: one listener, same render.</li>
+    <li><i>4</i>The same style and layout, 26 elements and 52 objects, in the frame's own layout phase.</li>
+  </ol>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L217-L248">packages/virtual-core/src/index.ts:217–221, 245–248, 1123, 1137</a>
+      <p>The sampled stack during the red bar is two frames deep: <code>(anonymous) index.js:384</code> called from <code>(anonymous) index.js:365</code>. In source:</p>
+<pre><span class="n"> 217</span>  const createHandler = (isScrolling: boolean) =&gt; () =&gt; {
+<span class="n"> 218</span>    offset = <mark>readOffset(element)</mark>              <span class="c">// index.js:365 calls index.js:384 …</span>
+<span class="n"> 245</span>  observeOffset(instance, cb, (el) =&gt; {
+<span class="n"> 247</span>    return horizontal ? <mark>el.scrollLeft</mark> * ((isRtl &amp;&amp; -1) || 1) : el.scrollTop   <span class="c">// … which is this read</span>
+<span class="n">1123</span>          const elementMax = isScrolling ? this._elementMaxScrollOffset() : null
+                                               <span class="c">// scrollWidth - clientWidth: layout is clean by now</span>
+<span class="n">1137</span>          if (kind === 'spurious') return      <span class="c">// scrollLeft did not change: the column virtualizer stops here</span></pre>
+      <p>The column virtualizer learns that nothing changed for it only <em>after</em> reading. Each virtualizer has its own listener (<code>addEventListener</code> at 225), and neither knows about the other.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Forced layout</dt><dd>A layout-dependent read while the DOM has unlaid-out changes makes the browser run style and layout at once, inside your JavaScript. <a href="rendering.html">Module 5</a> treats it in general.</dd>
+      <dt>Listener order</dt><dd>Listeners on one element run in the order they were added. Microtasks run between them.</dd>
+    </dl></div>
+  </div>
+  <table class="mtable" data-rows="r-two-virtualizers,r-one-virtualizer,u-tv-fixed-grid,u-tv-fixed-rows" data-names="lab: rows + columns,lab: rows only,TanStack's example: grid (two virtualizers),TanStack's example: row list (one)" data-head="Scenario" data-cols="main.scrollEvents|scroll events,main.layouts|layouts,main.forcedLayouts|of them forced,main.styleMs|style|ms,main.layoutMs|layout|ms" data-hi="r-two-virtualizers:main.forcedLayouts,u-tv-fixed-grid:main.forcedLayouts"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>One forced layout per scroll event wherever two virtualizers share a scroller, in our lab and in the library's own example; none with one. The total number of layouts and their time do not go up (the two example rows differ in what they render, so compare the lab rows).</p>
+    <p>So when is it extra? When something writes <em>after</em> the forced layout in the same frame. The source predicts when: a scroll that changes both axes. Then the column virtualizer does not return at line 1137; it notifies, and our render runs a second time. <code>a-diag-tanstack</code> scrolls the 100-column table diagonally:</p>
+  </div></div>
+  <div class="tracelink" data-trace="a-diag-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["a-diag-tanstack"],"titles":["diagonal scroll, rows + columns virtualized (a-diag-tanstack)"],"from":316.9,"to":321.6,"rows":["main","app"],"pins":[[1,317.26,"app",0],[2,317.7,"main.layout",0],[3,318.3,"app",0],[4,320,"main.layout",0]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Render 1, from the row virtualizer: one row entered, 19 cells written, with the column range of the <em>previous</em> frame (the column virtualizer has not run yet).</li>
+    <li><i>2</i>The column listener's <code>scrollLeft</code> read: a forced layout of what render 1 wrote.</li>
+    <li><i>3</i>Render 2, from the column virtualizer: the column range moved by one, and our render rewrites the cells of every row (648), including the 19 from a moment ago.</li>
+    <li><i>4</i>The frame's layout, of everything render 2 changed.</li>
+  </ol>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>In that recording there were <b data-m="a-diag-tanstack/app.draw.n"></b> renders and <b data-m="a-diag-tanstack/main.layouts"></b> layouts for <b data-m="a-diag-tanstack/main.scrollEvents"></b> scroll events. The first render of a doubled frame is partly wasted, and so is the layout between the two. Neither library function is wrong on its own. The cost comes from composing two instances that each read, decide and notify, with our render behind both.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>Two beliefs fell here. First, I took the suspicious line to be 1123, the <code>scrollHeight − clientHeight</code> read that looks expensive. The samples say the browser was already laying out one statement earlier, at the plain <code>scrollLeft</code> read on line 218: reading a scroll offset needs layout too. Deleting line 1123 would change nothing. Second, I read "forced layout" as "an extra layout". In the vertical scroll it is the frame's one layout, done early. <b>Rules: find the forcing read from the stack, not from which property looks heavy; and count layouts per frame before calling a forced one a cost.</b></p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> two virtual-core instances on one element produce a layout inside every scroll event (measured in four traces, explained by lines 218 and 247), and two renders per event when both ranges change (measured in one).</p>
+    <p><b>No:</b> that the forced layout slows a vertical scroll; in these recordings it does not. And the 648 rewritten cells in render 2 are our render's policy for a column change, not the library's.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>The pattern to avoid is several independent parties each reading scroll state and then writing. Proposal: one owner reads the scroll position of both axes once per frame, before any write, and one render follows; a 2-D window is one thing, not two 1-D things. Tablelab's view core already has this shape if the painter reports one (x, y) position and receives one window.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-two-virtualizers stack 300.95</code>. Expected, leaf first: <code>(anonymous) assets/index-….js:384</code>, <code>(anonymous) assets/index-….js:365</code>, <code>(root)</code>. Then <code>node lab/harness/q.mjs a-diag-tanstack marks draw 316 320</code>: two <code>draw</code> spans 0.7 ms apart, the second with <code>"cells":648</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Two virtualizers on one scroller: one forced style-and-layout per scroll event, in the lab and in TanStack's own grid example; none with a single virtualizer. Layout count and time are unchanged (r-two-virtualizers, r-one-virtualizer, u-tv-fixed-grid, u-tv-fixed-rows).</li>
+    <li data-kind="read">The forcing read is the second listener's first statement, el.scrollLeft (index.ts:218, 247); it returns as "spurious" only afterwards (1137).</li>
+    <li data-kind="measured">On a diagonal scroll both virtualizers notify: two renders and two layouts in one frame, the first render using the previous frame's column range (a-diag-tanstack).</li>
+    <li data-kind="rejected">"A forced layout is an extra layout." Here it is the frame's layout done earlier; it becomes extra only when a write follows it.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Our render is a few DOM calls. What sits inside the scroll event when the render is React?</p>
+</section>
+
+<section class="step" data-part="B · TanStack Virtual: numbers, inside the scroll event" data-title="The React adapter: a whole render inside the listener" data-node="event yours dom">
+  <p class="holding"><span class="label">Question I hold</span><span>React normally schedules a render for later. Step 1 showed it inside the scroll event. Which line puts it there, and what is on the stack?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read what <code>useVirtualizer</code> does when the core calls <code>onChange</code>, then take one sample from the middle of a scroll event in <code>f-scroll-react</code>.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/react-virtual%403.14.26/packages/react-virtual/src/index.tsx#L203-L217">packages/react-virtual/src/index.tsx:80, 203–217</a>
+<pre><span class="n"> 80</span>  useFlushSync = true,                         <span class="c">// the default</span>
+<span class="n">203</span>      if (shouldRerender) {
+<span class="n">212</span>        if (useFlushSync &amp;&amp; sync &amp;&amp; !measuringFromRef.current) {
+<span class="n">213</span>          <mark>flushSync(rerender)</mark>                    <span class="c">// render, commit and layout effects, now</span>
+<span class="n">214</span>        } else {
+<span class="n">215</span>          rerender()                             <span class="c">// React decides when</span></pre>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L1027-L1029">packages/virtual-core/src/index.ts:1027–1028</a>
+<pre><span class="n">1027</span>    (isScrolling) =&gt; {
+<span class="n">1028</span>      this.notify(<mark>isScrolling</mark>)                <span class="c">// sync = "a scroll is in progress"</span></pre>
+      <p>So a range change during scrolling is rendered synchronously, and the notify that ends scrolling (150 ms after the last event, <code>isScrolling</code> false) takes the ordinary path.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt><code>flushSync</code></dt><dd>React DOM's way to run a state update to completion before returning: the component functions, the DOM changes and layout effects.</dd>
+      <dt>Why here</dt><dd>The scroll event is the last moment before this frame's style and layout. Rows rendered now are in this frame; rows rendered in a later task may miss it and show as blank space.</dd>
+    </dl></div>
+  </div>
+  <div class="tracelink" data-trace="f-scroll-react">Search <code>flushSync</code> in the JavaScript samples.</div>
+<pre class="wrap"><span class="c">node lab/harness/q.mjs f-scroll-react stack 300.75      (leaf first)</span>
+  setTextContent                     react.js   <span class="c">React writing a cell's text into a new row</span>
+  completeWork · completeUnitOfWork · performUnitOfWork · workLoopSync · renderRootSync
+  performWorkOnRoot · performSyncWorkOnRoot · flushSyncWorkAcrossRoots_impl · flushSyncWork
+  <mark>reactDom_production.flushSync</mark>      react.js   <span class="c">index.tsx:213</span>
+  onChange                           react.js   <span class="c">the adapter's onChange, index.tsx:177</span>
+  Virtualizer.notify                 index.js:718
+  Virtualizer.maybeNotify.memo.key   index.js:731   <span class="c">index.ts:1027</span>
+  memoizedFunction                   index.js:39
+  (anonymous)                        index.js:795   <span class="c">the offset callback</span>
+  (anonymous)                        index.js:365   <span class="c">the scroll listener</span></pre>
+  <table class="mtable" data-rows="j-cells-L-tanstack,j-cells-L-react,j-react-memo" data-names="our keyed render,React,React with memoized rows" data-head="33 × 16 cells visible" data-cols="main.scrollEvents|scroll events,app.draw.n|renders,app.draw.p50|one render (median)|ms,main.scriptMs|script (whole scroll)|ms,main.forcedLayouts|forced layouts"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The stack is the one from step 2 with React's synchronous work loop below <code>onChange</code>. The render count equals the plain one: React renders when the memo fires, no more often. Each render costs more, and most of the extra is the row components that <code>memo</code> removes. The React page also has two virtualizers (<code>react.tsx:59–60</code>), so step 6's forced layout is here as well, after React's commit.</p>
+  </div></div>
+  <div class="beat conclude" ><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with the adapter's defaults a scrolling range change runs a complete React render and commit inside the scroll listener (read at index.tsx:213; <code>flushSync</code> is on the sampled stack).</p>
+    <p><b>No:</b> what the alternative costs. <code>useFlushSync: false</code> is a documented option, but the lab has no knob for it, so "later renders show blank rows" is the library authors' statement, not a measurement here. <a href="javascript.html">Module 4</a> measures what React's render itself costs.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs f-scroll-react prof 0 2100 | grep -E 'flushSync |onChange|Grid '</code>. Expected: <code>reactDom_production.flushSync</code> with nearly the same total time as <code>onChange</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">The React adapter calls flushSync(rerender) when a notify is synchronous, and scroll-driven notifies are synchronous while isScrolling is true (react-virtual index.tsx:212–213; virtual-core index.ts:1028).</li>
+    <li data-kind="measured">flushSync is on the sampled stack inside the scroll listener; React renders as often as the plain render, each costing more (f-scroll-react, j-cells-L-react, j-react-memo).</li>
+    <li data-kind="inferred">TanStack Virtual's design: range math only, synchronous in the scroll event; every DOM write, every data request and every cost after onChange belongs to the caller.</li>
+  </ul>
+  <p class="next" data-answer="sync"><b>Next question →</b> regular-table takes the opposite position on almost every point. Where exactly do its awaits sit?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · regular-table: owns the table, pulls a rectangle" data-title="The warm path, await by await" data-node="event range data dom frame"
+  data-ask="paths|regular-table has more than one way to draw. Which path runs when, and which lines of each read layout?">
+  <p class="holding"><span class="label">Question I hold</span><span>Between the scroll event and the written cells there are three awaits. What runs before, between and after them, and where is layout read?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Module 1 showed the outline (<code>_on_scroll</code> → <code>predraw</code> → animation frame → commit). Here I follow one frame of the large table (33 × 18 cells requested) and attach each piece of the frame to the lines that produce it, marking every read of layout. "Warm" means: the row height and the widths of the visible columns are already cached.</p>
+  </div></div>
+  <div class="tracelink" data-trace="j-cells-L-regular">Select the <code>scroll</code> event at about 300.8 ms, then the <code>Animation frame fired</code> slice after it.</div>
+  <div class="lanes" data-lanes='{"traces":["j-cells-L-regular"],"from":300.3,"to":309.2,"rows":["main","app"],"pins":[[1,300.82,"main.js",0],[2,300.9,"app",0],[3,301.6,"main.js",0],[4,302.9,"main.layout",0],[5,305,"main.layout",0],[6,307.7,"main.paint",0]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The <code>scroll</code> event, 0.2 ms. <code>_on_scroll</code> reads positions and sizes, then <code>predraw</code> plans the viewport; no DOM write.</li>
+    <li><i>2</i>Still inside the event, in microtasks: our data listener is called for rows 29 to 61 and columns 0 to 17 (33 × 18 cells) and answers at once (local data).</li>
+    <li><i>3</i><code>Animation frame fired</code>, 1.25 ms: the commit. The sampled stack here is <code>_draw_td</code> ← <code>draw</code> ← <code>_drawDataColumn</code> ← <code>_render_pass</code> ← <code>draw_sync</code> ← <code>Object.assign.inline</code> ← <code>(anonymous)</code>.</li>
+    <li><i>4</i>Style for 617 elements, then <span class="cp">5</span> one layout: 1,158 of 1,228 objects. Not forced: it is the frame's own.</li>
+    <li><i>6</i>Paint and commit.</li>
+  </ol>
+  <div class="boxes">
+    <div class="box file" style="grid-column:1/-1"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/events.ts#L60-L97">regular-table src/ts/events.ts:60–96</a> · <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/scroll_panel.ts#L160-L360">src/ts/scroll_panel.ts:194–357</a>
+      <p>The whole warm path in execution order. <span class="cp">R</span> is a layout-dependent read, <span class="cp">W</span> a DOM write, <b>await</b> a point where the function gives up the thread.</p>
+<pre><span class="c">── in the scroll event (pin 1) ──</span>
+<span class="n"> 62</span>        this._scroll_left = this.scrollLeft;                 <span class="c"><span class="cp">R</span></span>
+<span class="n"> 63</span>        this._scroll_top = this.scrollTop;                   <span class="c"><span class="cp">R</span></span>
+<span class="n"> 64</span>        if (this._scroll_pending) {                          <span class="c">// a draw is in flight: step 11</span>
+<span class="n"> 70</span>        const width = this._table_clip.clientWidth;          <span class="c"><span class="cp">R</span></span>
+<span class="n"> 71</span>        const height = this._table_clip.clientHeight;        <span class="c"><span class="cp">R</span></span>
+<span class="n"> 72</span>        const container_height = this.clientHeight;          <span class="c"><span class="cp">R</span> the last read of layout on this path</span>
+<span class="n"> 74</span>            await throttle_tag(this, async () =&gt; {           <span class="c">// the lock: step 12</span>
+<span class="n"> 77</span>                    const commit = await this.predraw(width, height, {
+<span class="c">── predraw, in microtasks (pin 2) ──</span>
+<span class="n">194</span>        const { num_columns, num_rows } = <b>await</b> this._update_dim_state(cache);   <span class="c">// cached: no listener call</span>
+<span class="n">195</span>        if (!this._column_sizes.row_height) {
+<span class="n">196</span>            return await inline();                           <span class="c">// no row height cached → the other path (step 9)</span>
+<span class="n">229</span>            const replanned = this._calculate_viewport(      <span class="c">// arithmetic on the numbers passed in</span>
+<span class="n">236</span>            const end_col = this._plan_column_extent(        <span class="c">// sums cached column widths</span>
+<span class="n">241</span>            if (end_col === undefined) {
+<span class="n">242</span>                return await inline();                       <span class="c">// a needed column was never measured → the other path</span>
+<span class="n">272</span>            if (!should_render) {                            <span class="c">// same integer viewport: no data call</span>
+<span class="n">276</span>            view_response = <b>await</b> <mark>this._view_cache.view(</mark>     <span class="c">// YOUR data listener; here the path waits for data</span>
+<span class="c">── back in _on_scroll ──</span>
+<span class="n"> 86</span>                    if (!commit.inline) {
+<span class="n"> 87</span>                        <b>await</b> new Promise(requestAnimationFrame);   <span class="c">// wait for the frame</span>
+<span class="n"> 88</span>                        <mark>commit();</mark>
+<span class="c">── the commit closure (pin 3): synchronous, no await, no read ──</span>
+<span class="n">300</span>                this._update_virtual_panels(                 <span class="c"><span class="cp">W</span> panel height, computed (734–738), not read back</span>
+<span class="n">315</span>                        this._update_sub_cell_offset(viewport);   <span class="c"><span class="cp">W</span> four custom properties on the &lt;table&gt;</span>
+<span class="n">329</span>                const complete = this.table_model.draw_sync(  <span class="c"><span class="cp">W</span> every visible cell (step 10); style listeners run here</span></pre>
+    </div>
+  </div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>All five reads are at the very start of the scroll event, when nothing in this frame has been written yet, so they are free. Everything after is arithmetic on cached numbers until the data listener is called. The writes all happen in one synchronous block inside the animation-frame step, and the browser lays out once, afterwards. Over the whole scroll: <b data-m="j-cells-L-regular/main.scrollEvents"></b> scroll events, <b data-m="j-cells-L-regular/main.rafCallbacks"></b> animation-frame callbacks, <b data-m="j-cells-L-regular/main.layouts"></b> layouts, <b data-m="j-cells-L-regular/main.forcedLayouts"></b> of them forced.</p>
+    <p>Two details of the trace that the source explains. The commit sits inside <code>Animation frame fired</code> but under <code>Run microtasks</code>: the callback given to <code>requestAnimationFrame</code> is a promise's <code>resolve</code>, and the awaiting function continues in the microtask that follows. And the stack at pin 3 does not contain <code>_on_scroll</code>: a function resumed after <code>await</code> starts a new stack at the innermost async function, here the arrow at <code>events.ts:74</code>.</p>
+  </div></div>
+  <div class="boxes"><div class="box"><span class="label">Knowledge I am using</span><dl>
+    <dt>Plan, then commit</dt><dd>Do everything that can wait (arithmetic, data) without touching the DOM; apply the result in one synchronous step at a moment of your choosing.</dd>
+    <dt>Microtask</dt><dd>The continuation of an <code>await</code> or a promise callback. Microtasks run as soon as the current JavaScript call returns to the browser, before the next task or the next listener.</dd>
+  </dl></div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>Looking for the commit in the profile, I searched for "commit" and then for the function named <code>inline</code>, and took <code>Object.assign.inline</code> for the inline fallback of line 196. It is the opposite: the commit closure, created as <code>Object.assign(() =&gt; {…}, { inline: false })</code> (<code>scroll_panel.ts:296–358</code>) and named by V8 after the property next to it. <b>Rule (the same as in step 2): the line number decides. In this build <code>Object.assign.inline</code> at regular-table.js:202 is the commit; <code>draw_sync</code> below it is the reliable name to search for.</b></p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on the warm path regular-table reads layout only at the start of the scroll event and writes only in the animation-frame step; the browser lays out once per frame (source and trace agree).</p>
+    <p><b>No:</b> that every regular-table draw looks like this. Lines 196 and 242 leave this path, and <code>draw()</code> never enters it.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-cells-L-regular stack 301.5</code>. Expected, leaf first: a DOM call or <code>_draw_td</code>, then <code>draw</code>, <code>_drawDataColumn</code>, <code>_render_pass</code>, <code>draw_sync</code>, <code>Object.assign.inline</code>, <code>(anonymous) …regular-table-….js:950</code>, <code>(root)</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">regular-table's warm scroll path: five layout reads at the start of the scroll event (events.ts:62–72), planning from cached sizes, await the data listener (scroll_panel.ts:276), await one animation frame (events.ts:87), then a synchronous commit with no reads.</li>
+    <li data-kind="measured">One layout per frame, none forced, on the warm path (j-cells-L-regular); the commit runs in a microtask inside the animation-frame callback and appears as <code>Object.assign.inline</code> → <code>draw_sync</code>.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Lines 196 and 242 "return await inline()". What is that other path, and what does it read?</p>
+</section>
+
+<section class="step" data-part="C · regular-table: owns the table, pulls a rectangle" data-title="The cold path: a draw that measures as it goes" data-node="event dom layout sizes">
+  <p class="holding"><span class="label">Question I hold</span><span>When a size is not cached, regular-table draws "inline". What does that path read from layout, how often, and what puts a table on it?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>regular-table's own <code>file_browser</code> example calls <code>resetAutoSize()</code> in a scroll listener, which forgets the row height and every column width. The lab can do the same (<code>rtReset=1</code>, <code>regular.ts:65–68</code>). On the next scroll event <code>predraw</code> finds no row height at line 195. In which part of the frame are the cells written now?</p>
+    <div class="opts"><button data-k="a">Still in the animation-frame step, after some extra measuring.</button><button data-k="b">Inside the scroll event, in microtasks; no animation-frame callback at all.</button><button data-k="c">In a later task, a frame late.</button></div>
+    <div class="reveal"><p><b>Inside the scroll event.</b> <code>inline()</code> is <code>await this.draw(…)</code> (<code>scroll_panel.ts:178–187</code>): the asynchronous pipeline, which writes as soon as its data resolves, and returns a no-op commit, so line 87 is skipped. <code>r-autosize-reset</code> has <b data-m="r-autosize-reset/main.rafCallbacks"></b> animation-frame callbacks for <b data-m="r-autosize-reset/main.scrollEvents"></b> scroll events.</p></div>
+  </div>
+  <div class="tracelink" data-trace="r-autosize-reset">Select a <code>scroll</code> event: one long <code>Run microtasks</code> with a row of <code>Layout</code> slices inside.</div>
+  <div class="lanes" data-lanes='{"traces":["r-autosize-reset","j-cells-L-regular"],"titles":["widths forgotten on every scroll event (r-autosize-reset)","the same table, warm (j-cells-L-regular)"],"from":300.2,"to":310.6,"rows":["main","app"],"pins":[[1,300.62,"main.layout",0],[2,301.3,"main.layout",0],[3,304.5,"main.layout",0],[4,308.7,"main.layout",0],[5,304.9,"main.layout",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The row-height probe: a hidden one-cell table is appended, <code>offsetHeight</code> is read, the probe is removed (<code>scroll_panel.ts:559–561</code>). One small forced layout.</li>
+    <li><i>2</i>The first column's cells are written, then <code>th.offsetWidth</code> is read: a forced layout of that column, 99 objects.</li>
+    <li><i>3</i>The same for every column: seventeen layouts in a row in this frame, all inside one 8.8 ms <code>scroll</code> event.</li>
+    <li><i>4</i>Style once more, for 580 elements, forced from <code>autosize_cells</code> (<code>table.ts:510–520</code>): it reads the zoom factor and each column's box after the column width rules were rewritten.</li>
+    <li><i>5</i>The warm table at the same moment: one layout of the whole table, after all JavaScript.</li>
+  </ol>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/scroll_panel.ts#L980-L1016">src/ts/scroll_panel.ts:980–1016 (internal_draw)</a>
+<pre><span class="n"> 986</span>    const { num_columns, num_rows } = await this._update_dim_state(
+<span class="n"> 990</span>    if (!this._column_sizes.row_height) {
+<span class="n"> 991</span>        this._probe_row_height();                      <span class="c"><span class="cp">W</span><span class="cp">R</span><span class="cp">W</span> pin 1</span>
+<span class="n"> 997</span>        () =&gt; this._table_clip.clientWidth,            <span class="c"><span class="cp">R</span> after whatever was written before draw()</span>
+<span class="n">1002</span>    this._update_virtual_panels(                       <span class="c"><span class="cp">W</span></span>
+<span class="n">1014</span>        this.scrollTop,                                <span class="c"><span class="cp">R</span> after that write, on purpose (comment at 1009)</span></pre>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/table.ts#L900-L1004">src/ts/table.ts:900, 991–1003 (_render_pass)</a>
+<pre><span class="n"> 900</span>            const warm = this._column_sizes.indices.some(Boolean);   <span class="c">// is any column measured?</span>
+<span class="n"> 991</span>                let col_width =
+<span class="n"> 992</span>                    this._column_sizes.indices[_virtual_x + Math.floor(x0)] ||
+<span class="n"> 993</span>                    (warm ? unmeasured_col_width : 0);
+<span class="n"> 995</span>                if (!col_width) {
+<span class="n"> 996</span>                    <mark>col_width = cont_head?.th?.offsetWidth || 0;</mark>   <span class="c"><span class="cp">R</span> just after this column was written: pins 2, 3</span></pre>
+      <p>With nothing measured (<code>warm</code> false) the read at 996 happens for <em>every</em> column, because the loop needs each real width to know when the viewport is full. With some columns measured, one read stands in for all new columns of a pass (line 993), and a batched <code>getBoundingClientRect</code> pass follows (<code>table.ts:517–520</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Auto-sizing</dt><dd>regular-table does not ask you for column widths. It draws a column, lets the browser lay it out, reads the width and caches it per column index. The cache is what makes the warm path possible.</dd>
+      <dt>Write, read, write, read</dt><dd>Each read after a write is a layout. Drawing column by column and measuring each is the pattern in its purest form; the library pays it once per column, then never again unless told to forget.</dd>
+    </dl></div>
+  </div>
+  <table class="mtable" data-rows="j-cells-L-regular,r-autosize-reset,a-diag-regular" data-names="warm: vertical scroll,cold every event: rtReset=1,diagonal scroll into new columns" data-head="regular-table, 33 × 16 cells visible" data-cols="main.scrollEvents|scroll events,main.rafCallbacks|animation-frame commits,main.forcedLayouts|forced layouts,main.layoutMs|layout|ms,frames.partial|frames without the main update" data-hi="r-autosize-reset:main.forcedLayouts,r-autosize-reset:main.rafCallbacks"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Told to forget on every event, the table is on the cold path for the whole scroll: no animation-frame commits, about eighteen forced layouts per scroll event, almost three times the layout time, and frames that the compositor had to present without the main thread's update (<a href="frames.html">Module 2</a> explains that column).</p>
+    <p>The third row is the everyday version. Nobody resets anything in <code>a-diag-regular</code>; the scroll simply moves right into columns that were never drawn. For those events line 241 finds an unmeasured width and the draw goes inline: scroll events minus animation-frame commits is the number of inline draws. Each has one forced layout at line 996 for the new column, not one per column, because the table is warm.</p>
+    <p>The same asynchronous pipeline also serves every <code>table.draw()</code> call: first draw, data updates, resizes. So "cold" has two meanings that travel together: it measures, and it writes outside the animation frame.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>In <code>a-diag-regular</code> some forced layouts are attributed to neither library but to <code>regular.ts</code>, the lab's own passive scroll listener, which only records <code>table.scrollTop</code>. Its comment says it exists to <em>avoid</em> a forced read later. On the warm path that holds: when it runs, nothing has been written. But when regular-table draws inline, the whole draw happens in the microtasks between regular-table's listener and ours, and our innocent read lands after it. It is step 6 again with the roles swapped: a second listener reading after a first one wrote. <b>Rule: "this read is safe" is a statement about what ran before it in the frame, and another party's fallback path can change that.</b></p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> regular-table has two pipelines; the cold one reads layout once per unmeasured column right after writing it and commits outside the animation frame; unmeasured sizes, <code>resetAutoSize()</code> and every <code>draw()</code> call select it.</p>
+    <p><b>No:</b> that calling <code>resetAutoSize()</code> is wrong; it is the way to let columns shrink again. Calling it per scroll event is what costs. Whether layout is cheaper with fixed-width columns belongs to <a href="rendering.html">Module 5</a>.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Column widths measured from content make the first sight of every column a synchronous layout, and make "which columns fit" unknowable without drawing. A view core that is given declared widths knows its window before anything is drawn and has no cold path. Proposal: keep content-measured widths out of the scroll path entirely; if auto-fit is wanted, run it as an explicit, occasional operation whose result is a declared width.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs r-autosize-reset tree 300 311 main 100 | grep -c 'Layout {'</code>. Expected: 17. Then record <code>http://127.0.0.1:5199/grid.html?lib=regular&amp;cols=100&amp;w=1560&amp;h=792&amp;rtReset=1</code> (after <code>node lab/server/main.mjs</code>) in DevTools' Performance panel while scrolling: every <code>Event: scroll</code> carries a row of purple layouts with the red "forced" corner.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">The inline fallback is the asynchronous draw(): it probes the row height if unset, reads client sizes and scrollTop after writes (scroll_panel.ts:990–1014) and reads th.offsetWidth after drawing each column that has no cached width (table.ts:991–996).</li>
+    <li data-kind="measured">With widths forgotten on every scroll event: no animation-frame commits and about eighteen forced layouts per event, all inside the scroll event (r-autosize-reset).</li>
+    <li data-kind="measured">Without any reset, scrolling into never-drawn columns takes the same path for those events (a-diag-regular).</li>
+    <li data-kind="inferred">A read that is safe on one path can be forced on another: the lab's own scroll listener reads scrollTop after regular-table's inline draw.</li>
+  </ul>
+  <p class="next" data-answer="paths"><b>Next question →</b> On either path a draw "writes every visible cell". What exactly does one draw write, and what does the browser have to redo because of it?</p>
+</section>
+
+<section class="step" data-part="C · regular-table: owns the table, pulls a rectangle" data-title="What one draw writes" data-node="dom layout">
+  <p class="holding"><span class="label">Question I hold</span><span>For each visible cell on each draw: what runs in JavaScript, what reaches the DOM, and what does that make the browser recompute?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the per-cell function, then use the slow scroll from step 3, this time with regular-table, because at that speed three kinds of frame alternate and each isolates one kind of write.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/tbody.ts#L30-L69">src/ts/tbody.ts:39–67, 202–213</a>
+<pre><span class="n"> 39</span>        const td = this._get_cell(tagName, ridx, cidx);      <span class="c">// the cell at this screen position</span>
+<span class="n"> 40</span>        const metadata = this._get_or_create_metadata(td);   <span class="c">// one WeakMap lookup</span>
+<span class="n"> 41</span>        metadata.y = ridx + Math.floor(ridx_offset);
+<span class="n"> 51</span>        td.classList.toggle("rt-cell-clip", clip);           <span class="c">// every cell, every draw</span>
+<span class="n"> 58</span>        <mark>if (metadata.value !== val) {</mark>
+<span class="n"> 63</span>                <mark>td.textContent = String(val ?? "");</mark>          <span class="c">// only when the text differs</span>
+<span class="n"> 67</span>        metadata.value = val;
+<span class="n">202</span>                    meta.type = "body";
+<span class="n">203</span>                    meta.x = x_floor || 0;                   <span class="c">// … about a dozen more fields, 204–213</span>
+<span class="n">205</span>                    meta.row_header = row_headers?.[ridx] || [];   <span class="c">// a new [] per cell without row headers</span></pre>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/scroll_panel.ts#L753-L759">src/ts/scroll_panel.ts:753–758</a>
+<pre><span class="n">754</span>        const style = this.table_model.table.style;          <span class="c">// the &lt;table&gt; element's inline style</span>
+<span class="n">755</span>        style.setProperty(CLIP_X, `${x_offset}px`);
+<span class="n">756</span>        style.setProperty(CLIP_Y, `${y_offset}px`);
+<span class="n">757</span>        style.setProperty(TRANSFORM_X, `${-x_offset}px`);
+<span class="n">758</span>        <mark>style.setProperty(TRANSFORM_Y, `${-y_offset}px`);</mark>   <span class="c">// the sub-row scroll offset, on every commit</span></pre>
+      <p>The header is redrawn the same way, once per drawn column and header level (<code>thead.ts:172</code>), with its merge cache cleared after every draw (<code>scroll_panel.ts:443</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Visited versus written</dt><dd>JavaScript work is per visible cell; DOM writes are per cell whose text changed. After the first row changes, every screen position holds another row, so every text changes.</dd>
+      <dt>Inherited custom property</dt><dd>A <code>--name</code> set on an element is inherited by all its descendants. Changing it makes the browser recompute their style, whether or not any rule uses it.</dd>
+    </dl></div>
+  </div>
+  <div class="tracelink" data-trace="j-speed-600-regular">Compare the <code>Layout</code> slices' <code>dirtyObjects</code> and the <code>Recalculate style</code> slices' <code>elementCount</code> frame by frame.</div>
+  <div class="lanes" data-lanes='{"traces":["j-speed-600-regular"],"from":298,"to":424,"rows":["main","app"],"pins":[[1,301.5,"main.layout",0],[2,318.7,"main.layout",0],[3,336.6,"main.layout",0],[4,384.7,"main.layout",0]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>300 ms: no row boundary crossed. No data request, no layout, yet style is recalculated for 616 elements. Apart from the panel height, rewritten with an unchanged value, the only writes of this commit are the four custom properties (<code>scroll_panel.ts:300–309</code>).</li>
+    <li><i>2</i>317 ms: the bottom edge crossed. The listener returns rows 7 to 39; rows 7 to 38 hold what they held, so line 58 skips them and one new row gets text. Layout: 38 objects.</li>
+    <li><i>3</i>334 ms: the top edge crossed. Rows 8 to 39 now sit one position higher: every cell's text differs. Layout: 1,123 of 1,228 objects.</li>
+    <li><i>4</i>384 ms: like pin 1.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Three costs, separated by the frames that have only some of them:</p>
+    <div class="scroll"><table>
+      <tr><th>Per draw</th><th>Proportional to</th><th>Seen in</th></tr>
+      <tr><td>JavaScript: listener formats the rectangle; <code>_draw_td</code> visits each cell, toggles a class, writes a dozen metadata fields</td><td>visible cells, on every draw (594 or 576 here)</td><td>both kinds of draw: the commit is 0.3–0.4 ms when one row changed, 0.7–1.2 ms when all did</td></tr>
+      <tr><td>Layout</td><td>cells whose text changed: one row, or all</td><td>pins 2 and 3: 38 against 1,123 objects</td></tr>
+      <tr><td>Style recalculation of the whole table</td><td>cells in the table, on every scrolled frame</td><td>pins 1 and 4: 616 elements with nothing else changed</td></tr>
+    </table></div>
+    <p>At the usual 40 px per frame every draw is of the "all" kind. Against the keyed TanStack render on the same table and scroll:</p>
+  </div></div>
+  <table class="mtable" data-rows="j-cells-L-tanstack,j-cells-L-regular" data-names="TanStack + keyed render,regular-table" data-head="33 × 16 cells visible, about 40 px per frame" data-cols="main.styleRecalcs|style recalcs,main.styleElements|elements restyled (sum),main.layoutDirty|objects laid out (sum),main.styleMs|style|ms,main.layoutMs|layout|ms,main.scriptMs|script|ms"></table>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a regular-table draw visits every visible cell in JavaScript and writes text only where it differs (read); a row step upward or downward through the pool rewrites all of it, and the sub-row offset alone restyles the whole table on every scrolled frame (measured).</p>
+    <p><b>No:</b> that the offset write is the cause of the 616 elements is an inference: it is the only write left in those frames, and custom properties inherit, but I did not record style-invalidation tracking to see Chrome name it. Why table layout costs what it does per object is <a href="rendering.html">Module 5</a>'s subject, and the keyed-versus-positional trade-off is <a href="javascript.html">Module 4</a>'s.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Positional reuse makes a one-row scroll step as expensive as a jump. That is acceptable when jumps are the common case (a drag over a huge table) and wasteful for wheel scrolling. Separately, an offset that every cell inherits is a per-frame cost proportional to the table. Proposal for the DOM painter: move the body with one transform on one element instead of an inherited property, and measure a keyed pool against a positional one on wheel traces before choosing.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs j-speed-600-regular slices '^(Layout|UpdateLayoutTree)$' main 300 425</code>. Expected: an <code>UpdateLayoutTree</code> with <code>"elementCount":616</code> in every frame, and <code>Layout</code> slices whose <code>dirtyObjects</code> alternate 38 and 1123, with two frames that have no <code>Layout</code> at all.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">Per visible cell per draw: a pool lookup, a class toggle, about a dozen metadata writes, and textContent only if the value differs (tbody.ts:39–67, 202–213).</li>
+    <li data-kind="measured">A draw after the bottom edge crosses a row lays out 38 objects; after the top edge crosses, 1,123 of 1,228 (j-speed-600-regular).</li>
+    <li data-kind="measured">Every scrolled frame recalculates style for all 616 elements of the table, including frames with no draw.</li>
+    <li data-kind="inferred">That recalculation comes from the four sub-cell custom properties written on the table element at every commit (scroll_panel.ts:753–758).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> All of this assumed the data answers at once. What happens to the loop when the listener takes 40 ms and the user keeps moving?</p>
+</section>
+
+<section class="step" data-part="C · regular-table: owns the table, pulls a rectangle" data-title="One draw in flight, and nothing is cancelled" data-node="event data lock dom"
+  data-ask="flight|When requests arrive faster than draws complete: what is skipped, what waits, and what is still drawn although it is already out of date?">
+  <p class="holding"><span class="label">Question I hold</span><span>A draw is waiting for its data and the scroll position moves on. Which positions get drawn, which are skipped, and what happens to the answer that is already on its way?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The thumb is dragged for 0.9 s over a backend that answers one request at a time in 40 ms. A request for rows 1930–1942 is in flight when the thumb passes row 3860. When the reply arrives, regular-table…</p>
+    <div class="opts"><button data-k="a">drops it and asks for the rows at the thumb.</button><button data-k="b">draws rows 1930–1942 in full on the next frame, then asks for the rows at the thumb.</button><button data-k="c">asks for the new rows first and draws whichever reply is newest.</button></div>
+    <div class="reveal"><p><b>It draws them.</b> Nothing between the data call and <code>commit()</code> looks at the scroll position again. In <code>b-drag-regular</code> there were <b data-m="b-drag-regular/ws.requests"></b> requests and <b data-m="b-drag-regular/main.rafCallbacks"></b> commits; only <b data-m="b-drag-regular/marks.content complete"></b> commit showed the rows the scroller was at when it landed, the last one.</p></div>
+  </div>
+  <div class="tracelink" data-trace="b-drag-regular">The backend's process is in the same trace: <code>Backend (node)</code> → <code>query #n</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["b-drag-regular"],"from":-15,"to":1045,"rows":["inputs","main","app","backendQuery"],"pins":[[1,39.8,"app",0],[2,72.7,"main.js",0],[3,106.3,"main.js",0],[4,112,"backendQuery",0],[5,989.4,"app",0]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>40 ms: the first scroll event of the drag starts a draw; our listener asks the backend for rows 1930–1942 (┃).</li>
+    <li><i>2</i>73 ms: another scroll event while that request is out. It takes 0.05 ms: two reads, two assignments, <code>_scroll_dirty = true</code>, return.</li>
+    <li><i>3</i>106 ms: the reply has arrived and the next frame commits rows 1930–1942. The thumb is at row 3860 by now.</li>
+    <li><i>4</i>In the same microtask run the loop plans again from the stored position and the next query starts (rows 3860–3872).</li>
+    <li><i>5</i>989 ms, after the mouse is released: the first commit that matches where the scroller is (◆).</li>
+  </ol>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/events.ts#L60-L97">src/ts/events.ts:62–94</a>
+<pre><span class="n">62</span>        this._scroll_left = this.scrollLeft;         <span class="c">// the newest position overwrites the stored one</span>
+<span class="n">63</span>        this._scroll_top = this.scrollTop;
+<span class="n">64</span>        if (this._scroll_pending) {
+<span class="n">65</span>            <mark>this._scroll_dirty = true;</mark>               <span class="c">// pin 2: all an event does during a draw</span>
+<span class="n">66</span>            return;
+<span class="n">75</span>                do {
+<span class="n">76</span>                    this._scroll_dirty = false;
+<span class="n">77</span>                    const commit = await this.predraw(width, height, {
+<span class="n">82</span>                        scroll_left: this._scroll_left,    <span class="c">// read once, when this iteration starts</span>
+<span class="n">83</span>                        scroll_top: this._scroll_top,
+<span class="n">87</span>                        await new Promise(requestAnimationFrame);
+<span class="n">88</span>                        <mark>commit();</mark>                            <span class="c">// pin 3: unconditional</span>
+<span class="n">90</span>                } while (this._scroll_dirty);              <span class="c">// pin 4: again, with whatever is stored now</span></pre>
+      <p>There is no token, no abort and no comparison of the planned viewport with the current one anywhere on this path; <code>predraw</code> takes the position only from its options (<code>scroll_panel.ts:169–170</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Latest wins</dt><dd>While one unit of work is in flight, newer requests overwrite one slot. Intermediate positions are never drawn.</dd>
+      <dt>Cancellation</dt><dd>Deciding that work already started is no longer wanted, and not finishing it (or not applying its result). regular-table has the first policy without the second.</dd>
+    </dl></div>
+  </div>
+  <table class="mtable" data-rows="b-drag-regular,b-scroll-ws-regular" data-names="thumb drag, 40 ms backend (one at a time),wheel scroll, 30 ms backend" data-head="regular-table over a WebSocket" data-cols="main.scrollEvents|scroll events,ws.requests|requests,main.rafCallbacks|commits,marks.content complete|commits showing the current rows,ws.roundTrip.p50|round trip (median)|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>A steady cycle: request, about 40 ms, the next frame, commit, request. Every reply is used, so no request is wasted; about half the scroll events only set the flag. During the whole drag the table shows rows the thumb left one cycle ago, each drawn completely (cells, style, layout, paint) and replaced one cycle later. The user sees motion in steps of a few thousand rows rather than a frozen table. The same holds for a wheel scroll over a 30 ms backend (second row).</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> regular-table's scroll loop is a request policy: one in flight, newest position next, every fetched viewport committed (read; the counts match).</p>
+    <p><b>No:</b> that committing a superseded viewport is a defect. It is what gives feedback during a drag, at the price of one full draw per round trip. What it does to a backend's queue, against the policies one writes by hand for TanStack, is <a href="backend.html">Module 6</a>.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>"One pull in flight, latest wins" is the conflation Tablelab's plan asks for between the scrolling pace and the publication pace, and regular-table gives it to the DOM painter for free. Two things stay open for the view core. Proposal: (1) tag each window with the position it was planned for and let the painter decide at commit time whether to apply a superseded one (apply while dragging, for feedback; skip when a newer one is already there); (2) report data age per commit, which here is one round trip plus up to a frame.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-drag-regular marks 'data listener|style listener|content complete' 0 1000</code>. Expected: pairs of a 40 ms <code>data listener</code> span and a <code>style listener</code> span whose <code>first</code> equals that request's <code>y0</code>, and a single <code>content complete</code> mark at the end.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">A scroll event during a draw stores the position and sets _scroll_dirty; the running iteration still awaits its data and its frame and commits; then the loop plans the stored position (events.ts:62–90). No cancellation exists on this path.</li>
+    <li data-kind="measured">Drag over a 40 ms backend: every request's reply was committed, and only the last commit showed the rows the scroller was at (b-drag-regular).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> That was the scroll loop. The other entry point is <code>draw()</code>, which our code calls when data changes. What if it is called two thousand times a second?</p>
+</section>
+
+<section class="step" data-part="C · regular-table: owns the table, pulls a rectangle" data-title="draw() asked faster than it completes" data-node="lock data dom layout">
+  <p class="holding"><span class="label">Question I hold</span><span>Every pushed value makes the lab call <code>table.draw()</code>. regular-table has a lock around draws. How many draws do 2,000 calls a second become?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The table is not scrolling and its data is in the page (the listener resolves at once). <code>draw()</code> is called once per WebSocket message, 2,000 times a second. How many draws run?</p>
+    <div class="opts"><button data-k="a">About 60 a second: one per frame.</button><button data-k="b">A few hundred a second: as many as fit, the rest coalesced.</button><button data-k="c">2,000 a second: every call draws.</button></div>
+    <div class="reveal"><p><b>Every call draws.</b> <b data-m="s-msg-2000-regular/ticks.messages"></b> messages produced <b data-m="s-msg-2000-regular/app.data listener.n"></b> data-listener calls, two per draw, and <b data-m="s-msg-2000-regular/main.layouts"></b> layouts in the two seconds. The lock found nothing to hold back.</p></div>
+  </div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/utils.ts#L48-L77">src/ts/utils.ts:48, 57–76</a> · <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/scroll_panel.ts#L113-L121">scroll_panel.ts:117</a>
+<pre><span class="n">48</span>const TAGS: Map&lt;any, PromiseWithResolvers&lt;undefined&gt;&gt; = new Map();
+<span class="n">57</span>export async function throttle_tag&lt;T&gt;(
+<span class="n">61</span>    if (TAGS.has(tag)) {                       <span class="c">// someone is drawing this element</span>
+<span class="n">62</span>        await TAGS.get(tag)?.promise;          <span class="c">// wait for them</span>
+<span class="n">63</span>        <mark>if (TAGS.has(tag)) {</mark>                   <span class="c">// an earlier waiter already took over</span>
+<span class="n">64</span>            await TAGS.get(tag)?.promise;      <span class="c">// wait for that one too …</span>
+<span class="n">65</span>            <mark>return;</mark>                            <span class="c">// … and return without running f</span>
+<span class="n">69</span>    TAGS.set(tag, Promise.withResolvers());
+<span class="n">71</span>        return await f();                      <span class="c">// f starts synchronously</span>
+<span class="n">73</span>        const l = TAGS.get(tag);
+<span class="n">74</span>        TAGS.delete(tag);
+<span class="n">75</span>        l?.resolve(undefined);</pre>
+      <p>The tag is the element. <code>draw()</code> (<code>scroll_panel.ts:117</code>) and the scroll loop (<code>events.ts:74</code>) share it. Of N callers that arrive during one operation, the first to have arrived runs next and the other N − 1 return when it finishes. The one that runs still draws the newest state: it reads <code>scrollTop</code> and calls the listener when it runs (<code>scroll_panel.ts:1014</code>, <code>table.ts:723</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Mutex versus rate limit</dt><dd>A lock stops two draws from overlapping. It reduces the number of draws only if a second request arrives while the first is still running, which for an <code>async</code> function means: while it is suspended at an <code>await</code> that outlasts the current task.</dd>
+      <dt>Task and microtask</dt><dd>A WebSocket message is one task. Awaits on already-resolved promises continue in microtasks inside the same task.</dd>
+    </dl></div>
+  </div>
+  <div class="tracelink" data-trace="s-msg-500-regular">Every <code>socket.onmessage</code> task has the same shape; <code>s-msg-2000-regular</code> is the same picture four times denser.</div>
+  <div class="lanes" data-lanes='{"traces":["s-msg-500-regular"],"titles":["500 messages a second, draw() per message (s-msg-500-regular)"],"from":500.2,"to":505.3,"rows":["main","app"],"axis":"ms after the start mark","pins":[[1,500.53,"main.js",0],[2,500.58,"main.layout",0],[3,502.65,"main.js",0]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>One message, one task: <code>socket.onmessage</code> calls <code>draw()</code>, and the whole draw runs in the microtasks of the same task (two listener calls, every cell visited, one cell's text written).</li>
+    <li><i>2</i>A forced layout inside it: <code>internal_draw</code>'s first read, <code>clientWidth</code> at <code>scroll_panel.ts:997</code>, comes after the previous draw's write, and no frame has laid that out in between.</li>
+    <li><i>3</i>The next message, 2 ms later: the previous draw finished long ago, the map is empty, a new draw starts.</li>
+  </ol>
+  <table class="mtable" data-rows="s-msg-60-regular,s-msg-500-regular,s-msg-2000-regular,s-raf-2000-regular" data-names="60 messages/s · draw() per message,500/s · draw() per message,2000/s · draw() per message,2000/s · one draw() per frame" data-head="regular-table, local data, not scrolling" data-cols="ticks.messages|messages,app.data listener.n|data-listener calls,main.layouts|layouts,main.forcedLayouts|forced,threads.mainUtilPct|main thread busy|%" data-hi="s-msg-2000-regular:main.layouts,s-raf-2000-regular:main.layouts"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>With data that resolves at once, a draw never outlives its task, so no caller ever finds the map occupied. The lock is idle and the page draws per message until the main thread is the limit. At 60 messages a second a frame lays out between two draws and the read is free; from 500 a second on, most draws force a layout. The last row is the same stream with the lab calling <code>draw()</code> once per animation frame: the rate limit that the lock is not.</p>
+    <p>To see the lock work, a draw must be suspended across tasks. <code>a-lock-regular</code> does that: data over a 30 ms backend, 500 <code>draw()</code> calls a second, and a wheel scroll, so that draws need rows that are not cached.</p>
+  </div></div>
+  <div class="tracelink" data-trace="a-lock-regular">The scroll is two gestures of about a second with a gap of about 70 ms between them (<code>GestureScrollEnd</code> at 992 ms).</div>
+  <div class="lanes" data-lanes='{"traces":["a-lock-regular"],"titles":["500 draw() calls a second, 30 ms backend, around the gap between the two gestures (a-lock-regular)"],"from":955,"to":1118,"rows":["inputs","main","app","backendQuery"],"pins":[[1,978,"app",0],[2,1012,"backendQuery",0],[3,1045,"backendQuery",0],[4,1074,"app",0],[5,1096,"backendQuery",0]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The first gesture is still running. The short marks every 2 ms are the lab's <code>tick apply</code> spans, each a <code>draw()</code> call. None of them starts a draw.</li>
+    <li><i>2</i>The only draws are the scroll loop's: one backend query of 30 ms after another, each followed by a commit in the next frame. The long spans in the row above are the page's side of the same round trips.</li>
+    <li><i>3</i>1034 ms: the gesture has ended, the loop finds nothing dirty and lets go of the tag. Exactly one queued <code>draw()</code> runs. It begins with the <code>0, 0, 0, 0</code> dimension call and then waits 30 ms itself: the asynchronous path estimates its column extent and asks for one column more than the scroll path did (<code>x1</code> is 7 in its span, 6 in the loop's), which the lab's cache does not hold.</li>
+    <li><i>4</i>1065–1083 ms: nothing is in flight, and every message gets its own draw again (two short listener spans per mark).</li>
+    <li><i>5</i>The second gesture needs uncached rows: a draw is in flight again, and the calls queue.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Counted over the first gesture in this recording, from the first uncached row at 34 ms to the release at 1034 ms: <code>draw()</code> was called 498 times and there were 59 scroll events; 30 draws ran, all of them the scroll loop's; none of the 498 calls drew. At the release one did, and the rest returned. Over the whole trace: <b data-m="a-lock-regular/ticks.applies"></b> calls, <b data-m="a-lock-regular/ws.requests"></b> backend requests.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I had filed <code>throttle_tag</code> under "regular-table coalesces draw requests", and the name says throttle. Two thousand requests a second became two thousand draws a second. Then, with a slow backend and a scroll, 498 requests became zero draws for a second and then one. Both follow from lines 61–65: it is a mutex with a one-deep "someone will draw after this" queue, and how much it coalesces depends entirely on how long a draw stays suspended. <b>Rule: before relying on a library's "one in flight", ask what keeps a unit in flight. If the answer is "an await on my data", then fast data means no conflation, and frame alignment has to come from my side.</b></p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> <code>throttle_tag</code> serialises draws per element and lets one of the callers that queued during a draw run afterwards (read); with synchronous data it never engages (measured), with slow data it reduced 498 calls to one (measured, one recording).</p>
+    <p><b>No:</b> that the updates of that second were lost. The scroll loop's own draws call the listener each time and show current values. What waited was the <em>request</em>; a <code>draw()</code> issued for another reason, such as changed columns, would have waited as long. How stale the screen gets under streaming is <a href="streaming.html">Module 7</a>.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Two different things are easy to confuse here. <b>Data conflation</b> is automatic in a pull design: whoever draws next reads the latest values. <b>Notification coalescing</b>, turning many "something changed" signals into few draws, is not, and regular-table only provides it as a side effect of slow data. Proposal: Tablelab's publication pace should have an explicit coalescing point (a dirty flag consumed at most once per frame), independent of how fast the engine answers, and the view core should keep "one pull in flight" as a separate rule.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-msg-2000-regular tree 500 501.2 main 8</code>. Expected: three tasks, each <code>FunctionCall … socket.onmessage</code> followed by <code>RunMicrotasks</code> containing <code>Document::UpdateStyleAndLayout</code>. Then <code>node lab/harness/q.mjs a-lock-regular marks '"y0":0,"y1":0' 34 1034</code>: expected one entry, at about 1033.9 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">throttle_tag: one tagged operation per element; callers arriving during it wait, the first of them runs next, the rest return without drawing (utils.ts:57–76). draw() and the scroll loop share the tag.</li>
+    <li data-kind="measured">With in-page data every draw() call ran a full draw: about two listener calls and one forced layout per message at 2,000 messages a second (s-msg-2000-regular).</li>
+    <li data-kind="measured">With a 30 ms backend and a scroll in progress, 498 draw() calls in one second produced no draw of their own until the scroll loop released the tag, then exactly one (a-lock-regular).</li>
+    <li data-kind="rejected">"throttle_tag limits the draw rate." It limits concurrency; the rate follows from how long a draw is suspended.</li>
+  </ul>
+  <p class="next" data-answer="flight"><b>Next question →</b> One job is left: the scroll position. How far does each design's scrollbar reach?</p>
+</section>
+
+<section class="step" data-part="C · regular-table: owns the table, pulls a rectangle" data-title="Scroll extent: a cap and a proportion" data-node="range extent">
+  <p class="holding"><span class="label">Question I hold</span><span>Two million rows of 24 px are 48,000,000 px. A browser does not lay out an element that tall. What does each design do about it?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read how regular-table sizes its scrolling panel and turns <code>scrollTop</code> into rows, then check both libraries with the two-million-row tables of step 5: after the mount, the thumb is dragged to the end of the track.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/scroll_panel.ts#L734-L739">src/ts/scroll_panel.ts:734–738, 861–873</a> · <a class="path" href="https://github.com/finos/regular-table/blob/v0.9.2/src/ts/constants.ts#L18">constants.ts:18</a>
+<pre><span class="n"> 18</span>export const BROWSER_MAX_HEIGHT = isFirefox ? 5000000 : <mark>10000000</mark>;
+<span class="n">738</span>        return Math.min(BROWSER_MAX_HEIGHT, nrows * row_height + header_height);   <span class="c">// the scroll panel</span>
+<span class="n">861</span>        const panel_height = Math.round(this._virtual_panel_height(nrows));
+<span class="n">862</span>        const total_scroll_height = Math.max(1, panel_height - containerHeight);
+<span class="n">864</span>        const percent_scroll =
+<span class="n">865</span>            Math.max(Math.ceil(scroll_top), 0) / total_scroll_height;
+<span class="n">867</span>        const clip_panel_row_height = height / row_height - header_levels;
+<span class="n">869</span>        const scrollable_rows = Math.max(
+<span class="n">871</span>            relative_nrows - clip_panel_row_height,
+<span class="n">873</span>        <mark>const start_row = scrollable_rows * percent_scroll;</mark>   <span class="c">// fraction scrolled × rows</span></pre>
+      <p>There is one formula for every table size. Below the cap the two factors cancel to <code>scrollTop ÷ row_height</code>. For this table: panel = min(10,000,000, 2,000,000 × 24 + 24) = 10,000,000 px; scrollable height = 10,000,000 − 312 = 9,999,688 px; rows that fit = 312 ÷ 24 − 1 = 12; so <code>start_row</code> = 1,999,988 × scrollTop ÷ 9,999,688. One pixel of scrolling is 0.2 rows, and the end of the track is row 1,999,988.</p>
+      <a class="path" href="https://github.com/TanStack/virtual/blob/%40tanstack/virtual-core%403.19.11/packages/virtual-core/src/index.ts#L2601-L2602">virtual-core index.ts:2601–2602</a>
+<pre><span class="n">2601</span>  getTotalSize = () =&gt;
+<span class="n">2602</span>    Math.max(this._getLayoutTotalSize() - this._holdOffset, 0)   <span class="c">// the raw sum: no cap, no mapping</span></pre>
+      <p>You put that number on a sizer element (<code>tanstack.ts:45</code> computes the same product directly). The range math then works in true pixels, and can only see offsets the element can actually scroll to.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Scroll extent</dt><dd>The height the scroller pretends to have. Browsers limit an element's laid-out size; beyond the limit the element is simply shorter than asked.</dd>
+      <dt>Proportional mapping</dt><dd>Treat the scrollbar as a fraction between 0 and 1 and multiply by the row count, instead of treating it as a pixel position in a real document.</dd>
+    </dl></div>
+  </div>
+  <div class="tracelink" data-trace="a-big-tanstack">The drag runs from about 1.8 s to 2.5 s after the reload.</div>
+  <div class="lanes" data-lanes='{"traces":["a-big-tanstack","a-big-regular"],"titles":["TanStack Virtual, 2,000,000 rows: drag to the end (a-big-tanstack)","regular-table, 2,000,000 rows: drag to the end (a-big-regular)"],"from":1780,"to":2620,"rows":["inputs","main","app"],"axis":"ms after the reload","pins":[[1,2447,"app",0],[2,2448.8,"app",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>TanStack, thumb at the end of the track: the last render lists rows 1,398,086 to 1,398,101. The scroller has moved <b data-m="a-big-tanstack/content.scrolledPx"></b> px and can go no further.</li>
+    <li><i>2</i>regular-table, same drag: the last data request is for rows 1,999,988 to 1,999,999, the end of the table, as computed above.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>In Chrome 154 the 48,000,000 px sizer is laid out 33,554,428 px tall (read from the page's geometry in a separate, untraced run of the same URL). 33,554,120 ÷ 24 is row 1,398,088: the last 600,000 rows cannot be scrolled to with TanStack's arithmetic, and nothing in the library notices. regular-table reaches the last row at any size, and pays with resolution: each pixel is 0.2 rows here, and in a table a thousand times larger it would be 200 rows.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> regular-table owns the scroll extent (a capped panel and a proportional map); TanStack Virtual leaves it to you and to the browser's limit (read; both ends measured).</p>
+    <p><b>No:</b> what scrolling feels like when one pixel is hundreds of rows; <a href="showcases.html">Module 10</a> traces regular-table's own two-billion-row example. And the browser limit is an observation of this Chrome build, not a constant I read in its source.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Both designs keep the position in the browser's scroller, in pixels, and differ in who bridges pixels and rows. Tablelab's view core keeps the position as a row, so the scrollbar is a presentation of <code>row0 ÷ rows</code>, the limit never applies and one wheel step is always a chosen number of rows. This step is the cost side of the two alternatives to that decision.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs a-big-regular marks 'data listener' 2300 3500</code>: expected, the last entry has <code>"y0":1999988,"y1":2000000</code>. <code>node lab/harness/q.mjs a-big-tanstack marks draw 2300 3500</code>: expected <code>"first":1398086</code>. Or open <code>http://127.0.0.1:5199/grid.html?lib=tanstack&amp;rows=2000000</code>, drag the thumb to the end and read <code>scrollTop</code> in the line under the table: expected about 33,554,000, not 47,999,712.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">regular-table caps its scroll panel at 10,000,000 px and maps scrollTop to rows proportionally at every size (scroll_panel.ts:738, 861–873; constants.ts:18). virtual-core has no cap and no mapping (index.ts:2601–2602).</li>
+    <li data-kind="measured">2,000,000 rows of 24 px: regular-table's last request ends at row 2,000,000; TanStack's scroller stops at 33,554,120 px, row 1,398,088 (a-big-regular, a-big-tanstack).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Perspective uses regular-table for its grid. What does it put behind the data listener?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · Perspective: an engine behind the listener" data-title="The same loop, with two round trips inside" data-node="data engine dom">
+  <p class="holding"><span class="label">Question I hold</span><span>Perspective's datagrid is a regular-table. What does one call of its data listener cost, and is the draw loop still the one from steps 8 to 12?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the datagrid plugin's data listener, then look at one scroll frame of <code>x-scroll-remote</code>, where the table lives in a Node server and the trace shows the server's side of every request.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/packages/viewer-datagrid/src/ts/data_listener/index.ts#L117-L126">packages/viewer-datagrid/src/ts/data_listener/index.ts:117–126</a>
+<pre><span class="n">117</span>            const [x, z] = await <mark>Promise.all([</mark>
+<span class="n">118</span>                this._view.to_columns_string({     <span class="c">// request 1: the window's cells</span>
+<span class="n">122</span>                this._view.num_columns(),          <span class="c">// request 2: the view's dimensions</span>
+<span class="n">126</span>            columns = <mark>JSON.parse(x as string)</mark> as ColumnData;   <span class="c">// on the main thread</span></pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-client/perspective.proto#L535-L544">rust/perspective-client/perspective.proto:542–544</a>
+<pre><span class="n">542</span>message ViewToColumnsStringResp {
+<span class="n">543</span>    string json_string = 1;                        <span class="c">// the protobuf reply carries one JSON string</span></pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/packages/viewer-datagrid/src/ts/data_listener/format_cell.ts#L69-L70">data_listener/format_cell.ts:69–70</a>
+<pre><span class="n">69</span>        const formatter = FORMAT_CACHE.get(type, plugin);
+<span class="n">70</span>        return formatter ? <mark>formatter.format(val)</mark> : String(val);   <span class="c">// Intl, per visible cell per draw</span></pre>
+      <p>The layers, from the notes on Perspective 5.9.2 that <a href="perspective.html">Module 9</a> builds on: the viewer (Rust compiled to WebAssembly) and the client that encodes requests run on the main thread; the engine runs in a Web Worker or in a server; the datagrid plugin is plain TypeScript around a <code>&lt;regular-table&gt;</code> in its shadow root (<code>plugin/activate.ts:73</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Round trip</dt><dd>A request to another thread or machine and its reply. Each costs at least a hop there, the work, and a hop back, and the reply arrives as a new task.</dd>
+      <dt>Formatted on the client</dt><dd>The engine returns raw values; text for the cells is made on the main thread, per cell, per draw.</dd>
+    </dl></div>
+  </div>
+  <div class="tracelink" data-trace="x-scroll-remote">Process <code>Backend (node)</code>, thread <code>perspective session</code>: <code>handle_request</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["x-scroll-remote"],"from":299.5,"to":320.5,"rows":["main","psp"],"pins":[[1,300.9,"main.js",0],[2,301.5,"main.js",0],[3,302.15,"psp",0],[4,302.4,"psp",0],[5,317.6,"main.js",0]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The <code>scroll</code> event with regular-table's <code>_on_scroll</code>: the same function as in step 8.</li>
+    <li><i>2</i><code>Animation frame fired</code>: a commit, and after it the loop's next plan and data call.</li>
+    <li><i>3</i>The server handles the first request of that call and <span class="cp">4</span> the second, 0.2 ms apart: two per data call.</li>
+    <li><i>5</i>The next frame commits what those two returned.</li>
+  </ol>
+  <table class="mtable" data-rows="x-scroll-worker,x-scroll-remote,x-scroll-remote-lat50" data-names="engine in a Web Worker,engine in a Node server,the same server 50 ms away" data-head="Perspective datagrid, wheel scroll" data-cols="main.scrollEvents|scroll events,marks.psp draw|draws,main.rafCallbacks|animation-frame commits,main.scriptMs|main-thread script|ms,threads.workerBusyMs|worker busy|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>regular-table's names are in the profile unchanged: <code>_on_scroll</code>, <code>predraw</code>, <code>Object.assign.inline</code>, <code>draw_sync</code>, <code>_draw_td</code>. The loop is the one we read. What changed is the await at <code>scroll_panel.ts:276</code>: it now always crosses a thread or a socket, twice, so the answer comes back in a later task, and the commit is for the position of the frame before. With 50 ms each way the third row shows step 11's arithmetic: one draw per round trip plus a frame, about one for every six scroll events.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a Perspective datagrid draw is regular-table's draw with two engine requests per data call, a JSON string inside a protobuf message, parsed and formatted on the main thread (read); the server-side pair is visible per frame (measured: 242 <code>handle_request</code> spans for 121 draws in this recording).</p>
+    <p><b>No:</b> where the time goes inside those requests, in the worker or on the wire. That is the traced walk of <a href="perspective.html">Module 9</a>.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-scroll-remote slices handle_request 299 320</code>. Expected: four spans in two pairs, each pair a longer one (the cells) followed by a shorter one.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">Perspective's datagrid data listener issues two engine requests per call (to_columns_string and num_columns), receives the cells as a JSON string inside a protobuf reply, parses it and formats each cell with Intl on the main thread (data_listener/index.ts:117–126, format_cell.ts:69–70, perspective.proto:542–544).</li>
+    <li data-kind="measured">Scrolling a Perspective grid runs regular-table's own scroll loop: one animation-frame commit per draw, two server requests per draw, one draw per round trip when the server is 50 ms away (x-scroll-remote, x-scroll-remote-lat50).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> And when data changes without a scroll: whose lock decides how often Perspective draws?</p>
+</section>
+
+<section class="step" data-part="D · Perspective: an engine behind the listener" data-title="A second lock, for updates" data-node="lock engine dom">
+  <p class="holding"><span class="label">Question I hold</span><span>Step 12 showed that regular-table's lock does not bound the draw rate. Perspective sits above it. What does Perspective add for updates?</span></p>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/utils/debounce.rs#L103-L110">rust/perspective-viewer/src/rust/utils/debounce.rs:103–110</a>
+<pre><span class="n">103</span>/// An async `Mutex` type specialized for Perspective's rendering, which
+<span class="n">104</span>/// debounces calls in addition to providing exclusivity. …
+<span class="n">108</span>/// … <mark>At most TWO debounce evaluations are ever outstanding (one</mark>
+<span class="n">109</span>/// <mark>running, one parked)</mark>; every additional concurrent caller resolves
+<span class="n">110</span>/// without queueing on the lock.</pre>
+      <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/renderer/dispatch.rs#L480-L487">renderer/dispatch.rs:485–487</a> · <a class="path" href="https://github.com/perspective-dev/perspective/blob/v5.9.2/rust/perspective-viewer/src/rust/renderer/render_timer.rs#L110-L122">render_timer.rs:115–118, 146–149</a>
+<pre><span class="n">485</span>        self.draw_lock()
+<span class="n">486</span>            .debounce_with(|guard| async move {
+<span class="n">487</span>                <mark>set_timeout(timer.get_throttle()).await?;</mark>   <span class="c">// wait before every update draw</span>
+<span class="n">115</span>                if state.render_times.len() &lt; 5 {
+<span class="n">116</span>                    0_i32
+<span class="n">118</span>                    f64::min(5000_f64, state.virtual_fps()) as i32   <span class="c">// the mean of the last render times, ms (146–149)</span></pre>
+      <p>The viewer's lock is the same idea as <code>throttle_tag</code> (one running, one waiting, the rest return), one layer up, plus a timer: before each update draw it sleeps for the mean duration of the last five draws. A scroll does not pass through it: the plugin registers no scroll listener of its own, so scrolling is regular-table's loop from step 14.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Adaptive throttle</dt><dd>A pause sized by how long recent work took: with a pause equal to the mean draw time, drawing takes at most about half of the time. It bounds the load, not the alignment with frames.</dd>
+    </dl></div>
+  </div>
+  <table class="mtable" data-rows="x-stream-worker-100,x-stream-worker-1000,x-stream-remote-1000,x-stream-remote-lat50" data-names="100 updates/s · engine in a worker,1000 updates/s · engine in a worker,1000 updates/s · engine in a server,100 updates/s · server 50 ms away" data-head="Perspective datagrid, about 2 s of updates, no scroll" data-cols="marks.psp draw|draws,main.rafCallbacks|animation-frame callbacks,main.layouts|layouts,threads.mainUtilPct|main thread busy|%"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>At 100 updates a second every update is drawn. At 1,000 a second the viewer's lock conflates them to a few hundred draws a second: fewer than the updates, and still several per displayed frame. None of the draws is in an animation-frame callback, and each has its own layout: update draws call regular-table's asynchronous <code>draw()</code> (<code>custom_elements/datagrid.ts:262</code>), the pipeline of step 9, not the scroll path. With the server 50 ms away, draws are spaced by round trips.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> Perspective bounds update draws with its own lock and timer above regular-table's (read), and in these recordings that bound is "as fast as draws complete, with equal pauses", not the display's frame rate (measured).</p>
+    <p><b>No:</b> anything about data age or about what the engine does per update; <a href="perspective.html">Module 9</a> follows one update through every layer.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs x-stream-worker-1000 marks 'psp draw' 1000 1100</code>. Expected: about 25 marks in 100 ms, where the display showed six frames.</div>
+  <ul class="add" hidden>
+    <li data-kind="read">Perspective's viewer serialises update draws with a debounce mutex (one running, one parked) and sleeps for the mean of the last five draw times before each (debounce.rs:103–110, dispatch.rs:485–487, render_timer.rs:115–118). Scrolling bypasses it.</li>
+    <li data-kind="measured">1,000 updates a second became a few hundred draws a second, none in an animation frame (x-stream-worker-1000, x-stream-remote-1000).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Put the three designs in one table. Who owns what?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · Side by side" data-title="Who owns what" data-node="event range yours data dom layout frame lock sizes extent engine">
+  <p class="holding"><span class="label">Question I hold</span><span>For each job and each time question from step 1: which design owns it, and which step showed it?</span></p>
+  <div class="scroll"><table>
+    <tr><th></th><th>TanStack Virtual 3.19.11</th><th>regular-table 0.9.2</th><th>Perspective 5.9.2 datagrid</th></tr>
+    <tr><td><b>Who owns the DOM</b></td><td>You: scroller, sizer, every row and cell. The library holds numbers. <small>(2, 6)</small></td><td>The library: scroller, panel, <code>&lt;table&gt;</code>, every cell, by screen position. You supply values and may restyle. <small>(8, 10)</small></td><td>regular-table, inside the plugin's shadow root; the plugin adds style passes. <small>(14)</small></td></tr>
+    <tr><td><b>When your code runs</b></td><td><code>onChange</code>, synchronously inside the scroll listener, when the first or last visible index or <code>isScrolling</code> changes. <small>(2, 3)</small></td><td>Data listener: called in the scroll event (microtasks) if no draw is in flight, otherwise after the one in flight commits. Style listener: inside the commit. <small>(8, 11)</small></td><td>Your code is a view configuration; the plugin's listener runs where regular-table's would. <small>(14)</small></td></tr>
+    <tr><td><b>Sync or async</b></td><td>Sync. React: <code>flushSync</code> while scrolling. <small>(7)</small></td><td>Async by construction: await data, await a frame, commit synchronously. Fallback: await data, write at once. <small>(8, 9)</small></td><td>Async, and the await always crosses a thread or a socket, twice per data call. <small>(14)</small></td></tr>
+    <tr><td><b>What is rewritten per step</b></td><td>Whatever your render does. Keyed: entering rows only. On a column change, in our render: every row. <small>(3, 6)</small></td><td>Every visible cell is visited; text where it differs (all of it after a first-row change); four inherited custom properties, so the whole table is restyled. <small>(10)</small></td><td>The same, plus per-cell <code>Intl</code> formatting of the fetched window on the main thread. <small>(14)</small></td></tr>
+    <tr><td><b>What the screen shows while late</b></td><td>The browser scrolls the rows that exist; beyond the overscan there is empty sizer. Late data is yours to show (placeholders). <small>(4)</small></td><td>The previous rows, held in place by a sticky table, then each fetched viewport in turn, even a superseded one. No blank area. <small>(11)</small></td><td>As regular-table, one commit per round trip. <small>(14)</small></td></tr>
+    <tr><td><b>Data-request policy</b></td><td>None. It reports a range; asking is yours. <small>(2)</small></td><td>Pull by rectangle, exactly the visible rows; one in flight, newest position next, nothing cancelled; no call when the integer viewport is unchanged. <small>(3, 11)</small></td><td>The same loop; each pull is two engine requests, no cell cache in the client. <small>(14)</small></td></tr>
+    <tr><td><b>Measurement policy</b></td><td>A start and size for all N rows from <code>estimateSize</code>, built eagerly; optional per-row measurement. <small>(5)</small></td><td>One row height, probed once. Column widths measured from the DOM at first sight and cached; unmeasured means the cold path. <small>(9)</small></td><td>regular-table's. <small>(14)</small></td></tr>
+    <tr><td><b>Scroll-extent strategy</b></td><td>Raw total in pixels on your sizer; the browser's limit applies. <small>(13)</small></td><td>Panel capped at 10,000,000 px; proportional mapping at every size. <small>(13)</small></td><td>regular-table's.</td></tr>
+    <tr><td><b>Update path</b> (data changed, no scroll)</td><td>Not the library's business: patch your elements or render again. A changed <code>count</code> rebuilds all N positions. <small>(5)</small></td><td>You call <code>draw()</code>: the asynchronous pipeline, a dimension call plus the window, every cell visited, outside the animation frame; serialised by <code>throttle_tag</code>, rate-limited by nothing. <small>(12)</small></td><td>The viewer's lock and adaptive timer, then <code>draw()</code> as left. <small>(15)</small></td></tr>
+    <tr><td><b>Layout reads on the scroll path</b></td><td><code>scrollTop</code>, <code>scrollHeight</code>, <code>clientHeight</code> per listener per event; forced if another listener wrote first. <small>(2, 6)</small></td><td>Five, at the start of the scroll event; none in the commit when warm; one per unmeasured column when cold. <small>(8, 9)</small></td><td>regular-table's, plus the plugin's style listeners.</td></tr>
+  </table></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Read down a column and each design is one decision carried through. TanStack Virtual decided to own only arithmetic; the price is that everything that can go wrong in time (order of reads and writes, how many renders per frame, what to request and when) is yours, and the library cannot protect you from composing it badly (step 6). regular-table decided to own the table; in exchange for control over elements you get a draw loop with a request policy, a lock and a frame-aligned commit already in it, and you inherit its per-draw costs and its two pipelines. Perspective moves the data listener's far side into an engine and adds one more lock.</p>
+    <p>Read across a row and you have the questions to ask of any fourth design, including ours.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> each cell of the table is tied to a source line and, where a trace could show it, to a trace, in the step named.</p>
+    <p><b>No:</b> which design is faster. The traces here were chosen to make mechanisms visible, each recorded once, in a headless browser with software rendering. Costs per frame are the business of Modules 2, 4 and 5.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Tablelab's split (a view core that owns range, position and window; painters that own elements) sits between the two columns. Proposal: write this table's rows as the contract between view core and painter, one sentence each, before the DOM painter is rebuilt: when the painter's code runs relative to input, what is in flight at most, what a commit rewrites, what is shown while late, who reads layout and when.</p></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">TanStack Virtual owns range arithmetic and nothing in time; regular-table owns the table, a request policy, a lock and a frame-aligned commit; Perspective adds an engine behind the listener and a second lock for updates.</li>
+  </ul>
+  <p class="next" data-answer="owns"><b>Next question →</b> Can you predict each design under a load you have not seen traced in this order?</p>
+</section>
+
+<section class="step" data-part="E · Side by side" data-title="Predict five loads" data-node="event range yours data dom layout lock extent">
+  <p class="holding"><span class="label">Question I hold</span><span>Given a load, what will each design do? Answer from the ownership table before opening the answer; each answer names the trace that shows it.</span></p>
+  <div class="exercise"><span class="label">Self-check</span>
+    <p><b>1.</b> A wheel scroll at 10 px per frame; rows are 24 px; the viewport is not a whole number of rows high. For TanStack with a keyed render, and for regular-table: in what fraction of frames does each do work, and how much?</p>
+    <details><summary>Answer</summary><p>Both act when either edge of the viewport crosses a row boundary: about three frames in four, not two in five. TanStack calls your render then; with a keyed render half of those renders write nothing (a row left) and the other half write one row. regular-table asks for the whole rectangle each time and visits every cell; when the bottom edge crossed it writes one row's text, when the top edge crossed it rewrites every cell. And in every scrolled frame, drawn or not, it restyles the whole table because of the offset properties. Traces: <code>j-speed-600-keyed</code>, <code>j-speed-600-regular</code> (steps 3 and 10).</p></details>
+    <p><b>2.</b> The thumb is dragged across the table; the backend needs 40 ms per window and serves one at a time. What does each design request, and what is on screen during the drag?</p>
+    <details><summary>Answer</summary><p>TanStack requests nothing: it calls your render for every scroll event, synchronously, and what to ask and what to show meanwhile (placeholders, old rows) is your policy; ask for every range and the backend's queue grows. regular-table has one request in flight; scroll events during it only set a flag; each reply is committed in full on the next frame although the thumb has moved on, then the newest position is requested. The screen always shows complete rows, one cycle old, never blank. Perspective over a remote server does the same with two requests per cycle. Traces: <code>b-drag-regular</code> (step 11), the <code>b-drag-…-tanstack</code> set in <a href="backend.html">Module 6</a>, <code>x-scroll-remote-lat50</code> (step 14).</p></details>
+    <p><b>3.</b> 2,000 single-cell updates a second arrive; the table is not scrolling and its data is in the page. You call the library's update path once per message. What runs?</p>
+    <details><summary>Answer</summary><p>TanStack has no update path; you patch one cell, and the cost is yours alone. regular-table's path is <code>draw()</code>: each call runs a complete asynchronous draw inside the message's task (a dimension call and a window call to your listener, every visible cell visited, a forced layout at its first read), 2,000 times a second, because no draw is ever still in flight when the next call comes. Nothing is frame-aligned until you call <code>draw()</code> from an animation-frame callback yourself. Perspective puts its own lock and adaptive pause in front and ends at a few hundred draws a second. Traces: <code>s-msg-2000-regular</code>, <code>s-raf-2000-regular</code> (step 12), <code>x-stream-worker-1000</code> (step 15); the TanStack counterpart is in <a href="streaming.html">Module 7</a>.</p></details>
+    <p><b>4.</b> A diagonal wheel scroll over a table of 100 columns, the grid built from a row virtualizer and a column virtualizer; and the same scroll in regular-table.</p>
+    <details><summary>Answer</summary><p>TanStack: two listeners per scroll event. The row one renders; the column one then reads <code>scrollLeft</code>, which forces a layout of what was just written; in frames where the column range also changes it notifies as well, so the render runs twice and the frame has two layouts, the first render having used the old column range. regular-table: one plan and one draw per frame; while the columns in view have been measured the commit is in the animation frame as usual, and each time a never-measured column comes into view that event's draw goes inline: written inside the scroll event, with a forced layout at the width read. Traces: <code>a-diag-tanstack</code> (step 6), <code>a-diag-regular</code> (step 9).</p></details>
+    <p><b>5.</b> The table has 2,000,000 rows of 24 px. What happens at mount, and what when the user presses End?</p>
+    <details><summary>Answer</summary><p>TanStack: at mount a loop over all rows fills a <code>Float64Array</code> (about 11 ms and 32 MB here), and again whenever the row count changes. The sizer you size to 48,000,000 px is laid out about 33,554,000 px tall by the browser, so End stops near row 1,398,000 and the rest cannot be reached by scrolling. regular-table: nothing per row at mount; a panel capped at 10,000,000 px and a proportional map, so End is the last row and one pixel is 0.2 rows. Traces: <code>a-big-tanstack</code>, <code>a-big-regular</code> (steps 5 and 13).</p></details>
+    <p><b>6.</b> Without scrolling back: name the two pipelines of regular-table, what selects each, and one way to tell them apart in a trace.</p>
+    <details><summary>Answer</summary><p>The plan-then-commit path (<code>predraw</code>, await data, await a frame, <code>draw_sync</code>) runs for a scroll when the row height and the needed column widths are cached. The asynchronous path (<code>internal_draw</code> → <code>table_model.draw</code>) runs for every <code>draw()</code> call and for a scroll that finds a size missing. In a trace: the first writes under <code>Animation frame fired</code> with one unforced layout after it; the second writes under <code>Run microtasks</code> inside the scroll event or the calling task, has no animation-frame callback, and shows forced layouts under <code>internal_draw</code> and <code>_render_pass</code> (steps 8 and 9).</p></details>
+    <p><b>7.</b> A profile shows <code>memoizedFunction</code>, <code>Virtualizer.maybeNotify.memo.key</code> and <code>Object.assign.inline</code>. What is each, and how would you make sure?</p>
+    <details><summary>Answer</summary><p>The shared wrapper of all of virtual-core's memos; the function that calls <code>notify</code> when the visible range changed; regular-table's commit closure. The last two names were invented by V8 from nearby code. Make sure by the file and line the profile gives, read against the source at the version you run (steps 2 and 8).</p></details>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> if these seven came easily, you can read a virtualizer's source for the questions that decide its behaviour under load: where it reads layout, where it awaits, what it keeps in flight, what it rewrites, how far it scrolls.</p>
+    <p><b>No:</b> that the predictions replace traces. Three of the seven needed a trace to correct the reading of the source: the two-edge notification rate, the forcing read, and the lock that did not coalesce.</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Five questions carry over to any virtualizer: where it reads layout, where it awaits, what it keeps in flight, what it rewrites per step, how far its scrollbar reaches.</li>
+  </ul>
+  <p class="next"><b>Next →</b> <a href="javascript.html">Module 4</a> prices the JavaScript in these loops per frame; <a href="rendering.html">Module 5</a> does the same for style, layout and paint; <a href="perspective.html">Module 9</a> walks Perspective end to end.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>

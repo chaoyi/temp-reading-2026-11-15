@@ -1,0 +1,923 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One trace, two processes · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">6 · One trace, two processes</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="send">page: send</span><span class="sep">→</span><span data-node="netsvc">network service</span><span class="sep">→</span>
+    <span data-node="recv">backend: receive</span><span class="sep">→</span><span data-node="queue">queue</span><span class="sep">→</span>
+    <span data-node="service">service</span><span class="sep">→</span><span data-node="reply">reply</span><span class="sep">→</span>
+    <span data-node="task">main-thread task</span><span class="sep">→</span><span data-node="js">onmessage, our code</span><span class="sep">→</span>
+    <span data-node="dom">DOM</span><span class="sep">→</span><span data-node="frame">frame</span>
+    <span class="sep">·</span><span data-node="policy">request policy</span>
+    <span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 6 · recorded 2026-11-16</p>
+  <h1>The rows come from another process. Where does a request spend its time, and what happens when I ask faster than it can answer?</h1>
+  <p class="lede">The table's rows now come from a backend over a WebSocket. The backend writes its own trace events on the clock Chrome uses, and the harness puts them into the same file: one trace, two programs, one time axis. This module follows a single request through three processes and six threads, then drags a scrollbar against a backend that serves one 40 ms query at a time and watches the line grow under three request policies.</p>
+  <p><b>What you will be able to do.</b> Read a trace that holds the browser and a backend; name each hop of a WebSocket round trip and say whether it is work or waiting; and reason about a request policy as a queue: arrival rate × service time, how long the line gets, how stale the screen is.</p>
+  <p><b>Why this matters for Tablelab.</b> The engine will sit behind a WebSocket or IPC transport. The design says "one pull in flight" and "report data age, not throughput". These traces show, with numbers, what each of those buys and what a plausible-looking alternative (ask for everything, cancel what you no longer need) does instead.</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>), steps 27–31, for the WebSocket source and the two libraries. Frame outcomes are Module 2's (<a href="frames.html">frames.html</a>); here a frame is only the last hop. The traces are in <code>traces/</code>; each step links the one it reads.</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57, device scale factor 1.75, one traced run per scenario. Browser and backend ran on one machine over loopback: the transport times here are a floor, not a network. These traces hold no screenshots (the recording wrote no <code>Screenshot</code> events), so "what is on screen" is read from the page's own marks: the <code>filled</code> flag of each <code>app: draw</code> and the ◆ mark set when every visible row shows its data. Timestamps in the text are from this recording; bold numbers are read from the data and follow a re-recording.</p>
+  <div class="foot"><button class="primary" data-start>Start: 16 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · Two processes on one clock" data-title="A trace with a second program in it" data-node="recv service method"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>A Chrome trace records Chrome. How did a Node backend get into this file, and what exactly did it write down?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I open <code>b-click-ws-tanstack</code>: one click on the scrollbar track, rows from a backend whose query takes 5 ms. Below Chrome's processes there is one more, <b>Backend (node)</b>, with two tracks and a counter. I print its first events as they are in the file:</p>
+  </div></div>
+  <div class="tracelink" data-trace="b-click-ws-tanstack">In Perfetto, scroll to the last process, <code>Backend (node)</code>; pin its two tracks next to <code>CrRendererMain</code> of the Renderer.</div>
+<pre class="wrap"><span class="cp">1</span>{"ph":"M","name":"process_name","pid":1704645,"tid":0,"args":{"name":"Backend (node)"}}
+   {"ph":"M","name":"thread_name","pid":1704645,"tid":1,"args":{"name":"ws io (recv/send)"}}
+   {"ph":"M","name":"thread_name","pid":1704645,"tid":2,"args":{"name":"query service"}}
+<span class="cp">2</span>{"ph":"i","s":"t","cat":"backend","name":"recv #2","pid":1704645,"tid":1,"ts":260796786568,"args":{"y0":13,"y1":14,"queued":0,"busy":0}}
+<span class="cp">3</span>{"ph":"X","cat":"backend","name":"query #2","pid":1704645,"tid":2,"ts":260796786590,"dur":5183,"args":{"y0":13,"y1":14,"waitedMs":0.022,"serviceMs":5}}
+<span class="cp">4</span>{"ph":"C","cat":"backend","name":"rows queue (conn 1)","pid":1704645,"ts":260796786607,"args":{"value":0}}</pre>
+  <ol class="pins">
+    <li><i>1</i><b>Metadata</b>: a process name and two "thread" names. Node runs this backend on one thread; <code>tid</code> 1 and 2 are <em>labels</em> chosen so that a viewer draws two lanes.</li>
+    <li><i>2</i><b>An instant</b> written inside the WebSocket <code>message</code> handler: request #2 was seen, nothing queued, no query running.</li>
+    <li><i>3</i><b>A span</b>: the query's service interval, from the moment a server was free until the reply text was ready; <code>waitedMs</code> is how long the request stood in line before that.</li>
+    <li><i>4</i><b>A counter</b>: the queue length after each change. Perfetto draws it as a step chart.</li>
+  </ol>
+  <div class="lanes" data-lanes='{"traces":["b-click-ws-tanstack"],"from":50,"to":95,"rows":["mainFrames","main","app","backendIo","backendQuery"],"pins":[[1,56.3,"app"],[2,56.54,"backendIo"],[3,59,"backendQuery"],[4,61.75,"backendIo"],[5,62,"main"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The page's own span <code>app: ws round trip #5</code> and its request tick, on the Renderer's main thread.</li>
+    <li><i>2</i><code>recv #5</code> in the backend, 0.24 ms later.</li>
+    <li><i>3</i><code>query #5</code>: 5.2 ms. Nothing computes here; the lab models a query with a timer.</li>
+    <li><i>4</i><code>send #5</code>.</li>
+    <li><i>5</i>Back in the Renderer: the task that runs <code>socket.onmessage</code>.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The backend's events are ordinary trace events with their own <code>pid</code>. Their <code>ts</code> values are in the same range as Chrome's (260,796,… million microseconds), so a viewer needs no alignment step: it sorts them onto the same axis.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/server/spans.mjs:7, 33–34, 41–42 · lab/harness/record.mjs:72, 147, 153</span>
+      <p>The whole technique is thirty lines: timestamp with the clock Chrome uses, keep events in the Chrome JSON trace-event format, append them to the trace.</p>
+<pre><span class="n"> 7</span>  export const nowUs = () => Number(<mark>process.hrtime.bigint() / 1000n</mark>);
+<span class="n">33</span>  export function span(track, name, startUs, durUs, args) {
+<span class="n">34</span>    push({ ph: "X", cat, name, pid, tid: TRACKS[track][0], ts: startUs, dur: Math.max(1, durUs), args });
+<span class="n">41</span>  export function counter(name, value, ts = nowUs()) {
+<span class="n">42</span>    push({ ph: "C", cat, name, pid, ts, args: { value } });
+
+<span class="c">// record.mjs</span>
+<span class="n"> 72</span>  await srv.spans(); <span class="c">// drop backend events from before the trace</span>
+<span class="n">147</span>  const spans = await srv.spans();
+<span class="n">153</span>  if (spans.events.length > 12) <mark>trace.traceEvents.push(...spans.events);</mark></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>The trace-event format is open</dt><dd>Any program can write <code>{name, ph, ts, pid, tid}</code> records. A viewer does not ask who wrote them. This works for a Rust engine as well as for Node.</dd>
+      <dt>A track is not a thread</dt><dd>Chrome's rows are real threads. The backend's two rows are one thread, split by topic. Two backend spans that overlap in time did not run in parallel; one of them is a timer waiting.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> when the backend's JavaScript saw each request, how long each stood in line, when each query's timer fired, when <code>send</code> was called.</p>
+    <p><b>No:</b> anything the backend did not report. There is no event for the kernel handing bytes to Node, for Node's WebSocket library parsing the frame, or for garbage collection in Node. Between Chrome's last event and <code>recv</code> the trace is blank on both sides.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-click-ws-tanstack threads</code> lists every process and thread with its event count. Expected: 3,583 events on <code>Renderer / CrRendererMain</code>, and three lines for <code>Backend (node)</code> with 18 events each (two tracks and the counter).</div>
+  <ul class="add" hidden>
+    <li data-kind="read">The backend timestamps its own events with process.hrtime in microseconds (spans.mjs:7) and the harness appends them to Chrome's trace (record.mjs:153): process "Backend (node)".</li>
+    <li data-kind="read">The backend's two "threads" are labels on one Node thread; its spans are intervals between callbacks, mostly a timer waiting.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Two programs stamped these events. Why should I believe that 56.30 ms in one and 56.54 ms in the other are 0.24 ms apart?</p>
+</section>
+
+<section class="step" data-part="A · Two processes on one clock" data-title="Do the two clocks agree?" data-node="method"
+  data-ask="clock|Can I subtract a time written by the backend from a time written by Chrome?">
+  <p class="holding"><span class="label">Question I hold</span><span>What would a wrong clock look like in this trace, and does this trace look like that?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>Suppose the backend's clock ran 1 ms ahead of Chrome's. What changes in the numbers?</p>
+    <div class="opts"><button data-k="a">Every round trip gets 1 ms longer.</button><button data-k="b">Nothing: only differences matter.</button><button data-k="c">"Up" (request → server receive) grows by 1 ms, "down" (server done → reply handled) shrinks by 1 ms, the round trip is unchanged.</button></div>
+    <div class="reveal"><p><b>Up grows, down shrinks.</b> The round trip is measured by the page alone, start and end on one clock, so an offset cannot touch it. The offset shows only in the two halves that cross the process boundary, with opposite signs. A reply "handled before the server finished it" (a negative down) is the signature of a clock problem.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three checks. <b>1.</b> Chrome says which clock its <code>ts</code> uses: the trace's metadata has <code>"clock-domain": "LINUX_CLOCK_MONOTONIC"</code>. <b>2.</b> On this machine I print Node's <code>process.hrtime</code> and <code>clock_gettime(CLOCK_MONOTONIC)</code> one after the other: 261,490.10 s and 261,490.16 s, the same count of seconds since boot, 0.06 s apart because the two commands started that far apart. <b>3.</b> The check that needs no trust in either statement: in every request of every trace, the server must receive after the page sent, and the page must handle the reply after the server finished it, both by a small, steady amount.</p>
+  </div></div>
+  <table class="mtable" data-rows="b-click-ws-tanstack,b-click-ws-regular,b-drag-every-tanstack,b-drag-inflight-tanstack,b-drag-regular,b-jitter-regular,b-scroll-ws-tanstack,b-scroll-ws-regular,b-wide-tanstack" data-head="Scenario" data-cols="ws.requests|requests,ws.upMs.p50|up: request → server receive p50|ms,ws.upMs.max|max|ms,ws.downMs.p50|down: server done → reply handled p50|ms,ws.downMs.max|max|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Over the 588 requests of the twelve shared <code>b-</code> traces, the smallest "up" is 0.076 ms and the smallest "down" 0.154 ms (computed from <code>data/*.js</code>). None is negative, and the medians sit between 0.1 and 0.4 ms in every scenario, whatever the service time. The maxima that stand out (2.6 ms down in <code>b-drag-every-tanstack</code>, 2.1 ms up in <code>b-wide-tanstack</code>) are single requests; step 6 shows what such a reply was waiting for.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/harness/analyze-lib.mjs:425–426</span>
+      <p>How "up" and "down" are derived. Both subtract across the process boundary, which is only legal on one clock:</p>
+<pre><span class="n">425</span>  upMs: quantiles(rt.filter((a) => a.d.srvRecv).map((a) => (<mark>a.d.srvRecv - a.ts</mark>) / 1000)),
+<span class="n">426</span>  downMs: quantiles(rt.filter((a) => a.d.srvDone).map((a) => (<mark>a.ts + a.dur - a.d.srvDone</mark>) / 1000)),</pre>
+      <p><code>a.ts</code> is the start of the page's <code>app: ws round trip</code> span in Chrome's trace; <code>srvRecv</code> and <code>srvDone</code> are the server's own timestamps, which it sends back in the reply (<code>lab/server/backend.mjs:56</code>) and the page stores in the span's detail.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Monotonic clock</dt><dd>A clock that only counts forward from an arbitrary start (here: boot). Every process on one machine reads the same one. It says nothing about wall time and nothing about another machine.</dd>
+      <dt>Causality as a test</dt><dd>A message cannot arrive before it was sent. If the cross-process differences are positive and small for every message, the clocks agree to within that small amount.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected Perfetto to draw an arrow from each request to its query and back: <code>record.mjs</code> has a function that adds flow events (<code>cat: "rpc"</code>) for that. There are none in these traces: <code>q.mjs b-click-ws-tanstack raw 'ws rpc' 1</code> prints nothing. The function looks up the end of the round trip under the key <code>e.name.slice(19)</code> (record.mjs:169), but <code>"app: ws round trip #"</code> is 20 characters long, so the key is <code>"#5"</code>, never matches <code>"5"</code>, and line 174 skips every request. The rule I keep: before I rely on an annotation, I check that it is in the file. Here the join is by the number in the names: <code>ws request #5</code>, <code>recv #5</code>, <code>query #5</code>, <code>send #5</code>, <code>ws round trip #5</code>. (If that command prints an event in your copy, the harness was fixed and the arrows are there.)</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on one machine, backend and browser times can be subtracted; the error is below the 0.1 ms that the fastest hop takes.</p>
+    <p><b>No:</b> that this carries to a backend on another host. Two machines have two monotonic clocks with unrelated origins. Then the offset has to be estimated from the messages themselves, and only the <em>sum</em> of up and down is known for certain: an asymmetric path and a clock offset look the same.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>In Perfetto's search box type <code>#5</code> and step through the hits: the page's mark and span, then <code>recv #5</code>, <code>query #5</code>, <code>encode #5</code>, <code>send #5</code> in the backend. Or: <code>node lab/harness/q.mjs b-click-ws-tanstack slices '#5$'</code>. Expected: the mark at 56.34 ms, <code>recv</code> at 56.54, <code>query</code> at 56.58 for 5.17 ms, <code>send</code> at 61.75.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Chrome's trace clock is LINUX_CLOCK_MONOTONIC (trace metadata); in 588 requests the server's receive follows the page's send by 0.08–0.5 ms (one 2.1 ms) and no reply is handled before the server finished it.</li>
+    <li data-kind="rejected">"The trace has flow arrows per request": none in these traces; record.mjs:169 builds a key that never matches. Join by the request number in the event names.</li>
+    <li data-kind="inferred">Cross-process subtraction is valid here because both programs read one machine's monotonic clock; with a remote backend only up + down would be certain.</li>
+  </ul>
+  <p class="next" data-answer="clock"><b>Next question →</b> Then I can follow one request across the boundary. Which threads touch it on the way out?</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · One request, hop by hop" data-title="The request leaves" data-node="send netsvc recv"
+  data-ask="hops|Of one round trip, which hops are work, which are waiting, and who owns each?">
+  <p class="holding"><span class="label">Question I hold</span><span><code>socket.send()</code> runs on the main thread. Which threads, in which processes, carry the bytes to the backend, and how long does each take?</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The page calls <code>send()</code> inside its scroll handler, 0.65 ms into a main-thread task that runs for 1.55 ms. When does the request leave the renderer process?</p>
+    <div class="opts"><button data-k="a">When the task ends: output is flushed between tasks.</button><button data-k="b">At once: another process has it before the handler returns.</button><button data-k="c">With the next frame.</button></div>
+    <div class="reveal"><p><b>At once.</b> The network service wakes 0.02 ms after the send, and the backend has the request at 56.54 ms, while the task that sent it runs until 57.20 ms. A WebSocket send is not tied to the task or to the frame.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I take request #5 of <code>b-click-ws-tanstack</code> and list every event between the page's send and the backend's receive, on all threads of all processes (times in ms after the click):</p>
+  </div></div>
+  <div class="tracelink" data-trace="b-click-ws-tanstack">In Perfetto: pin <code>CrRendererMain</code> and <code>Chrome_ChildIOThread</code> of the Renderer, <code>Chrome_ChildIOThread</code> of <code>Service: network.mojom.NetworkService</code>, and the backend's two tracks; zoom to 56.2–56.7 ms.</div>
+<pre>  ms       process · thread                          event
+ 55.647    Renderer · CrRendererMain                 task: BeginMainFrame (COMPOSITOR_TQ), 1.553 ms
+ 56.134      └ EventDispatch scroll → our render()
+ 56.297    <span class="cp">1</span>  app: ws round trip #5 begins             <span class="c">performance.now() just before send</span>
+ 56.314    <span class="cp">2</span>  <mark>WebSocketSend</mark> {dataLength: 38}
+ 56.316         Send mojo message ──────────────┐    <span class="c">flow arrow, toplevel.flow</span>
+ 56.334    Network service · Chrome_ChildIOThread │  <span class="cp">3</span> EpollEvent (mojo channel readable), 0.102 ms
+ 56.359      └ <mark>Receive mojo message</mark>  network.mojom.WebSocket ◀┘
+ 56.375      └ SimpleWatcher::OnHandleReady  services/network/websocket.cc, 0.060 ms   <span class="cp">4</span>
+ 56.441    Renderer · Chrome_ChildIOThread            EpollEvent, 0.010 ms
+ 56.540    Backend (node) · ws io                     <span class="cp">5</span> <mark>recv #5</mark> {y0: 16, y1: 18, queued: 0, busy: 0}
+ 56.578    Backend (node) · query service             query #5 begins (waited 0.038 ms)
+ 57.200    Renderer · CrRendererMain                 the BeginMainFrame task ends</pre>
+  <ol class="pins">
+    <li><i>1</i>Our source takes the time, then calls <code>socket.send</code> with 38 bytes of JSON: <code>{"id":5,"y0":16,"y1":18,"x0":0,"x1":6}</code>.</li>
+    <li><i>2</i>Blink's instant <code>WebSocketSend</code> (category <code>devtools.timeline</code>). 2 µs later the main thread itself writes a message to the network service: there is no hop through the renderer's IO thread on the way out.</li>
+    <li><i>3</i>18 µs later the network service's thread wakes on its channel and receives the message: the frame's length and type.</li>
+    <li><i>4</i>The payload travels separately, through a data pipe; this watcher belongs to <code>services/network/websocket.cc</code>. That it reads the 38 bytes here and writes them to the TCP socket is my reading of the source, not an event in the trace.</li>
+    <li><i>5</i>The backend's <code>message</code> handler runs 0.105 ms after pin 4 ended: loopback TCP, Node's event loop, and its WebSocket library unmasking the frame. No event covers that stretch.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>"Up" for this request is 0.243 ms (56.297 → 56.540). The CPU work I can see in it is 0.10 ms on the network service's thread; the rest is two wake-ups (18 µs and about 0.1 ms). The renderer's main thread spent about 20 µs on the send and went on with its frame.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/dom_websocket.cc;l=346">third_party/blink/renderer/modules/websockets/dom_websocket.cc:346–347</a>
+<pre><span class="n">346</span>    buffered_amount_ += encoded_message.length();
+<span class="n">347</span>    <mark>channel_->Send(encoded_message, /*watcher=*/nullptr);</mark></pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc;l=423">…/websockets/websocket_channel_impl.cc:423–428</a>
+<pre><span class="n">423</span>    DEVTOOLS_TIMELINE_TRACE_EVENT_INSTANT(
+<span class="n">424</span>      <mark>"WebSocketSend"</mark>, InspectorWebSocketTransferEvent::Data,
+<span class="n">425</span>      execution_context_.Get(), identifier_, message.length());
+<span class="n">427</span>    SendFromMemory(kMessageTypeText, base::as_byte_span(message),
+<span class="n">428</span>                   std::move(watcher));</pre>
+      <p><code>send()</code> is synchronous down to the write into the pipe to the network service. Nothing is posted to a later task, which is why the request is out before the handler returns.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Network service</dt><dd>Chrome does not let a renderer touch sockets. A separate process, <code>Service: network.mojom.NetworkService</code>, owns them. In this trace its WebSocket work runs on its <code>Chrome_ChildIOThread</code>.</dd>
+      <dt>Mojo: message pipe and data pipe</dt><dd>Chrome's processes talk through Mojo. Small typed messages ("a frame of 38 bytes follows") go through a message pipe; bulk bytes go through a data pipe, a shared ring buffer. A trace shows a slice named <code>Receive mojo message</code> with the interface name in its arguments.</dd>
+      <dt>Wake-up</dt><dd>The gap between "A wrote" and "B started": the kernel notices the readable descriptor and schedules B's thread. Nobody works; it is the price of a hop.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a send costs the main thread tens of microseconds and leaves immediately; on loopback the request reaches the backend's code in about a quarter of a millisecond, of which 0.1 ms is another process's CPU.</p>
+    <p><b>No:</b> that <code>send()</code> always returns this fast or that the bytes are "on the wire" when it returns. When the pipe to the network service is full, Blink queues the message and <code>bufferedAmount</code> grows; that is congestion, Module 8 (<a href="network.html">network.html</a>).</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-click-ws-tanstack slices 'WebSocketSend|^recv #'</code>. Expected: nine pairs (18 events); in each, <code>recv</code> follows <code>WebSocketSend</code> by 0.2–0.3 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Request #5: WebSocketSend on the main thread at 56.314 ms, network service awake at 56.334, backend handler at 56.540; the task that sent it ran until 57.20.</li>
+    <li data-kind="read">DOMWebSocket::send calls the channel synchronously (dom_websocket.cc:347); the channel emits WebSocketSend and writes to the network service at once (websocket_channel_impl.cc:423–428).</li>
+    <li data-kind="measured">On the way out the renderer's IO thread is not on the path: the main thread writes to the network service's channel itself.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> And the way back: who wakes the main thread, and as what kind of task?</p>
+</section>
+
+<section class="step" data-part="B · One request, hop by hop" data-title="The reply comes back" data-node="reply task js dom">
+  <p class="holding"><span class="label">Question I hold</span><span>The backend calls <code>ws.send</code> at 61.750 ms. What has to happen before <code>socket.onmessage</code> runs, and how is that task ranked against everything else the main thread has to do?</span></p>
+  <div class="beat"><span class="label">What I do</span><div><p>The same listing for the way back, request #5.</p></div></div>
+<pre>  ms       process · thread                          event
+ 61.703    Backend (node) · query service            encode #5: JSON.stringify, 192 bytes, 0.047 ms
+ 61.750    Backend (node) · ws io                    <span class="cp">1</span> <mark>send #5</mark> {bytes: 192, buffered: 0}
+ 61.850    Network service · Chrome_ChildIOThread    <span class="cp">2</span> EpollEvent (socket readable, net/socket/socket_posix.cc), 0.048 ms
+ 61.876      └ Send mojo message ───────────────────────────┐
+ 61.893    Renderer · Chrome_ChildIOThread           <span class="cp">3</span> EpollEvent (mojo channel readable), 0.021 ms
+ 61.910      └ SequenceManager PostTask ──────────┐        │
+ 61.924    Renderer · CrRendererMain              ▼        │
+             <span class="cp">4</span> task: <mark>FRAME_LOADING_TQ · NORMAL_PRIORITY · TASK_TYPE_NETWORKING</mark>, 0.286 ms
+ 61.928        └ SimpleWatcher::OnHandleReady  network.mojom.WebSocketClient
+ 61.934          └ <mark>Receive mojo message</mark>  network.mojom.WebSocketClient ◀┘
+ 61.949    <span class="cp">5</span>       WebSocketReceive {dataLength: 192}
+ 61.967            └ FunctionCall <mark>socket.onmessage</mark>, 0.115 ms
+ 61.987    <span class="cp">6</span>          app: ws parse #5 (JSON.parse), 0.036 ms
+ 62.057               app: ws round trip #5 ends
+ 62.088            └ RunMicrotasks, 0.110 ms
+ 62.092    <span class="cp">7</span>          app: draw, 12 cells, 0.070 ms ·  62.176  app: content complete</pre>
+  <ol class="pins">
+    <li><i>1</i>The reply leaves Node. <code>buffered: 0</code>: the socket took it whole.</li>
+    <li><i>2</i>0.10 ms later the network service's thread wakes on the <em>socket</em>, parses the WebSocket frame and writes to the renderer: a message "a frame of 192 bytes" and the bytes into the data pipe.</li>
+    <li><i>3</i>The renderer's IO thread wakes on the channel. Its whole job is to post a task to the main thread; it never sees the payload.</li>
+    <li><i>4</i>The task, 14 µs later. The scheduler arguments say what it is: the frame's <b>loading</b> queue, <b>normal</b> priority, task type <b>networking</b>.</li>
+    <li><i>5</i>Blink has the complete message and writes the instant <code>WebSocketReceive</code>.</li>
+    <li><i>6</i>Our handler: parse, store the rows in the cache, end the round-trip span.</li>
+    <li><i>7</i>The promise our panel was waiting on resolves, and its <code>render()</code> runs as a microtask in the <em>same task</em>: the two new rows get their text. The DOM is right at 62.16 ms.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>"Down" for this request is 0.354 ms (61.703 → 62.057): 0.05 ms to encode, 0.10 ms to reach the network service, 0.07 ms through two threads to the main thread, 0.13 ms inside the task until our span ends. There is no <code>EventDispatch</code> slice: a <code>message</code> event on a WebSocket is not a DOM event dispatch, so in DevTools the handler appears as a bare "Function call" under a task.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc;l=592">…/websockets/websocket_channel_impl.cc:592–594, 1158, 1170</a>
+      <p>Which queue the reply's task is posted to is decided once, when the socket opens:</p>
+<pre><span class="n"> 592</span>    client_receiver_.Bind(
+<span class="n"> 593</span>        std::move(client_receiver),
+<span class="n"> 594</span>        execution_context_->GetTaskRunner(<mark>TaskType::kNetworking</mark>));
+<span class="n">1158</span>        "WebSocketReceive", InspectorWebSocketTransferEvent::Data,
+<span class="n">1170</span>        client_->DidReceiveTextMessage(message);</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/platform/scheduler/main_thread/frame_scheduler_impl.cc;l=509">…/scheduler/main_thread/frame_scheduler_impl.cc:509–510</a>
+<pre><span class="n">509</span>      case TaskType::kNetworking:
+<span class="n">510</span>        return <mark>LoadingTaskQueueTraits()</mark>;</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/dom_websocket.cc;l=540">…/websockets/dom_websocket.cc:540, 86–88</a>
+<pre><span class="n">540</span>    event_queue_->Dispatch(MessageEvent::Create(msg, origin_));
+<span class="n"> 86</span>      case kActive:
+<span class="n"> 88</span>        <mark>target_->DispatchEvent(*event);</mark>   <span class="c">// synchronous: the handler runs inside the mojo task</span></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Task queue and priority</dt><dd>The main thread takes work from several queues. The scheduler serves the highest priority that has work, and the oldest task among equals. A WebSocket message arrives in the loading queue at <em>normal</em> priority. The frame's <code>BeginMainFrame</code> comes through <code>COMPOSITOR_TQ</code>, here at <em>highest</em>. What that ranking does under a flood of messages is Module 7 (<a href="streaming.html">streaming.html</a>).</dd>
+      <dt>Microtask</dt><dd>A promise continuation. It runs when the current JavaScript call returns, before the task ends. So "reply handled" and "DOM updated" can be one task, as here, or separated by a wait for an animation frame, as in regular-table (Module 1, step 28).</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a reply reaches JavaScript as one normal-priority main-thread task, woken by the IO thread; the network service does the socket and frame work in another process.</p>
+    <p><b>No:</b> that it <em>starts</em> 0.2 ms after the server sent it in general. A task waits for the task before it. Here the main thread was idle; step 6 has one that was not.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-click-ws-tanstack tasks 55 63 0</code> prints the main thread's tasks with queue, priority and poster. Expected: the last line is <code>61.92 0.29 FRAME_LOADING_TQ NORMAL_PRIORITY Notify (simple_watcher.cc)</code>. In Perfetto, click that task's slice and read <code>args.renderer_main_thread_task_execution.task_type</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Reply #5: backend send 61.750 → network service 61.850 → renderer IO thread 61.893 → main-thread task 61.924 (FRAME_LOADING_TQ, normal priority, TASK_TYPE_NETWORKING) → onmessage 61.967 → DOM right 62.16.</li>
+    <li data-kind="read">The WebSocket client is bound to the frame's kNetworking task runner (websocket_channel_impl.cc:594), which maps to the loading queue (frame_scheduler_impl.cc:509–510); the message event is dispatched synchronously inside that task (dom_websocket.cc:540, 88).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Add it up. The round trip took 5.76 ms. Is that how late the rows were?</p>
+</section>
+
+<section class="step" data-part="B · One request, hop by hop" data-title="Budget the round trip, then follow it to the screen" data-node="service task dom frame">
+  <p class="holding"><span class="label">Question I hold</span><span>Of the 5.76 ms, how much was work? And when did the two rows this request fetched reach the screen?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The request leaves at 56.3 ms and the rows are in the DOM at 62.2 ms. When are they on screen?</p>
+    <div class="opts"><button data-k="a">About 62 ms: the DOM is the screen.</button><button data-k="b">About 73 ms: with the next vsync.</button><button data-k="c">About 90 ms: two vsyncs after the frame that sent the request.</button></div>
+    <div class="reveal"><p><b>About 90 ms.</b> The DOM change waits for the next <code>BeginMainFrame</code> (72.25 ms), and that frame's pixels are presented at 89.9 ms: 33.6 ms after the request, for a round trip of 5.8.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>First the budget of request #5, from the listings of the last two steps:</p>
+<pre>  0.243 ms  up        main → network service → socket → Node handler     0.10 ms CPU (network service), rest wake-ups
+  0.038 ms  queue     recv → a server is free                            waiting (nothing ahead of it)
+  5.125 ms  service   query #5: a 5 ms timer                             waiting, by design: the lab's stand-in for a query
+  0.354 ms  down      encode → socket → network service → IO → main      0.05 + 0.05 + 0.02 ms CPU, then 0.13 ms in our task
+  ────────
+  5.760 ms  round trip, as the page measures it</pre>
+    <p>Then I put the frames next to it, for both libraries (the same click, <code>b-click-ws-regular</code> below).</p>
+  </div></div>
+  <div class="tracelink" data-trace="b-click-ws-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["b-click-ws-tanstack","b-click-ws-regular"],"titles":["b-click-ws-tanstack · our source renders on the reply","b-click-ws-regular · regular-table commits in the next animation frame"],"from":20,"to":96,"rows":["frames","mainFrames","main","app","backendQuery"],"pins":[[1,56.3,"app",0],[2,62.18,"app",0],[3,72.3,"mainFrames",0],[4,66.6,"frames",0],[5,27.4,"app",1],[6,44.5,"main",1],[7,38.1,"frames",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>TanStack panel: request #5 leaves at 56.30 ms, from inside the main frame for vsync 73 (55.6–57.2 ms).</li>
+    <li><i>2</i>◆ 62.18 ms: the rows are in the DOM. The frame that could have carried them committed 5 ms ago.</li>
+    <li><i>3</i>The next main frame starts at 72.25 ms and commits the change.</li>
+    <li><i>4</i>The box of vsync 74 (hover it): its main-thread part was presented 23.9 ms after the vsync, at 89.9 ms.</li>
+    <li><i>5</i>regular-table: request at 27.38 ms, from inside its main frame; the reply is handled at 32.97 ms.</li>
+    <li><i>6</i>It then waits for an animation frame and writes the cells at 44.46 ms, 11.5 ms after the reply, inside the main frame for vsync 73.</li>
+    <li><i>7</i>That vsync's main-thread part is presented at 60.96 ms: 33.6 ms after the request. The same.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Across the nine requests of the click: round trip <b data-m="b-click-ws-tanstack/ws.roundTrip.p50" data-unit="ms"></b> median, of which <b data-m="b-click-ws-tanstack/ws.serverService.p50" data-unit="ms"></b> is the timer, <b data-m="b-click-ws-tanstack/ws.upMs.p50" data-unit="ms"></b> up and <b data-m="b-click-ws-tanstack/ws.downMs.p50" data-unit="ms"></b> down. Chrome's part of a round trip is about half a millisecond of CPU on three threads in two processes: 0.15 ms on the network service's thread, 0.03 ms on the renderer's IO thread, 0.3 ms on the main thread, most of it our handler and render.</p>
+    <p>On screen the 5.8 ms cost one whole frame. With local data the rows would have been written in the main frame that noticed the scroll (55.6 ms) and presented at 73.0 ms; with the backend they are presented at 89.9 ms. A 0.5 ms backend would cost the same frame: the request leaves <em>during</em> a main frame, and any reply that arrives after that frame's commit waits for the next one.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed our TanStack source, which renders the moment a reply lands, shows rows most of a frame earlier than regular-table, which waits for <code>requestAnimationFrame</code> after the reply. In the DOM that is true: right 5.9 ms after the request against 17.1 ms. On screen it is false: both are presented 33.6 ms after the request, because a DOM write between frames only waits for the next <code>BeginMainFrame</code>, which is where the animation-frame callback runs anyway. The rule I keep: compare designs at the presentation point. "DOM complete" flatters whoever writes early.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with a main thread that is idle between frames, time to screen is the round trip rounded up to whole frames, plus the pipeline's one vsync from commit to presentation.</p>
+    <p><b>No:</b> that waiting for an animation frame is free in general. It is free here because an idle main thread starts every <code>BeginMainFrame</code> on time. When main frames come late, the animation frame is one more thing to wait for: step 10 has a drag where that wait is 9 to 26 ms per reply.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: report three observation points per pull, not one: reply handled, DOM written, frame presented. In this trace they are 5.8, 5.9 and 33.6 ms after the request. A latency budget stated at the first point hides the quantization to frames that the user actually gets.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-click-ws-tanstack frames 50 95</code>. Expected: vsync 74 at 65.97 ms, state <code>partial</code>, "presented-after" 23.89; main frame 74 from 72.25 ms for 1.59 ms. (Why that vsync's box is amber is Module 2's subject: the compositor's scroll was presented first, without waiting for the main thread.)</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Round trip #5 = 0.243 up + 0.038 queue + 5.125 service + 0.354 down; Chrome's share is about 0.5 ms of CPU on three threads in two processes.</li>
+    <li data-kind="measured">Rows requested at 56.30 ms were in the DOM at 62.16 and presented at 89.9: a 5.8 ms round trip cost one extra frame on screen.</li>
+    <li data-kind="rejected">"Rendering on the reply beats waiting for an animation frame by most of a frame": true in the DOM (5.9 against 17.1 ms), not on screen (33.6 ms both) in this click.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Here the main thread was idle when the reply came. What does a round trip look like when it is not?</p>
+</section>
+
+<section class="step" data-part="B · One request, hop by hop" data-title="A slow round trip with a fast backend" data-node="task reply method">
+  <p class="holding"><span class="label">Question I hold</span><span>The backend still answers in 5 ms. The page now measures round trips of 60 ms and more. Which hop grew?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p><code>b-window-drag-tanstack</code>: a big table (40 columns, 60 rows of overscan), the thumb dragged, each step asks for a fresh window of about 6,100 cells. Service time 5 ms, nobody else uses the backend. The page's median round trip is…</p>
+    <div class="opts"><button data-k="a">About 6 ms, as before: the backend did not change.</button><button data-k="b">About 20 ms: the reply is bigger.</button><button data-k="c">About 70 ms.</button></div>
+    <div class="reveal"><p><b>About 70 ms</b>: <b data-m="b-window-drag-tanstack/ws.roundTrip.p50" data-unit="ms"></b> median, with <b data-m="b-window-drag-tanstack/ws.serverService.p50" data-unit="ms"></b> of service. The reply was back in the renderer process a few milliseconds after the request left. It then waited for the main thread, which was still inside the task that had sent the request.</p></div>
+  </div>
+  <div class="tracelink" data-trace="b-window-drag-tanstack">Pin <code>CrRendererMain</code> and the backend's <code>query service</code>.</div>
+  <div class="lanes" data-lanes='{"traces":["b-window-drag-tanstack"],"from":30,"to":230,"rows":["tasks","main","app","backendQuery"],"pins":[[1,41.9,"app"],[2,44.5,"backendQuery"],[3,80,"tasks"],[4,108.5,"main"],[5,160,"tasks"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>41.90 ms: request #2 leaves, from inside our <code>render()</code>, which has just created 153 rows of placeholders.</li>
+    <li><i>2</i>The backend: received 0.2 ms later, done at about 47.2 ms. A 5 ms bar.</li>
+    <li><i>3</i>The task that sent the request is still running: after 6 ms of JavaScript come style (7 ms), layout (18 ms), pre-paint, paint (22 ms) and layerize for 6,120 new cells. It ends at 107.8 ms, 66.6 ms after it began.</li>
+    <li><i>4</i>108.34 ms: the reply's task finally runs. It had been in the queue for about 61 ms.</li>
+    <li><i>5</i>Our <code>render()</code> fills the cells (6 ms). The next task, 96 ms, renders the next step's placeholders and runs the whole lifecycle again.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The page's round-trip span is 66.75 ms for this request. The server's own numbers inside it: 0.02 ms in the queue, 5.1 ms of service. "Down" is <b data-m="b-window-drag-tanstack/ws.downMs.p50" data-unit="ms"></b> at the median and <b data-m="b-window-drag-tanstack/ws.downMs.max" data-unit="ms"></b> at worst, in a trace with <b data-m="b-window-drag-tanstack/main.longTasks"></b> tasks of 50 ms or more. Transport did not slow down; the last hop, "main-thread task", is a queue too, and it was occupied.</p>
+    <p>A milder case of the same thing is in <code>b-drag-cancel-tanstack</code>: reply #13 reached the renderer at about 434.4 ms, while a 4.66 ms <code>BeginMainFrame</code> task was running (433.78–438.44); the reply's task ran at 438.50. That is the 4.3 ms "down" maximum in that trace.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">What I think</span>
+      <p>A reply cannot interrupt a task. Its delivery is a task of normal priority (step 4), and the main thread finishes what it is doing first. So the round trip, as JavaScript measures it, contains main-thread queueing: the page is timing itself as well as the backend. The only way to tell the two apart is a timestamp taken outside the page, at the server, and carried in the reply. That is what <code>srv: {recv, start, done}</code> is for.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Working or waiting</dt><dd>For each stretch of a span, ask which thread was busy on its behalf. During pin 3 the backend's lane is empty and the main thread is busy with <em>other</em> work: the request is waiting, and the queue it waits in is the main thread's.</dd>
+      <dt>Head-of-line blocking</dt><dd>One long item at the front of a queue delays everything behind it, however small. The same shape appears on the network in Module 8.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a long round trip measured in the page does not by itself say the backend or the network is slow. With the server's timestamps the split is exact: here 5 ms theirs, 60 ms ours.</p>
+    <p><b>No:</b> that the 60 ms is the WebSocket's cost. It is this panel's style, layout and paint cost for 6,120 new cells (Module 5, <a href="rendering.html">rendering.html</a>); the reply merely stood behind it.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: every reply carries the engine's receive, start and done times on the shared clock (or, across machines, its service and queue <em>durations</em>, which need no clock agreement). The client then reports "reply age when handled" separately from "service time". Without that split, a slow renderer is filed as a slow engine.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-drag-cancel-tanstack tasks 432 440 0.05</code>. Expected: a 4.66 ms <code>COMPOSITOR_TQ</code> task at 433.78, then two <code>FRAME_LOADING_TQ</code> tasks at 438.50 and 438.62: the replies that waited.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">b-window-drag-tanstack: service 5 ms, median round trip about 75 ms; the reply waits in the main thread's queue behind the task that sent the request (67 ms: 6 ms of JavaScript, then style, layout and paint for 6,120 new cells).</li>
+    <li data-kind="inferred">A round trip timed in JavaScript includes main-thread queueing; only a server-side timestamp in the reply separates backend time from page time.</li>
+  </ul>
+  <p class="next" data-answer="hops"><b>Next question →</b> One request at a time is understood. What happens when requests arrive faster than the backend finishes them?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · A drag meets a queue" data-title="Every range: the line grows" data-node="queue service policy"
+  data-ask="policy|When requests arrive faster than the backend serves them, what should the client do?">
+  <p class="holding"><span class="label">Question I hold</span><span>The thumb is dragged 150 px in 0.9 s, through 57,900 rows. The backend serves one query at a time, 40 ms each. Our source asks for every range the viewport passes. What happens to the requests?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The last request leaves at 918 ms, right after the mouse is released. Each query takes 40 ms. When is its reply handled?</p>
+    <div class="opts"><button data-k="a">About 960 ms: one service time later.</button><button data-k="b">About 1,000 ms: it waits for the one in service, then is served.</button><button data-k="c">About 1,240 ms.</button></div>
+    <div class="reveal"><p><b>1,240 ms.</b> When it arrives, seven requests are waiting in front of it and an eighth is just finishing. All are for rows the viewport has already left, and the server serves every one of them first: 7 × 40 ms of waiting, then 40 ms for the request itself.</p></div>
+  </div>
+  <div class="tracelink" data-trace="b-drag-every-tanstack">In Perfetto: the backend's <code>query service</code> track and the counter <code>rows queue (conn N)</code> under the Backend process.</div>
+  <div class="lanes" data-lanes='{"traces":["b-drag-every-tanstack"],"from":-20,"to":1300,"rows":["inputs","app","backendIo","backendQuery"],"counters":["rows queue"],"pins":[[1,35.3,"app"],[2,517,"backendQuery"],[3,910.8,"inputs"],[4,917.9,"backendIo"],[5,1199.6,"backendQuery"],[6,1240.4,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>35.3 ms: the first request of the drag. Each scroll event moves the viewport about 1,930 rows, so every request is for a range that shares nothing with the one before.</li>
+    <li><i>2</i>The <code>query service</code> lane is a solid row of 40 ms bars: the server is never idle. Below it the counter climbs.</li>
+    <li><i>3</i>910.8 ms: the mouse is released.</li>
+    <li><i>4</i>917.9 ms: <code>recv #31</code>, the request for the rows the user stopped on. Its arguments say <code>queued: 7, busy: 1</code>.</li>
+    <li><i>5</i>1,199.6 ms: <code>query #31</code> starts. <code>waitedMs: 281.6</code>.</li>
+    <li><i>6</i>◆ 1,240.4 ms: the rows are in the DOM, <b data-m="b-drag-every-tanstack/content.settleMs" data-unit="ms"></b> after the release.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="b-drag-every-tanstack/ws.requests"></b> requests, all answered. The line reached <b data-m="b-drag-every-tanstack/backend.queueMax"></b>. The round trip, 40 ms for the first request, has a median of <b data-m="b-drag-every-tanstack/ws.roundTrip.p50" data-unit="ms"></b> and a maximum of <b data-m="b-drag-every-tanstack/ws.roundTrip.max" data-unit="ms"></b>; almost all of it is <code>serverWait</code> (max <b data-m="b-drag-every-tanstack/ws.serverWait.max" data-unit="ms"></b>). The service time never changed.</p>
+    <p>And the screen: every <code>app: draw</code> from 35 ms to 1,240 ms has <code>filled: false</code>. The panel showed rows of "…" for 1.2 seconds. Twenty-nine replies arrived for rows that were no longer in the DOM (the keyed pool had removed them) and were drawn by nobody.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">What I think: the arithmetic of the line</span>
+<pre>arrivals   30 requests between 35.3 and 917.8 ms    one every 30.4 ms   λ = 32.9 per second
+service    query starts 40.1 ms apart               S = 40.1 ms         the server finishes 24.9 per second
+load       ρ = λ × S = 32.9 × 0.0401                = <mark>1.32</mark>              more work arrives than can be done
+
+each request waits 40.1 − 30.4 = 9.7 ms longer than the one before it
+the 30th waits 29 × 9.7 = <mark>281 ms</mark>                                    measured: 281.6 ms
+the line grows by 32.9 − 24.9 = 8 per second: 7 after 0.88 s          measured: 7 waiting + 1 in service</pre>
+      <p>The wait is not a property of the backend. It is the product of how long the overload has lasted and by how much ρ exceeds 1. Had the drag lasted 3 seconds, the last wait would have been about a second.</p>
+    </div>
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/server/backend.mjs:45–47, 86–87 · lab/pages/src/source.ts:113–118</span>
+      <p>The server: a first-in-first-out line in front of <code>conc</code> servers. The client: ask for whatever is neither cached nor already asked for, immediately, every time.</p>
+<pre><span class="n">45</span>  const pump = () => {
+<span class="n">46</span>    <mark>while (busy &lt; conc &amp;&amp; queue.length) start(queue.shift());</mark>
+<span class="n">47</span>    counter(`rows queue (conn ${conn})`, queue.length);
+<span class="n">86</span>    queue.push(req);
+<span class="n">87</span>    pump();
+
+<span class="c">// source.ts, policy "every"</span>
+<span class="n">114</span>    let lo = y0;
+<span class="n">115</span>    while (lo &lt; y1 &amp;&amp; covered(lo, x0, x1)) lo++;
+<span class="n">118</span>    <mark>if (lo &lt; hi) send(lo, hi, x0, x1);</mark></pre>
+    </div>
+  </div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Arrival rate λ, service time S, load ρ</dt><dd>ρ = λ × S ÷ (number of servers) is the fraction of server time the arrivals ask for. Below 1 a line forms and empties. At 1 or above it only grows, for as long as the arrivals keep coming: there is no steady state to quote, only "how long has this been going on".</dd>
+      <dt>Open loop</dt><dd>The sender does not look at the receiver before sending. Our "every" policy is open-loop: the scroll position generates requests, whatever the backend is doing.</dd>
+    </dl></div>
+    <div class="box"><span class="label">May conclude</span>
+      <p><b>Yes:</b> an open-loop client with ρ = 1.3 for 0.9 s makes the answer the user is waiting for 330 ms late, behind work nobody wants.</p>
+      <p><b>No:</b> that the backend is "slow". Its service time is 40 ms from the first query to the last, and throughput is at its maximum the whole time. A throughput graph of this run looks perfect.</p>
+    </div>
+  </div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-drag-every-tanstack slices '^(recv|query)'</code>. Expected: in the <code>recv</code> lines <code>queued</code> climbs 0, 0, 0, 0, 0, 1, 1, … 7; in the <code>query</code> lines <code>waitedMs</code> climbs 0.02, 7.2, 14.2, 21.2, … 281.6. In Perfetto the counter track draws the same staircase.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Every-range policy against one 40 ms server: 30 requests in 0.88 s (ρ = 1.32), line up to 8, last wait 281.6 ms, rows right 330 ms after release; the screen showed placeholders for 1.2 s.</li>
+    <li data-kind="inferred">Under overload the last wait is about (time under overload) × (ρ − 1), not a property of the service time; here 0.88 s × 0.32, or 29 requests × 9.7 ms.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The server cannot go faster. What if the client simply never has more than one request out?</p>
+</section>
+
+<section class="step" data-part="C · A drag meets a queue" data-title="One in flight, newest next" data-node="queue policy">
+  <p class="holding"><span class="label">Question I hold</span><span>Same drag, same backend. The source now sends a request only when none is out, and while one is out it remembers only the newest range wanted. What does the line look like?</span></p>
+  <div class="tracelink" data-trace="b-drag-inflight-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["b-drag-inflight-tanstack"],"from":-20,"to":1300,"rows":["inputs","app","backendIo","backendQuery"],"counters":["rows queue"],"pins":[[1,38,"app"],[2,500,"backendQuery"],[3,906.8,"inputs"],[4,930.4,"backendIo"],[5,971.2,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>38.0 ms: the first request. The next one leaves at 78.7 ms, in the same task that handled the first reply.</li>
+    <li><i>2</i>The server is as busy as before: a solid row of 40 ms bars. The counter stays at 0.</li>
+    <li><i>3</i>906.8 ms: release. The final range is first wanted at 921.7 ms; request #23 (for the range before it) is still out, so the final range is only remembered.</li>
+    <li><i>4</i>930.4 ms: reply #23 lands and request #24, for the final range, leaves in the same task.</li>
+    <li><i>5</i>◆ 971.2 ms: rows right, <b data-m="b-drag-inflight-tanstack/content.settleMs" data-unit="ms"></b> after release.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="b-drag-inflight-tanstack/ws.requests"></b> requests instead of 30; the round trip stays at <b data-m="b-drag-inflight-tanstack/ws.roundTrip.p50" data-unit="ms"></b> (max <b data-m="b-drag-inflight-tanstack/ws.roundTrip.max" data-unit="ms"></b>); the line never forms (<b data-m="b-drag-inflight-tanstack/backend.queueMax"></b>). Seven of the thirty ranges the viewport passed were never asked for.</p>
+    <p>The screen <em>during</em> the drag did not improve: every draw is <code>filled: false</code> until 970.95 ms. Each reply is for the range wanted one round trip ago, and one scroll event later the viewport is 1,930 rows away.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/source.ts:109–111, 150–154</span>
+<pre><span class="n">109</span>    if (config.policy === "inflight") {
+<span class="n">110</span>      if (inFlight.size) return void (<mark>pending = { y0, y1, x0, x1 }</mark>);   <span class="c">// overwrite: newest wins</span>
+<span class="n">111</span>      return send(y0, y1, x0, x1);
+<span class="n">150</span>    if (config.policy === "inflight" &amp;&amp; pending &amp;&amp; !inFlight.size) {   <span class="c">// in onmessage</span>
+<span class="n">151</span>      const p = pending;
+<span class="n">152</span>      pending = undefined;
+<span class="n">153</span>      if (!has(p.y0, p.y1, p.x0, p.x1)) <mark>send(p.y0, p.y1, p.x0, p.x1);</mark></pre>
+      <p>One variable, <code>pending</code>, is the whole queue: it holds at most one range and each new want replaces it. The reply is the signal to send.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Closed loop</dt><dd>The next request is released by the previous reply. The arrival rate can then never exceed the service rate: λ adjusts itself to 1 ÷ (round trip), here 24.7 per second, and ρ is 1 with an empty line.</dd>
+      <dt>Conflation</dt><dd>Keeping only the latest value of something that was overwritten before anyone used it. Here the "value" is the wanted range. It is safe because an old range has no worth once the viewport left it.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> one in flight bounds the wait for the final answer: at most the rest of the query in service plus one service time, 2 × S. Here 8.7 ms + 40.6 ms after the final range was first wanted (and that was 15 ms after release: the scroll event waits for a frame).</p>
+    <p><b>No:</b> that it fixes what the user sees while moving. Nothing here draws a reply for a range the viewport has left, so the drag is blank under every policy; step 10 shows a library that draws them.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-drag-inflight-tanstack marks 'ws request'</code>. Expected: 23 marks, 40.4–40.7 ms apart, from 38.08 to 930.39 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One in flight, newest next: 23 requests, round trip 40.5 ms throughout, no line, rows right 64 ms after release (330 ms with the every-range policy).</li>
+    <li data-kind="read">The inflight policy is one overwritten variable (source.ts:110) and a send in the reply handler (source.ts:150–153): a closed loop with conflation of the wanted range.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Skipping ranges feels wasteful when the server might have been free. What about asking for everything and cancelling what the viewport left?</p>
+</section>
+
+<section class="step" data-part="C · A drag meets a queue" data-title="Cancel what the viewport left" data-node="queue service policy">
+  <p class="holding"><span class="label">Question I hold</span><span>The source asks for every range again, and on every render tells the server to drop requests that no longer overlap the viewport. How much server work does that save?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>30 requests are sent and 29 cancel messages (one for every request except the last). How many queries does the server skip?</p>
+    <div class="opts"><button data-k="a">29: every cancelled request.</button><button data-k="b">About half.</button><button data-k="c">6.</button></div>
+    <div class="reveal"><p><b>Six.</b> The server ran <b data-m="b-drag-cancel-tanstack/backend.queries"></b> of the <b data-m="b-drag-cancel-tanstack/ws.requests"></b> queries. A cancel can only remove a request that is still in line, and with one server and a short line, a request has nearly always <em>started</em> by the time its cancel arrives, one scroll event (about 30 ms) later.</p></div>
+  </div>
+  <div class="tracelink" data-trace="b-drag-cancel-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["b-drag-cancel-tanstack"],"from":-20,"to":1300,"rows":["inputs","app","backendIo","backendQuery"],"counters":["rows queue"],"pins":[[1,134.2,"backendIo"],[2,150.6,"backendIo"],[3,155,"backendQuery"],[4,917.7,"backendIo"],[5,997.7,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>134.2 ms: <code>recv #5</code>. Query #4 is in service until 154.9 ms, so #5 waits.</li>
+    <li><i>2</i>150.6 ms: the cancel for #5 arrives while it is still in line: <code>cancelled #5</code>. Request #6 arrives 0.16 ms later.</li>
+    <li><i>3</i>155.0 ms: #6 starts when #4 finishes, having waited 4.2 ms. Query #5 never ran.</li>
+    <li><i>4</i>917.7 ms: <code>recv #31</code>, the final range. Query #30 started 1.4 ms ago; its cancel finds nothing in line. #31 waits the full 39.2 ms.</li>
+    <li><i>5</i>◆ 997.7 ms: rows right, <b data-m="b-drag-cancel-tanstack/content.settleMs" data-unit="ms"></b> after release.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The six cancellations that took effect are #5, #10, #14, #18, #21 and #27. Between them the wait climbs by 7 to 10 ms per request (7.2, 14.2, then #5 would have waited past its cancel; 4.2, 10.2, 17.2, 24.2, then #10; …), exactly as in step 7, until one request is still waiting when its cancel arrives. The line never exceeds <b data-m="b-drag-cancel-tanstack/backend.queueMax"></b>. The round trip has a median of <b data-m="b-drag-cancel-tanstack/ws.roundTrip.p50" data-unit="ms"></b>, not 40, because most requests wait for the remainder of a query that was already cancelled by the client but could not be stopped.</p>
+    <p>Six of thirty is 20%. The overload was ρ = 1.32, so the share of arrivals the server cannot serve is 1 − 1 ÷ 1.32 = 24%. The cancel policy shed the excess and nothing more: the server stayed 100% busy, and 23 of its 24 results were for rows that had left.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/server/backend.mjs:74–81 · lab/pages/src/source.ts:177–179</span>
+<pre><span class="n">74</span>    if (req.cancel !== undefined) {
+<span class="n">75</span>      const i = <mark>queue.findIndex</mark>((r) => r.id === req.cancel);   <span class="c">// only the line; not the one in service</span>
+<span class="n">76</span>      if (i >= 0) {
+<span class="n">77</span>        queue.splice(i, 1);
+
+<span class="c">// source.ts, in want(): called by every render</span>
+<span class="n">177</span>        if (!f.cancelSent &amp;&amp; (f.y1 &lt;= wanted.y0 || f.y0 >= wanted.y1)) {
+<span class="n">179</span>          socket.send(JSON.stringify({ cancel: id }));</pre>
+      <p>The lab's server cannot interrupt a query that has started: a timer is running and nothing checks a flag. Many real engines are the same for a single query.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Preemption</dt><dd>Stopping work that has begun. A cancel that only removes waiting requests limits the <em>line</em>; only a cancel that reaches into the running query frees the <em>server</em>.</dd>
+      <dt>Residual service time</dt><dd>What is left of the job in service when you arrive. Even with an empty line you wait for it. Here the final request waited 39.2 ms for a query whose answer was already unwanted.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed "ask for everything, cancel what you no longer need" was the generous policy: all the freshness of asking early, none of the waste. The trace shows 29 cancels buying 6 skipped queries, a server as busy as without them, and a final answer <em>later</em> than one-in-flight gives (90 ms against 64 ms in these two runs). The rule I keep: against a server that cannot be interrupted, the cheapest cancellation is the request that was never sent. Cancel messages pay only when the line is long or the service can be preempted.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> queue-only cancellation caps the line at the excess load; it bounds the final wait to 2 × S like one-in-flight does, at the price of a cancel protocol and a server that is never idle.</p>
+    <p><b>No:</b> that 90 ms against 64 ms ranks the two policies. Both are "residual + one service time"; where in the running query the final request lands is luck (39.2 ms here, 8.7 ms there). One run each.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-drag-cancel-tanstack slices '^cancelled'</code>. Expected: six instants, for #5, #10, #14, #18, #21, #27. Then <code>… marks 'ws cancel'</code>: 29 marks.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Every range + cancel: 29 cancels sent, 6 took effect, 24 of 30 queries served, line at most 1, median round trip 55 ms, rows right 90 ms after release.</li>
+    <li data-kind="rejected">"Cancelling unwanted requests spares the server": a cancel only removes what has not started (backend.mjs:75); the shed share equals the overload, 1 − 1/ρ.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> regular-table was given no policy at all. How many requests does its own draw loop send into the same backend?</p>
+</section>
+
+<section class="step" data-part="C · A drag meets a queue" data-title="regular-table: the draw loop is the policy" data-node="policy task frame dom">
+  <p class="holding"><span class="label">Question I hold</span><span>regular-table awaits its data listener inside a draw and starts the next draw only after committing the last. Which of the three policies is that, and what is on screen meanwhile?</span></p>
+  <div class="tracelink" data-trace="b-drag-regular"></div>
+  <div class="lanes" data-lanes='{"traces":["b-drag-regular"],"from":25,"to":245,"rows":["frames","mainFrames","main","app","backendQuery"],"pins":[[1,39.8,"app"],[2,80.4,"main"],[3,89.5,"frames"],[4,105.8,"mainFrames"],[5,106.7,"app"],[6,156.2,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>39.7 ms: the draw calls our data listener, which sends request #2 for rows 1,930–1,942 and awaits it.</li>
+    <li><i>2</i>80.4 ms: the reply's task. The draw continues, and asks for an animation frame.</li>
+    <li><i>3</i>The vsync at 88.8 ms: red, dropped. An animation frame was wanted; the compositor did not send <code>BeginMainFrame</code> until this vsync's deadline, 105.66 ms.</li>
+    <li><i>4</i>105.7 ms: the main frame runs, the animation callback commits the cells (106.6 ms): rows 1,930… are in the DOM, 67 ms after they were asked for.</li>
+    <li><i>5</i>106.7 ms: the scroll moved meanwhile (<code>_scroll_dirty</code>), so the loop draws again at once: request #3, for rows 3,860….</li>
+    <li><i>6</i>156.1 ms: the next commit. This time the wait for the animation frame was 9 ms.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="b-drag-regular/ws.requests"></b> requests, one at a time, round trip <b data-m="b-drag-regular/ws.roundTrip.p50" data-unit="ms"></b>, no line. It is the one-in-flight policy with one difference: between the reply and the next request sits a wait for an animation frame, in this drag 9 ms (seven times) or 26 ms (nine times). The cycle is 50 or 67 ms, the arrival rate 16.7 per second, ρ = 16.7 × 0.0407 = 0.68. The server is idle a third of the time.</p>
+    <p>The screen is the opposite of the TanStack panel's. regular-table draws what it asked for, even though the viewport has moved on: fifteen times during the drag the table commits real rows, each set 50 to 67 ms old, about two scroll events (the commit at 106.6 ms shows rows 1,930…, while the request leaving at 106.7 ms is for 3,860…). No placeholders, ever. The ◆ mark, "the first row drawn is the row the scrollbar points at", appears once, at 989 ms, <b data-m="b-drag-regular/content.settleMs" data-unit="ms"></b> after release.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://github.com/finos/regular-table/blob/52e86bf8b74fc5948bb0047afbc8bb9207dd933c/src/ts/events.ts#L64-L90">regular-table src/ts/events.ts:64–67, 75–90</a>
+<pre><span class="n">64</span>        if (this._scroll_pending) {
+<span class="n">65</span>            <mark>this._scroll_dirty = true;</mark>     <span class="c">// a scroll during a draw: remember only that it happened</span>
+<span class="n">66</span>            return;
+<span class="n">75</span>                do {
+<span class="n">76</span>                    this._scroll_dirty = false;
+<span class="n">77</span>                    const commit = <mark>await this.predraw(</mark>width, height, {   <span class="c">// awaits our listener → the socket</span>
+<span class="n">86</span>                    if (!commit.inline) {
+<span class="n">87</span>                        <mark>await new Promise(requestAnimationFrame);</mark>
+<span class="n">88</span>                        commit();
+<span class="n">90</span>                } while (this._scroll_dirty);</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=1377">cc/scheduler/scheduler_state_machine.cc:626–628, 1376–1380</a>
+<pre><span class="n"> 626</span>    if (ShouldWaitForScrollEvent()) {
+<span class="n"> 627</span>      return false;                  <span class="c">// in ShouldSendBeginMainFrame</span>
+<span class="n">1376</span>    // We are scrolling but have not received a scroll event for this begin frame.
+<span class="n">1377</span>    if (settings_.scroll_deadline_mode_enabled &amp;&amp; is_scrolling_ &amp;&amp;
+<span class="n">1378</span>        waiting_for_scroll_event_) {
+<span class="n">1379</span>      return true;</pre>
+      <p>Why 26 ms: the mouse moves every 30 ms, the display ticks every 16.7 ms. In a vsync without a mouse move, the compositor holds the main frame back to give the scroll input a chance to arrive. The trace shows the result (<code>Scheduler::BeginImplFrame</code> at 88.97 ms, <code>SendBeginMainFrame</code> at 105.66 ms, deadline mode <code>LATE</code>); that this condition was the cause is my inference from the source. Module 2 has the scheduler.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Stale against blank</dt><dd>Two ways to be late. <em>Stale</em>: show the last thing you have, which is real but for another position. <em>Blank</em>: show a placeholder until the right thing arrives. Which one a table does is a <em>draw</em> policy, separate from the request policy.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> regular-table needs no request policy from its user: its draw loop admits one request at a time and conflates scroll positions to the latest. A slow backend slows its draws; it cannot flood the backend.</p>
+    <p><b>No:</b> that its 16 requests against 23 mean it is gentler by design. The difference is the animation-frame wait, and that wait depends on input timing in this recording (9 or 26 ms). With a 5 ms backend in a click (step 5) the wait cost nothing.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-drag-regular marks 'ws parse|style listener' 30 300</code>. Expected: pairs of a parse (the reply) and a style listener (the commit), 26.2, 8.8, 26.0 and 26.9 ms apart; each style listener's <code>first</code> is the row requested one cycle earlier (1930, 3860, 5790, 9651).</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">regular-table against the one-at-a-time backend: 16 requests, never two in flight, cycle = round trip + 9 or 26 ms waiting for an animation frame; ρ ≈ 0.68; real rows in the DOM throughout, 50 to 67 ms old.</li>
+    <li data-kind="read">One draw at a time, latest scroll position next (regular-table events.ts:64–67, 75–90); the commit waits for requestAnimationFrame (events.ts:87).</li>
+    <li data-kind="inferred">The 26 ms waits are main frames the compositor sent only at the deadline while waiting for scroll input (scheduler_state_machine.cc:626, 1377–1379); the trace shows the late send, not the reason.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> One more way out: let the backend serve every query at once. Is the problem gone?</p>
+</section>
+
+<section class="step" data-part="C · A drag meets a queue" data-title="More servers, and the five runs side by side" data-node="queue service policy">
+  <p class="holding"><span class="label">Question I hold</span><span>With unlimited concurrency there is no line. Where did the load go, and which of the five runs would I ship?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>b-drag-every-parallel</code> is step 7 with <code>conc=0</code>: every query starts when it arrives. Then one table for all five drags.</p>
+  </div></div>
+  <div class="tracelink" data-trace="b-drag-every-parallel"></div>
+  <div class="lanes" data-lanes='{"traces":["b-drag-every-parallel"],"from":-20,"to":1300,"rows":["inputs","app","backendIo","backendQuery"],"counters":["rows queue"],"pins":[[1,300,"backendQuery"],[2,964,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The 40 ms query bars now overlap: requests arrive every 30 ms, so two are in service at once for 10 ms of every 30. (In <code>recv</code>'s arguments <code>busy</code> is 0 or 1 on arrival: never more than two together.)</li>
+    <li><i>2</i>◆ 964 ms: rows right <b data-m="b-drag-every-parallel/content.settleMs" data-unit="ms"></b> after release, the best of the five.</li>
+  </ol>
+  <table class="mtable" data-rows="b-drag-every-tanstack,b-drag-inflight-tanstack,b-drag-cancel-tanstack,b-drag-every-parallel,b-drag-regular" data-names="every range · one server,one in flight · one server,every + cancel · one server,every range · servers unlimited,regular-table · one server" data-head="Policy · backend" data-cols="ws.requests|requests,ws.cancels|cancels sent,backend.queries|queries served,backend.queueMax|longest line,ws.serverWait.max|longest wait|ms,ws.roundTrip.p50|round trip p50|ms,ws.roundTrip.max|max|ms,content.settleMs|release → rows right|ms" data-hi="b-drag-every-tanstack:ws.serverWait.max,b-drag-every-tanstack:content.settleMs"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The parallel server answers all 30 requests in 40.8 ms each. It also did 30 × 40 ms = 1.2 s of query work in 0.92 s of drag: the load of ρ = 1.32 is unchanged, it is now spread over two servers at 0.66 each. And the screen during the drag is the same as in steps 7 to 9: in all four TanStack runs the first draw with <code>filled: true</code> comes after the release (1,240, 971, 997 and 964 ms). Each reply is 40 ms old when it lands and the viewport moved on after 30.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>The general rule</dt><dd>ρ = λ × S ÷ c, with c servers. A client can lower λ (one in flight, conflation), a queue can shed the excess (cancel, drop), an operator can raise c (parallelism) or lower S (a faster query). If none of them brings ρ below 1, the wait grows for as long as the input lasts.</dd>
+      <dt>What each lever costs</dt><dd><b>Every range:</b> nothing to build; unbounded wait and wasted queries under overload. <b>One in flight:</b> one variable; ranges are skipped; wait bounded by 2 × S. <b>Cancel:</b> a protocol with ids on both sides; saves only what has not started. <b>More servers:</b> CPU and memory in the engine, for answers that are mostly discarded during fast motion.</dd>
+    </dl></div>
+    <div class="box"><span class="label">May conclude</span>
+      <p><b>Yes:</b> for the user's question at the end of a drag, "show me where I stopped", the closed loop gives a bounded answer with the least machinery, and extra servers improve it only by the residual wait (52 ms against 64 ms here).</p>
+      <p><b>No:</b> that parallel service is pointless. For slow scrolling, where consecutive ranges overlap and replies are still wanted when they land, it shortens every wait. This drag is the case where nothing fetched on the way is ever shown.</p>
+    </div>
+  </div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal, in the design's words: <b>one pull in flight per view</b>, with the wanted window conflated to the latest. These traces put numbers on it: final answer within 2 × S instead of (overload time) × (ρ − 1), and 23 queries instead of 30. Cancellation is worth a protocol only where the engine can stop a running query; otherwise it removes about 1 − 1/ρ of the requests. And the engine's load during a drag is set by the view's draw rate, not the scroll rate, which is the "three paces" decoupling of Module 7.</p></div>
+  <div class="try"><span class="label">Try it</span>By hand: <code>cd lab &amp;&amp; npm run serve</code>, then open <code>http://127.0.0.1:5199/grid.html?lib=tanstack&amp;source=ws&amp;serverMs=40&amp;conc=1&amp;policy=every</code> and drag the thumb; then change to <code>policy=inflight</code>. What the traces predict (I did not drag by hand): with <code>every</code> the rows stay "…" after you let go, longer the longer you dragged, about a third of your drag time; with <code>inflight</code> they appear within 80 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Unlimited concurrency: no line, 40.8 ms round trips, rows right 52 ms after release; the server did 1.2 s of query work in a 0.92 s drag (two queries at once a third of the time).</li>
+    <li data-kind="measured">In all four TanStack drags no reply was drawn before the release: a 40 ms answer is stale after 30 ms of drag, whatever the policy.</li>
+    <li data-kind="inferred">ρ = λ × S ÷ c decides whether a line grows; one in flight lowers λ, cancel sheds the excess, more servers raise c. Only the first is free for the engine.</li>
+  </ul>
+  <p class="next" data-answer="policy"><b>Next question →</b> Policies with several requests out raise a new problem: replies need not come back in the order they were asked.</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · Out of order, and large" data-title="Replies that overtake each other" data-node="service reply js policy">
+  <p class="holding"><span class="label">Question I hold</span><span>The service time now varies from 5 to 45 ms and the backend serves all queries at once. A later request can finish first. Who notices?</span></p>
+  <div class="predict" data-right="a"><span class="label">Predict first</span>
+    <p><code>b-jitter-regular</code>: regular-table scrolls for two seconds against that backend, 59 requests. How many replies arrive before the reply to an earlier request?</p>
+    <div class="opts"><button data-k="a">None.</button><button data-k="b">About a third: whenever a short query follows a long one.</button><button data-k="c">Nearly all.</button></div>
+    <div class="reveal"><p><b>None.</b> In all <b data-m="b-jitter-regular/ws.requests"></b> <code>recv</code> events the arguments say <code>busy: 0</code>: the server never held two requests. regular-table's draw loop has one out at a time (step 10), so there is nothing to overtake. Jitter only makes its draw cycle uneven: commits come 17, 33 or 50 ms apart.</p></div>
+  </div>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>To see overtaking I need a client with several requests out. <code>b-jitter-every-tanstack</code> is the same scroll and backend with our TanStack source and the every-range policy: a request per frame, each answered after 5 to 45 ms.</p>
+  </div></div>
+  <div class="tracelink" data-trace="b-jitter-every-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["b-jitter-every-tanstack"],"from":308,"to":404,"rows":["main","app","backendIo","backendQuery"],"pins":[[1,317.1,"backendIo"],[2,334,"backendIo"],[3,351.8,"backendIo"],[4,356,"backendIo"],[5,356.1,"main"],[6,397.5,"app"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>317.05 ms: <code>recv #17</code> (row 28). Its query will take 38.9 ms.</li>
+    <li><i>2</i>333.97 ms: <code>recv #18</code> (row 29), with <code>busy: 1</code>: #17 is still running. This one takes 17.8 ms.</li>
+    <li><i>3</i>351.83 ms: <code>send #18</code>. The later request is answered first.</li>
+    <li><i>4</i>355.97 ms: <code>send #17</code>, 4 ms behind.</li>
+    <li><i>5</i>The page handles #18 at 351.94 ms and #17 at 356.09 ms, in that order, as two tasks.</li>
+    <li><i>6</i>◆ 397.5 ms: the next time all visible rows are filled (why so late is step 14).</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The backend sends in completion order and the WebSocket delivers in the order sent, so the page sees #18 before #17. Nothing goes wrong in the page: row 29 is stored when #18 lands, row 28 when #17 lands. Our source never looks at the order.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/source.ts:123–125, 129–131</span>
+      <p>What makes the order irrelevant: every reply names its request, and its rows are stored under their own row numbers.</p>
+<pre><span class="n">123</span>    const msg = JSON.parse(ev.data) as { <mark>id</mark>: number; <mark>y0</mark>: number; x0: number; rows: Cell[][]; …
+<span class="n">124</span>    const flight = inFlight.get(<mark>msg.id</mark>);
+<span class="n">125</span>    inFlight.delete(msg.id);
+<span class="n">129</span>      let row = cache.get(<mark>msg.y0 + i</mark>);
+<span class="n">131</span>      for (let c = 0; c &lt; cells.length; c++) row[msg.x0 + c] = cells[c];</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>A WebSocket keeps order; a server need not</dt><dd>Messages on one connection arrive in the order they were sent. But "sent" is when the server finished, not when the client asked. Any server that works on two requests at once can reverse them.</dd>
+      <dt>Apply by key, not by arrival</dt><dd>A reply is safe to apply in any order if it says what it is (request id, row range) and the receiver files it there. The dangerous pattern is "the reply that just arrived is the current view".</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with several requests in flight and uneven service, overtaking is routine (here within the first second); a design with one pull in flight per view cannot have it.</p>
+    <p><b>No:</b> that keyed storage is enough when the data changes. This lab's rows never change, so an older reply and a newer one agree. If rows are updated between two queries, the reply that was <em>computed</em> earlier can <em>arrive</em> later and overwrite fresher cells; then the key must include the engine's version of the data. No trace here exercises that.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: a pull reply carries the request id, the window it covers and the data version it was computed at; the view applies it only if it is not older than what it holds. With one pull in flight the check never fires, which is one more reason to prefer that policy; with parallel pulls it is what keeps the table correct.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-jitter-every-tanstack slices '^(recv|send) #1[78]$'</code>. Expected: <code>recv #17</code> 317.05, <code>recv #18</code> 333.97, <code>send #18</code> 351.83, <code>send #17</code> 355.97. And <code>node lab/harness/q.mjs b-jitter-regular slices '^recv'</code>: 59 lines, every one <code>"busy":0</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="rejected">"With jittered service, regular-table's replies overtake each other": never; in 59 requests the server held one at a time. Its draw loop serializes requests.</li>
+    <li data-kind="measured">With a request per frame and 5–45 ms service, reply #18 was sent 4 ms before reply #17; the page handled them in that order and stored each by row.</li>
+    <li data-kind="read">Our source matches replies by id and stores cells by row (source.ts:124, 129–131), so arrival order does not matter for unchanging data.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> So far every reply was a few hundred bytes. What does a large one cost, and where?</p>
+</section>
+
+<section class="step" data-part="D · Out of order, and large" data-title="A megabyte per reply" data-node="reply task js method">
+  <p class="holding"><span class="label">Question I hold</span><span>Each reply is padded to 1 MB. Which thread pays for the megabyte: the network service, the IO thread, or the main thread in <code>JSON.parse</code>?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p><code>JSON.parse</code> of a 1,000,156-byte reply, on the main thread, takes about…</p>
+    <div class="opts"><button data-k="a">10 ms: a megabyte of JSON is a lot.</button><button data-k="b">1.5 ms.</button><button data-k="c">0.15 ms.</button></div>
+    <div class="reveal"><p><b data-m="b-pad-1mb/ws.parse.p50" data-unit="ms"></b> at the median (max <b data-m="b-pad-1mb/ws.parse.max" data-unit="ms"></b>). The padding is one long string, and a string gives a parser little to do: no numbers to convert, no arrays to build. Compare <code>b-window-drag-tanstack</code> (step 6): a reply of 36 KB that holds 6,120 cells parses in <b data-m="b-window-drag-tanstack/ws.parse.p50" data-unit="ms"></b>. The same time for a twenty-seventh of the bytes.</p></div>
+  </div>
+  <div class="tracelink" data-trace="b-pad-1mb">Zoom to 522–531 ms on <code>CrRendererMain</code>.</div>
+<pre>  ms       process · thread                        event (reply #26)
+ 522.820   Backend · query service                 encode #26: JSON.stringify, 1,000,156 bytes, 0.403 ms
+ 523.223   Backend · ws io                         send #26 {bytes: 1000156, buffered: 0}
+ 523.345   Network service · Chrome_ChildIOThread  EpollEvent (socket readable), then one mojo message per chunk
+ 523.453   Renderer · CrRendererMain               <span class="cp">1</span> seven tasks, 0.06–0.08 ms each, 0.07 ms apart: Receive mojo message (WebSocketClient)
+ 523.954   Renderer · CrRendererMain               <span class="cp">2</span> the eighth: ThreadControllerImpl::RunTask, 2.062 ms
+ 525.304       WebSocketReceive {dataLength: 66713}                       <span class="cp">3</span> 1.35 ms into the task
+ 525.527       FunctionCall socket.onmessage, 0.400 ms                    <span class="cp">4</span> ws parse #26: 0.33 ms, MinorGC 0.15 ms
+ 526.016     ThreadControllerImpl::RunTask ends
+ 529.990   the enclosing RunTask slice ends: 6.039 ms                     <span class="cp">5</span> 3.97 ms after the task inside it</pre>
+  <div class="lanes" data-lanes='{"traces":["b-pad-1mb"],"from":514,"to":534,"rows":["tasks","main","gc","app","backendQuery"],"pins":[[4,525.7,"main"],[5,528,"tasks"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The megabyte reaches the renderer in eight pieces. Each is its own main-thread task that copies up to 131,000 bytes out of the data pipe; between two of them the network service's thread refills the pipe.</li>
+    <li><i>2</i>The last piece completes the message.</li>
+    <li><i>3</i><code>dataLength</code> is 66,713: the size of the last piece, not of the message. Before this instant, 1.35 ms; after it, 0.2 ms until our handler starts.</li>
+    <li><i>4</i>Our handler: 0.4 ms including a scavenge.</li>
+    <li><i>5</i>The outer <code>RunTask</code> slice, the one trace tools read as "the task", lasts 4 ms longer than the task inside it. No slice names that time, and the sampled profile calls it <code>(idle)</code>.</li>
+  </ol>
+  <p class="note">The chart shows the same reply with pins 4 and 5 of the list: the request leaves at 517.5 ms, the 5 ms query bar follows, and the grey task bar runs on long after the yellow handler.</p>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Over the 99 padded replies of this recording (my script over the trace; medians): 0.97 ms from the start of the last task to <code>WebSocketReceive</code>, 0.23 ms in <code>socket.onmessage</code>, and a tail of 2.58 ms (never less than 2.26) between the end of <code>ThreadControllerImpl::RunTask</code> and the end of <code>RunTask</code>. With plain 150-byte replies (<code>b-scroll-ws-regular</code>) the same three numbers are 0.02, 0.10 and 0.03 ms. "Down" rose from <b data-m="b-scroll-ws-regular/ws.downMs.p50" data-unit="ms"></b> to <b data-m="b-pad-1mb/ws.downMs.p50" data-unit="ms"></b>. Garbage collection: <b data-m="b-pad-1mb/gc.minor"></b> scavenges, <b data-m="b-pad-1mb/gc.minorMs" data-unit="ms"></b> in total, and <b data-m="b-pad-1mb/gc.major"></b> major collections, <b data-m="b-pad-1mb/gc.majorMs" data-unit="ms"></b>: the heap falls from 8 MB to 4 MB at each scavenge, so the megabytes are short-lived garbage that is cheap to reclaim.</p>
+    <p>So the megabyte costs the main thread about 4.5 ms per reply, and <code>JSON.parse</code> is 0.15 ms of it. Where is the rest?</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:services/network/websocket.cc;l=69">services/network/websocket.cc:69–70</a>
+      <p>Why eight tasks: the pipe between network service and renderer holds 131,000 bytes.</p>
+<pre><span class="n">69</span>  constexpr uint32_t <mark>kReceiveDataPipeCapacity</mark> =
+<span class="n">70</span>      BUILDFLAG(IS_ANDROID) ? 1 &lt;&lt; 16 : <mark>131000</mark>;</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc;l=1155">…/websockets/websocket_channel_impl.cc:1144, 1155–1158</a>
+      <p>Why time passes before <code>WebSocketReceive</code>: non-final pieces are appended to a buffer; on the final one a DevTools probe gets the whole message <em>before</em> the trace instant is written.</p>
+<pre><span class="n">1144</span>      message_chunks_->Append(data);
+<span class="n">1155</span>    <mark>probe::DidReceiveWebSocketMessage</mark>(execution_context_, identifier_, opcode,
+<span class="n">1156</span>                                      false, chunks);
+<span class="n">1158</span>        "WebSocketReceive", InspectorWebSocketTransferEvent::Data,</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/core/inspector/inspector_network_agent.cc;l=2136">…/core/inspector/inspector_network_agent.cc:2136–2144</a>
+      <p>What the probe does when a DevTools client has the Network domain enabled: copy every piece into one buffer and turn it into a protocol event.</p>
+<pre><span class="n">2136</span>    Vector&lt;uint8_t> flatten;
+<span class="n">2139</span>      <mark>flatten.append_range(span);</mark>
+<span class="n">2141</span>    GetFrontend()-><mark>webSocketFrameReceived</mark>(
+<span class="n">2144</span>        WebSocketMessageToProtocol(op_code, masked, flatten));</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/core/exported/web_dev_tools_agent_impl.cc;l=645">…/core/exported/web_dev_tools_agent_impl.cc:645–652</a>
+      <p>And the tail: after <em>every</em> task, DevTools' agent first tells V8 the thread is idle, then serializes and sends the queued protocol events.</p>
+<pre><span class="n">645</span>  void WebDevToolsAgentImpl::DidProcessTask(
+<span class="n">651</span>    <mark>ThreadDebugger::IdleStarted(isolate);</mark>
+<span class="n">652</span>    <mark>FlushProtocolNotifications();</mark></pre>
+      <p>The harness drives Chrome with Playwright, which enables that domain and listens for the event (<code>lab/node_modules/playwright-core/lib/coreBundle.js:37759, 37766</code>, version 1.65.1: <code>"Network.webSocketFrameReceived"</code>, <code>session.send("Network.enable")</code>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Observer effect</dt><dd>What the measuring tool makes the program do. A DevTools client that watches the network receives a copy of every WebSocket message. For 150 bytes that is nothing. For a megabyte it is a copy, a conversion to a string, a serialization and an IPC, on the main thread, per message.</dd>
+      <dt><code>RunTask</code> and <code>ThreadControllerImpl::RunTask</code></dt><dd>Two slices around every task. The outer one also covers what task observers do after the task returns. It is the one tools use: <code>base/task/sequence_manager/thread_controller_with_message_pump_impl.cc:453–456</code> says "Trace-parsing tools (DevTools, Lighthouse, etc) consume this event to determine long tasks", and this course's task and long-task numbers read it too (<code>analyze-lib.mjs:262</code>).</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>Two beliefs fell here. <b>First:</b> "a megabyte of JSON is a main-thread parsing problem." The parse is 0.15 ms, because parse cost follows the number of values, not the number of bytes: 6,120 cells in 36 KB cost as much as one string of 1,000 KB. <b>Second:</b> "what the trace shows on the main thread is what the page costs." About 3.5 of the 4.5 ms per reply (the 2.6 ms tail and, by my reading of the source, most of the 1 ms before <code>WebSocketReceive</code>) is Chrome copying the message for the DevTools client that the recording itself attached. The sampled profile cannot see it: V8 has been told the thread is idle. The rule I keep: when a slice is longer than everything inside it and the profile says idle, I ask what is observing the page before I ask what the page is doing.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a large message reaches the main thread as one task per 131 KB plus a final task that assembles it; with a DevTools client attached, every message is also copied to that client on the main thread, in time no JavaScript profile shows.</p>
+    <p><b>No:</b> the cost of a megabyte <em>without</em> an observer. The harness cannot record without its DevTools session, so the split "1 ms real, 3.5 ms observer" is inferred from source and from the tail's size, not measured against a control. And nothing here says what a megabyte of <em>cells</em> costs: by the rate of step 6's replies (0.17 ms per 36 KB) that would be about 5 ms of parsing, but that is an extrapolation, not a trace.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal on where to parse. At window-sized replies, parsing is not the frame's problem: in <code>b-window-drag-tanstack</code> the parse is 0.2 ms, writing the cells 6 ms, and style, layout and paint of them 60 ms. (A big window does not even mean big replies in a steady scroll: <code>b-wide-tanstack</code>, 100 columns on a large viewport, averages 285 bytes per reply, because only the rows that entered are asked for.) Parsing moves off the main thread when replies carry much more than is drawn, or arrive at a high rate. Then the socket itself should live in the worker, so that the per-chunk tasks, the assembly and the parse all leave the main thread; what crosses to the renderer, and whether it is cloned or transferred, is Module 7's question (<a href="streaming.html">streaming.html</a>). And when profiling large messages with DevTools open, expect the tool's own copy in the numbers.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-pad-1mb tree 523.9 530.2 main 5</code>. Expected: a <code>RunTask</code> of 6.04 ms containing a <code>ThreadControllerImpl::RunTask</code> of 2.06 ms. Then <code>… prof 523.9 530</code>: 3.98 ms of <code>(idle)</code> in a window where "a task is running".</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">A 1 MB reply: 8 main-thread tasks (131 KB pipe), JSON.parse 0.15 ms, yet about 4.5 ms of main thread per reply; "down" 2.5 ms against 0.3 ms.</li>
+    <li data-kind="rejected">"Parse time follows bytes": one 1 MB string parses in 0.15 ms; 6,120 cells in 36 KB take 0.17 ms.</li>
+    <li data-kind="read">With a DevTools client watching the network, each received WebSocket message is copied and sent to it (inspector_network_agent.cc:2136–2144) in a flush after the task, after V8 was told the thread is idle (web_dev_tools_agent_impl.cc:651–652).</li>
+    <li data-kind="inferred">The 2.6 ms unattributed tail of every big-reply task is that flush; it is the recording's observer effect and scales with message size.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Back to ordinary replies and the question behind all of this: while an answer is on its way, what is the user looking at?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · What the user sees" data-title="Blank or stale: a steady scroll" data-node="dom frame policy"
+  data-ask="see|While the answer is on its way, what is on screen, and what number describes it?">
+  <p class="holding"><span class="label">Question I hold</span><span>A steady scroll at 1,170 px/s (about 0.8 rows per frame), backend 30 ms. TanStack's panel shows "…" for rows it does not have; regular-table shows the rows it has. How long is each wrong?</span></p>
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>In the TanStack panel a new row enters and its request is answered 30 ms later. How long does that row show "…"?</p>
+    <div class="opts"><button data-k="a">30 ms: until its reply.</button><button data-k="b">33 ms: its reply, rounded up to a frame.</button><button data-k="c">Up to about 100 ms.</button></div>
+    <div class="reveal"><p><b>Up to about 100 ms.</b> Rows are filled in bursts, every 83 to 117 ms, mostly four to six rows at a time. A row whose reply has arrived keeps its "…" until <em>every</em> row of the window has arrived.</p></div>
+  </div>
+  <div class="tracelink" data-trace="b-scroll-ws-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["b-scroll-ws-tanstack","b-scroll-ws-regular"],"titles":["b-scroll-ws-tanstack · placeholders","b-scroll-ws-regular · stale rows"],"from":292,"to":424,"rows":["frames","main","app"],"pins":[[1,297.9,"app",0],[2,300.9,"app",0],[3,331.4,"main",0],[4,414.5,"app",0],[5,300.6,"app",1],[6,331.1,"main",1],[7,334,"app",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>TanStack, ◆ 297.9 ms: a burst fills 24 cells. All visible rows are right.</li>
+    <li><i>2</i>300.9 ms: row 27 enters as "…"; request #16. A new row and a new request follow in each of the next five frames.</li>
+    <li><i>3</i>331.4 ms: reply #16 is handled and our <code>render()</code> runs. It writes nothing (<code>cells: 0, filled: false</code>): row 28's reply is still out.</li>
+    <li><i>4</i>◆ 414.5 ms: the frame at 400 ms brought no new row, the last reply landed, and one render fills 36 cells: six rows, the oldest of which had its data for 83 ms.</li>
+    <li><i>5</i>regular-table, 300.6 ms: its draw asks for rows 14–26 (only row 26 is new to the cache).</li>
+    <li><i>6</i>331.1 ms: the reply; the draw waits for the animation frame.</li>
+    <li><i>7</i>334.0 ms: commit, and the next request, now for rows 16–28. The table shows rows 14…; the scrollbar is two rows further.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>TanStack panel:</b> <b data-m="b-scroll-ws-tanstack/ws.requests"></b> requests, each answered in <b data-m="b-scroll-ws-tanstack/ws.roundTrip.p50" data-unit="ms"></b>. The rows already on screen move smoothly with the compositor's scroll. At the bottom a band of "…" grows by a row per frame, up to five visible rows (120 px of a 288 px viewport), then fills at once. The viewport is completely right (◆) <b data-m="b-scroll-ws-tanstack/content.completeMarks"></b> times in two seconds.</p>
+    <p><b>regular-table:</b> <b data-m="b-scroll-ws-regular/ws.requests"></b> requests: a strict two-frame cycle of request, reply, commit. No cell is ever blank. But the table is pinned in place between commits, so the content advances in steps of about 1.6 rows, 30 times a second, and what it shows is the scroll position of two frames (33 ms) ago. ◆ appears <b data-m="b-scroll-ws-regular/content.completeMarks"></b> times: at 1,051 ms, where the synthesized scroll pauses for a few frames, and at the end.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/tanstack.ts:113, 121, 129 · lab/pages/src/source.ts:160–164</span>
+      <p>Why an arrived row stays blank. <code>peek</code> returns the window only if every cell of it is cached; otherwise <code>undefined</code>, and then no row gets data:</p>
+<pre><span class="n">113</span>    const data = source.peek(first, last + 1, x0, x1 + 1);
+<span class="n">121</span>        const row = <mark>data?.[item.index - first]</mark>;                  <span class="c">// data undefined → every row undefined</span>
+<span class="n">129</span>        } else if (… || (!el._ready &amp;&amp; row)) fill(el, item.index, x0, x1, row);
+
+<span class="c">// source.ts</span>
+<span class="n">160</span>    peek(y0, y1, x0, x1) {
+<span class="n">162</span>      if (<mark>has(y0, y1, x0, x1)</mark>) return collect(y0, y1, x0, x1);   <span class="c">// all or nothing</span>
+<span class="n">163</span>      request(y0, y1, x0, x1);
+<span class="n">164</span>      return undefined;</pre>
+      <p>At 0.8 rows per frame, about every sixth frame brings no new row. That leaves a 33 ms gap without a request, just longer than the 30 ms round trip: the only moments when nothing is in flight and <code>has()</code> is true. Hence one fill per six frames, 100 ms.</p>
+      <span class="path">lab/pages/src/regular.ts:14–16</span>
+<pre><span class="n">14</span>  // The &lt;table> is `position: sticky` inside the scroller: while a draw is
+<span class="n">15</span>  // pending it stays put, showing the previous rows, instead of scrolling
+<span class="n">16</span>  // away. Cells are reused by screen position, not by row.</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Blank time and staleness</dt><dd>Two numbers for "late". <em>Blank time</em>: how long a visible cell shows a placeholder. <em>Staleness</em>: how old the position (or data) on screen is relative to what the user asked for. A blank table can be perfectly fresh where it is filled; a stale one is never blank.</dd>
+      <dt>All-or-nothing reads</dt><dd>An interface that answers "the whole window or nothing" turns the slowest cell's latency into every cell's latency.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed a 30 ms backend means rows are blank for about 30 ms. The round trips are 30 ms, every one. The rows are blank for up to 100 ms, because the page's read is all-or-nothing and a steady scroll keeps one request in flight nearly all the time. And I believed the frame statistics would show the difference between the two panels: "frames without the main thread's update" are <b data-m="b-scroll-ws-tanstack/frames.partial"></b> of <b data-m="b-scroll-ws-tanstack/frames.vsyncs"></b> for TanStack and <b data-m="b-scroll-ws-regular/frames.partial"></b> of <b data-m="b-scroll-ws-regular/frames.vsyncs"></b> for regular-table. That counts something else. In these two traces the amber vsyncs are exactly those where a main frame was in progress and the vsync before had produced no main-thread update (I listed every <code>PipelineReporter</code> of both). TanStack changes the DOM in five frames of six (a new placeholder row), regular-table in every second frame (one commit per reply). The count follows the cadence of DOM changes, not how wrong the screen is. The rule I keep: no built-in frame metric knows whether a cell shows the right value. That needs a mark of my own.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> how long the screen is wrong is decided by the draw policy on top of the round trip: all-or-nothing reads gave 100 ms of blank for a 30 ms backend; draw-what-you-asked-for gave 33 ms of staleness and half the content frame rate.</p>
+    <p><b>No:</b> that "TanStack shows placeholders". TanStack Virtual computes ranges; the placeholder and the all-or-nothing read are this lab's forty lines around it (Module 3, <a href="anatomy.html">anatomy.html</a>). A source that hands out the rows it has would fill each row 30 ms after it entered. The lab has no such knob, so that is untested here.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-scroll-ws-tanstack marks 'draw|content complete' 296 420</code>. Expected: after the <code>filled:true</code> draw at 297.90, about twenty draws with <code>"filled":false</code>, then at 414.48 one with <code>"cells":36,"filled":true</code> and the ◆ mark at 414.59.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">30 ms backend, steady scroll: the TanStack panel fills rows in bursts every 83–117 ms (4–6 rows), though every round trip is 30 ms; regular-table commits every second frame, 33 ms behind, never blank.</li>
+    <li data-kind="read">Our panel reads the window all-or-nothing (source.ts:162; tanstack.ts:113, 121): one missing row keeps every arrived row blank.</li>
+    <li data-kind="rejected">"Frames without the main update" measures lateness of content: it follows how often the DOM changes (18 against 58 of 140 vsyncs), not whether cells are right.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> If fills happen only when nothing is in flight, a faster scroll should never fill. Does it?</p>
+</section>
+
+<section class="step" data-part="E · What the user sees" data-title="Change one input: scroll twice as fast" data-node="dom js policy method">
+  <p class="holding"><span class="label">Question I hold</span><span>My explanation of the 100 ms bursts makes a prediction: at more than one new row per frame a request is always in flight, so nothing is filled until the scroll stops. I recorded <code>b-scroll-fast-ws-tanstack</code> (2,400 px/s, the same 30 ms backend) to test it.</span></p>
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The scroll runs for two seconds, with a pause of a few frames in the middle. The backend answers all <b data-m="b-scroll-fast-ws-tanstack/ws.requests"></b> requests in 30 ms each. How many times are rows filled?</p>
+    <div class="opts"><button data-k="a">About 120 times: once per reply.</button><button data-k="b">Twice.</button><button data-k="c">About 20 times: every 100 ms, as before.</button></div>
+    <div class="reveal"><p><b>Twice:</b> at 1,030 ms, in the pause, and at 2,098 ms, after the end. Each fill writes 90 cells, all fifteen rows in the DOM. For most of two seconds the whole table shows "…".</p></div>
+  </div>
+  <div class="tracelink" data-trace="b-scroll-fast-ws-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["b-scroll-ws-tanstack","b-scroll-fast-ws-tanstack"],"titles":["b-scroll-ws-tanstack · 1,170 px/s","b-scroll-fast-ws-tanstack · 2,400 px/s"],"from":-20,"to":2200,"rows":["frames","app"],"pins":[[1,414.5,"app",0],[2,1030.5,"app",1],[3,2098.3,"app",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>At 1,170 px/s: a ◆ every 100 ms or so, <b data-m="b-scroll-ws-tanstack/content.completeMarks"></b> in all.</li>
+    <li><i>2</i>At 2,400 px/s: the first ◆ at 1,030.5 ms, when the synthesized scroll pauses and the last reply lands.</li>
+    <li><i>3</i>The second and last ◆ at 2,098.3 ms, <b data-m="b-scroll-fast-ws-tanstack/content.settleMs" data-unit="ms"></b> after the input ended.</li>
+  </ol>
+  <table class="mtable" data-rows="b-scroll-ws-tanstack,b-scroll-fast-ws-tanstack,b-scroll-ws-regular" data-names="TanStack panel · 1170 px/s,TanStack panel · 2400 px/s,regular-table · 1170 px/s" data-head="30 ms backend" data-cols="ws.requests|requests,ws.roundTrip.p50|round trip p50|ms,ws.roundTrip.max|max|ms,content.completeMarks|times all visible rows were right,content.settleMs|input end → rows right|ms,frames.dropped|frames dropped" data-hi="b-scroll-fast-ws-tanstack:content.completeMarks"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The prediction holds. By every number the backend and the transport report, the fast scroll is the healthier run: more requests, the same 30 ms, no line, no dropped frame. On screen it is the worst case in this module: an empty table that scrolls smoothly.</p>
+    <p>The trace shows a second thing I did not go looking for. The panel drew <b data-m="b-scroll-fast-ws-tanstack/app.draw.n"></b> times for <b data-m="b-scroll-fast-ws-tanstack/main.scrollEvents"></b> scroll events (<b data-m="b-scroll-ws-tanstack/app.draw.n"></b> for <b data-m="b-scroll-ws-tanstack/main.scrollEvents"></b> at the slower speed). Near the end one reply is followed by thirty and more <code>app: draw</code> spans within a millisecond.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/tanstack.ts:152 · lab/pages/src/source.ts:147–148, 170</span>
+      <p>Where the extra draws come from. Every render that finds data missing registers a new waiter that will render again:</p>
+<pre><span class="n">152</span>    if (!data) void source.get(first, last + 1, x0, x1 + 1)<mark>.then(render)</mark>; <span class="c">// render again when it arrives</span>
+
+<span class="c">// source.ts</span>
+<span class="n">170</span>      return new Promise((resolve) => <mark>waiting.push(</mark>{ y0, y1, x0, x1, done: () => resolve(collect(y0, y1, x0, x1)) }));
+<span class="n">147</span>      const w = waiting[i];
+<span class="n">148</span>      if (has(w.y0, w.y1, w.x0, w.x1)) waiting.splice(i, 1)[0].done();   <span class="c">// in onmessage: wake every satisfied waiter</span></pre>
+      <p>A reply that completes a window wakes every waiter registered for it. Each woken render finds the <em>current</em> window incomplete and registers another waiter. The number of waiters grows by one per scroll event and is never reduced, so a reply late in the scroll triggers dozens of renders that each write nothing.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Throughput against staleness</dt><dd>Throughput counts answers per second. Staleness asks how old, or how absent, the thing on screen is. A client can receive every answer on time and show none of them.</dd>
+      <dt>One subscription per view</dt><dd>"Tell me when this arrives" registered once per render call multiplies wake-ups. A view needs one standing interest, replaced when the window changes.</dd>
+    </dl></div>
+  </div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed one reply causes one render. At 2,400 px/s it causes dozens, and the number per reply grows with the length of the scroll, so the total grows with its square (<b data-m="b-scroll-fast-ws-tanstack/app.draw.n"></b> draws, <b data-m="b-scroll-fast-ws-tanstack/app.draw.sum" data-unit="ms"></b> of main thread, for <b data-m="b-scroll-fast-ws-tanstack/main.scrollEvents"></b> scroll events). They are cheap here because each finds nothing to write. Replace "writes nothing" with a per-cell formatter and this is the long task of Module 4. The rule I keep: count calls per event before trusting that a handler runs once; <code>app.draw.n</code> next to <code>main.scrollEvents</code> would have shown it in any of these traces.</p></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the mechanism of step 14 is confirmed by a second recording with one input changed; and round-trip time, request count and frame outcomes all fail to show a table that is blank for two seconds. Only the page's own "rows right" mark does.</p>
+    <p><b>No:</b> how blank the screen was in pixels over time. The ◆ mark is all-or-nothing as well: it says when <em>every</em> visible row was right, not how many were. A per-row measure (the time each visible row spent as a placeholder) is what this needs; the lab does not record one.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposals. <b>Measure</b> what the design document already asks for, per view: age of the data on screen and time-blank per visible row, with tails, at the presentation point. Throughput and round trip were both perfect in the worst run here. <b>Draw</b> what has arrived: a window read should return the rows it has, and the painter should fill them, so that one slow row costs one row. <b>Subscribe</b> once per view, not once per render.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs b-scroll-fast-ws-tanstack marks 'content complete'</code>. Expected: two marks, at 1030.53 and 2098.32. Then <code>… marks draw 2079 2081</code>: 34 draws in two milliseconds, 29 of them with <code>"cells":0</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">At 2,400 px/s with the same 30 ms backend the TanStack panel filled rows twice in two seconds (at the pause and at the end), as the all-or-nothing mechanism predicts; round trips stayed at 30 ms.</li>
+    <li data-kind="measured">The panel drew 3,830 times for 123 scroll events: each render that misses data registers one more waiter (tanstack.ts:152), and a reply wakes them all.</li>
+    <li data-kind="inferred">Neither throughput, round trip nor frame outcomes detect a blank table; a mark of "rows right", better per row, at the presentation point does.</li>
+  </ul>
+  <p class="next" data-answer="see"><b>Next question →</b> What can I now do without scrolling back?</p>
+</section>
+
+<!-- ═════════════════════════ PART F ═════════════════════════ -->
+
+<section class="step" data-part="F · Check" data-title="Self-check, and what to carry to the engine" data-node="send netsvc recv queue service reply task js dom frame policy method">
+  <p class="holding"><span class="label">Question I hold</span><span>Can I answer these from memory, and say for each what evidence I would look for in a trace?</span></p>
+  <div class="exercise"><span class="label">1 · The hops</span>
+    Name the threads that run code for one WebSocket reply between the backend's <code>send</code> and your <code>onmessage</code>, and the queue and priority of the main-thread task.
+    <details><summary>Answer</summary><p>The network service's <code>Chrome_ChildIOThread</code> (reads the socket, parses the frame, writes a mojo message and the payload), the renderer's <code>Chrome_ChildIOThread</code> (only posts a task), the renderer's main thread. The task runs from <code>FRAME_LOADING_TQ</code> at normal priority with task type <code>TASK_TYPE_NETWORKING</code>; inside it <code>Receive mojo message</code> (<code>network.mojom.WebSocketClient</code>), the instant <code>WebSocketReceive</code>, then a <code>FunctionCall</code>. On loopback the three hops took 0.2 ms (step 4).</p></details>
+  </div>
+  <div class="exercise"><span class="label">2 · Work or waiting</span>
+    A page reports a 75 ms round trip to a backend whose service time is 5 ms. Name two different places the other 70 ms can be, and the one measurement that separates them.
+    <details><summary>Answer</summary><p>In the backend's line (step 7: <code>serverWait</code>, visible as the gap between <code>recv #n</code> and <code>query #n</code> and in the queue counter), or in the main thread's queue (step 6: the reply's task waits behind a long task; "down" is large while the backend lane is empty). The separating measurement is the server's own receive/start/done times carried in the reply and compared on one clock, or as durations.</p></details>
+  </div>
+  <div class="exercise"><span class="label">3 · The line</span>
+    Requests arrive every 25 ms for 2 seconds at a single server that needs 40 ms each. How long does the last request wait, and how many are in line when it arrives?
+    <details><summary>Answer</summary><p>ρ = 40 ÷ 25 = 1.6. Each request waits 15 ms longer than the one before; 80 requests arrive, so the last waits about 79 × 15 ms ≈ 1.2 s (equivalently 2 s × (ρ − 1)). The server finished 50 of them in the 2 s, so about 29 are ahead of it. The check in a trace: <code>waitedMs</code> on successive <code>query</code> spans should climb by a constant.</p></details>
+  </div>
+  <div class="exercise"><span class="label">4 · Three policies</span>
+    For "every range", "one in flight, newest next" and "every range + cancel", say what bounds the wait for the final answer after the input stops, against a server that cannot be interrupted.
+    <details><summary>Answer</summary><p>Every range: nothing bounds it; it is the whole backlog, (overload time) × (ρ − 1) plus one service. One in flight: the rest of the query in service plus one service time, at most 2 × S. Cancel: the same 2 × S bound (the query in service cannot be stopped), with a line of at most the excess load; the cancels saved 6 of 30 queries at ρ = 1.32, about 1 − 1/ρ.</p></details>
+  </div>
+  <div class="exercise"><span class="label">5 · Observation points</span>
+    A reply is handled 5.8 ms after its request and the DOM is right 0.1 ms later. Why was it on screen 33.6 ms after the request, and would writing the DOM in <code>requestAnimationFrame</code> instead have changed that?
+    <details><summary>Answer</summary><p>The request left during a main frame; the reply arrived after that frame's commit, so its DOM change waited for the next <code>BeginMainFrame</code> (16 ms after the first), and that frame was presented one vsync after its commit. Waiting for an animation frame lands in the same <code>BeginMainFrame</code>, so in step 5 both designs were presented at 33.6 ms. DOM completion, commit and presentation are three different times.</p></details>
+  </div>
+  <div class="exercise"><span class="label">6 · The observer</span>
+    A main-thread task's <code>RunTask</code> slice is 6 ms; the <code>ThreadControllerImpl::RunTask</code> inside it is 2 ms; the sampled profile shows <code>(idle)</code> for the difference. What do you check?
+    <details><summary>Answer</summary><p>Whether a DevTools client is attached and what it subscribed to. After each task the DevTools agent marks V8 idle and then flushes protocol notifications (<code>web_dev_tools_agent_impl.cc:651–652</code>); with the Network domain enabled every WebSocket message is copied into one (step 13). The time is real main-thread time caused by the observer, and it scales with message size.</p></details>
+  </div>
+  <div class="exercise"><span class="label">7 · What to measure</span>
+    A run answers 121 requests in 30 ms each with no dropped frame. What else do you need before calling it good?
+    <details><summary>Answer</summary><p>What was on screen: step 15's run has exactly those numbers and showed placeholders for nearly two seconds. You need a mark of your own for "the visible rows are right" (better: time-blank or data age per visible row), taken at the presentation point, and its tail, not its mean.</p></details>
+  </div>
+  <div class="insight"><span class="label">For a table engine</span><p>The proposals of this module in one place, as inputs to the design, not decisions:</p>
+    <p><b>1.</b> One pull in flight per view, wanted window conflated to the latest (step 8, 11). <b>2.</b> Cancellation only where the engine can stop a running query (step 9). <b>3.</b> Replies carry request id, window, data version and the engine's queue and service times (steps 6, 12). <b>4.</b> Report reply handled, DOM written and frame presented as separate points (step 5). <b>5.</b> A window read returns what it has; painters fill partial windows; one subscription per view (steps 14, 15). <b>6.</b> Measure time-blank and data age per visible row, with tails (step 15). <b>7.</b> Parse in the worker that owns the socket once replies outgrow what is drawn; until then the cost is in the DOM (step 13). <b>8.</b> Engine events on the browser's clock in the same trace file: thirty lines, and it turned every "is it the backend?" in this module into a subtraction (steps 1, 2).</p></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Carried forward to Modules 7 and 8: the main-thread task queue is a queue like the backend's; a policy is judged by what is on screen and how old it is, not by answers per second.</li>
+  </ul>
+  <p class="next"><b>Next →</b> <a href="streaming.html">Module 7 · Live updates</a>: the server now pushes on its own clock, and the question becomes which of three paces decides what the user sees.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>
