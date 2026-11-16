@@ -16,8 +16,11 @@
 // away. Cells are reused by screen position, not by row.
 //
 // A pushed value (ticks) cannot be patched into one cell from outside, so
-// update() asks regular-table for a whole draw; regular-table coalesces
-// draws that are requested while one is running.
+// update() asks regular-table for a whole draw. With a synchronous data
+// source each draw() finishes inside the task that asked for it, so a draw
+// per message really is a draw per message (Module 7, step 6); the library's
+// lock only merges requests made while a draw is suspended across tasks,
+// for example while it waits for a backend.
 
 import "regular-table"; // defines <regular-table>; vite.config.mjs serves its TypeScript source
 import type { RegularTableElement } from "regular-table";

@@ -1,0 +1,1122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live updates: three paces · Table engines under load</title>
+<link rel="stylesheet" href="assets/course.css">
+<script src="data/index.js"></script>
+</head>
+<body>
+<div class="bar">
+  <a class="home" href="index.html">← Course</a>
+  <span class="title">7 · Live updates: three paces</span>
+  <div class="dots" id="dots"></div>
+  <span class="count" id="count"></span>
+  <button class="nav" id="prev">← Back</button>
+  <button class="nav" id="next">Next →</button>
+  <button class="nav" id="all">All</button>
+</div>
+<div class="layout">
+<aside class="rail">
+  <h2>Where we are</h2>
+  <div class="pipe" id="pipe">
+    <span data-node="server">server</span><span class="sep">→</span><span data-node="wire">socket, pipe</span><span class="sep">→</span>
+    <span data-node="queue">task queue</span><span class="sep">→</span><span data-node="handler">handler</span><span class="sep">→</span>
+    <span data-node="dom">DOM</span><span class="sep">→</span><span data-node="frame">main frame</span><span class="sep">→</span>
+    <span data-node="present">screen</span>
+    <span class="sep">·</span><span data-node="scheduler">scheduler</span><span class="sep">·</span><span data-node="worker">worker</span>
+    <span class="sep">·</span><span data-node="method">method</span>
+  </div>
+  <h2>Questions to keep</h2>
+  <ul class="asks" id="asks"></ul>
+  <h2>What I know so far <span id="ledger-count"></span></h2>
+  <ul class="ledger" id="ledger"></ul>
+  <details class="steps"><summary>All steps</summary><ul class="map" id="map"></ul></details>
+</aside>
+<main id="main">
+
+<div class="intro" id="intro">
+  <p class="kicker">Table engines under load · Module 7 · recorded 2026-11-16</p>
+  <h1>The server pushes 8,000 cell updates a second. How many should the page apply, when, and how old is a value when you see it?</h1>
+  <p class="lede">A table is open and a server pushes new cell values over a WebSocket on its own clock. Three things now run at three speeds: the server produces at its rate, the page applies at another, and the display shows a picture 60 times a second. This module follows one update from the server's timer to a pixel, then raises the rate until the page can no longer keep up, and compares what six policies do about it.</p>
+  <p>Afterwards you can reason about any live table as <b>three paces and the two buffers between them</b>; find the <b>knee</b>, the rate at which applying per message stops keeping up, and recognise it in a trace; measure <b>data age</b> at three points (handled, in the DOM, on screen); and say what Chrome's main-thread scheduler does when messages flood the thread.</p>
+  <p><b>Why this matters for Tablelab.</b> This is the Stage 0b / Pass 1 question: ingestion, publication and rendering as decoupled paces, with conflation and one pull in flight between them, and the difference between coalescing <i>notifications</i> and conflating <i>data</i>. Every design choice in that sentence appears below as a recorded trace with a control next to it.</p>
+  <p><b>What you need.</b> Module 1 (<a href="walkthrough.html">Where does a scroll go?</a>) for the trace vocabulary and Module 2 (<a href="frames.html">What happened to each frame?</a>) for frame outcomes and observation points. Module 6 (<a href="backend.html">One trace, two processes</a>) introduces the backend's lanes. The traces are in <code>traces/</code>; each step links the one it reads.</p>
+  <p class="note">Recorded 2026-11-16, headless Chrome 154.0.8037.57 (software compositing, a synthetic 60 Hz vsync), device scale factor 1.75, one traced run per scenario, on a machine that was doing other work at the same time. Numbers in bold that come from the traces are bound to the data and change if a scenario is re-recorded; small tables marked "read once" were read from this recording with the commands shown. The page writes a <code>performance.mark</code> for every message and a <code>performance.measure</code> for every apply; step 5 measures what that costs. Chromium source at <code>73c14f6</code> (M154), regular-table 0.9.2 (<code>52e86bf</code>), React 19.2 with scheduler 0.27.</p>
+  <div class="foot"><button class="primary" data-start>Start: 18 steps →</button></div>
+</div>
+
+<!-- ═════════════════════════ PART A ═════════════════════════ -->
+
+<section class="step" data-part="A · Three paces and two buffers" data-title="One update, from the server's timer to a pixel" data-node="server wire queue handler dom frame present"
+  data-ask="standing|Faced with any trace: what is my question, what is one unit of work, where is the unexplained time, and is it work or waiting?">
+  <p class="holding"><span class="label">Question I hold</span><span>Before any load: one value leaves the server. Which threads touch it, in what order, and where does its time go before I can see it?</span></p>
+
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The server sends one cell value 60 times a second. A value crosses three processes (the Node backend, Chrome's network service, the renderer), runs our handler, and is written into one cell. It will turn out to be about 9 ms old when it reaches the screen. Where is most of that time spent?</p>
+    <div class="opts"><button data-k="a">Crossing the processes: socket, network service, IPC</button><button data-k="b">In our handler: parse, bookkeeping, the DOM write</button><button data-k="c">Waiting: the value is in the DOM and nothing is looking at it yet</button></div>
+    <div class="reveal"><p><b>Waiting.</b> The value is in the DOM 0.33 ms after the server made it. It then sits there for 7.5 ms until the next vsync starts a frame. The transport and our code together are 4% of its age.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I take the quietest stream, <code>s-msg-60-tanstack</code>: 60 messages a second, one cell each, the keyed TanStack panel, and each message applied as it arrives (<code>apply=msg</code>). I pick message number 82 and list every event that mentions it, on every thread of every process, between the server's timer and the frame that shows it.</p>
+  </div></div>
+  <div class="tracelink" data-trace="s-msg-60-tanstack">In Perfetto: pin <code>tick producer</code> of the "Backend (node)" process and <code>CrRendererMain</code> of the Renderer; search <code>WebSocketReceive</code>.</div>
+<pre>ms        process / thread                    event                                   note
+319.907   Backend (node) / tick producer      produce + send              0.083 ms   <span class="cp">1</span> the value is born; <mark>sentUs</mark> is taken here
+319.992   Network service / IO thread         EpollEvent                  0.070 ms   <span class="cp">2</span> reads the socket
+320.038   Network service / IO thread         Send mojo message
+320.052   Renderer / Chrome_ChildIOThread     EpollEvent                  0.016 ms      posts a task to the main thread
+320.075   Renderer / CrRendererMain           RunTask                     0.215 ms   <span class="cp">3</span> queue FRAME_LOADING_TQ, normal priority
+320.097   Renderer / CrRendererMain           WebSocketReceive
+320.119   Renderer / CrRendererMain           FunctionCall socket.onmessage  0.134 ms
+320.165   Renderer / CrRendererMain           app: tick message                      <span class="cp">4</span> <mark>handled</mark>: 0.26 ms old
+320.220   Renderer / CrRendererMain           ProxyMain::SetNeedsAnimate, InvalidateLayout, ScheduleStyleRecalculation
+320.237   Renderer / CrRendererMain           UserTiming::Measure (app: tick apply)  <span class="cp">5</span> <mark>in the DOM</mark>: 0.33 ms old
+          <span class="c">… 7.5 ms in which nothing happens to this value …</span>
+327.75    Renderer / Compositor               vsync 87 begins
+327.88    Renderer / CrRendererMain           ProxyMain::BeginMainFrame   0.48 ms    <span class="cp">6</span> style, layout, paint, commit
+328.83    GPU process                         frame presented                        <span class="cp">7</span> <mark>on screen</mark>: 8.92 ms old</pre>
+  <div class="lanes" data-lanes='{"traces":["s-msg-60-tanstack"],"from":317,"to":331,"rows":["backendTicks","main","app","mainFrames","frames"],"pins":[[1,319.91,"backendTicks"],[4,320.12,"main.js"],[6,327.88,"mainFrames"],[7,327.75,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>The producer's pace.</b> A 1 ms timer in the backend computes how many messages are due and sends them. <code>sentUs</code>, the time written into the message, is on the trace clock, so every later event can be subtracted from it.</li>
+    <li><i>2</i><b>The network service</b>, a separate process, owns the socket. It reads the frame and forwards it to the renderer over mojo (Chrome's IPC): the length as a message, the bytes through a data pipe.</li>
+    <li><i>3</i><b>A task on the main thread.</b> The renderer's IO thread only posts it; the message is handled on <code>CrRendererMain</code>, in the queue named <code>FRAME_LOADING_TQ</code>, at normal priority. Step 15 comes back to those two facts.</li>
+    <li><i>4</i><b>Handled</b>: our <code>onmessage</code> has parsed the message. Our mark sits here.</li>
+    <li><i>5</i><b>In the DOM</b>: one <code>textContent</code> write. Blink notes that style and layout are stale and asks the compositor for a frame (<code>SetNeedsAnimate</code>). It does not compute anything yet.</li>
+    <li><i>6</i><b>The display's pace.</b> The next vsync starts a main frame, which turns the dirty DOM into a committed picture.</li>
+    <li><i>7</i><b>On screen</b>: the frame is presented 1.08 ms after its vsync.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>Three paces. The <b>server</b> produces when its timer says so. The <b>page</b> handles one message per task, as soon as the main thread is free. The <b>display</b> starts a frame every 16.67 ms. And two places where a value waits for the next pace:</p>
+    <p><b>Buffer 1, between server and page</b>: the kernel's socket buffers, the network service, a mojo pipe, and the main thread's task queue. It keeps every message, in order. It can only grow or drain.</p>
+    <p><b>Buffer 2, between page and display</b>: the DOM itself. It holds one value per cell; a newer value overwrites an older one that no frame has shown yet. The renderer reads it once per frame.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The two buffers have opposite characters. Buffer 1 is a queue: its length is how far the page is behind. Buffer 2 is a table of latest values: it has no length, only a freshness. Every policy in this module is a decision about which kind of buffer a value waits in, and where that buffer lives.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/ticks.ts:66–81</span>
+      <p>The page's side: where "handled" and "in the DOM" are defined for this module.</p>
+<pre><span class="n">66</span>  socket.onmessage = (ev) => {
+<span class="n">67</span>    const t0 = performance.now();
+<span class="n">68</span>    const m = decode(ev.data);
+<span class="n">74</span>    for (const u of m.u) {
+<span class="n">75</span>      overlay.set(u[0] * 4096 + u[1], u[2]);
+<span class="n">76</span>      dirty.set(u[0] * 4096 + u[1], u);
+<span class="n">77</span>    }
+<span class="n">80</span>    <mark>mark("app: tick message", { detail: { seq: m.s, sentUs: m.t } });</mark>
+<span class="n">81</span>    if (config.apply === "msg") <mark>flush(t0);</mark>      <span class="c">// apply now; "app: tick apply" ends after it</span></pre>
+      <span class="path">lab/server/backend.mjs:138, 141, 162</span>
+<pre><span class="n">138</span>    const due = rateBase + Math.floor(((now - rateSince) / 1e6) * hz);
+<span class="n">141</span>    while (produced &lt; due) {            <span class="c">// everything that is due, at once</span>
+<span class="n">162</span>  const timer = setInterval(produce, 1);</pre>
+      <p>The producer wakes every millisecond. At 8,000 messages a second that is a burst of eight per wake-up; it matters in steps 4 and 9.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Data age</dt><dd>Now minus the time the value was produced. It needs a clock both ends share; here the backend writes trace-clock microseconds into each message.</dd>
+      <dt>Observation point</dt><dd>Where on the path the age is read. Handled, in the DOM and on screen are three different numbers (Module 2 treats observation points in general).</dd>
+      <dt>Pace</dt><dd>The rhythm at which one stage takes work: a timer, a task queue, a vsync.</dd>
+      <dt>mojo</dt><dd>Chrome's inter-process message system. A WebSocket's bytes cross from the network service to the renderer through it.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> at this rate the path from server to DOM takes a third of a millisecond, and the rest of the age is waiting for the display's pace.</p>
+    <p><b>No:</b> that 8.9 ms is "the latency". It is one message, in one recording, with the server on the same machine. The 7.5 ms of waiting depends only on when in the frame interval the message happened to arrive.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-msg-60-tanstack marks . 300 345</code> lists three applies with their <code>oldestUs</code>; <code>… frames 290 350</code> lists the vsyncs. Subtract. Expected: every message of this trace is applied about 7.6 ms before a vsync, because 60 messages a second against 60 frames a second keep a constant phase.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">One update at 60/s: in the DOM 0.33 ms after the server produced it, on screen at 8.9 ms; 7.5 ms of that is waiting for the next vsync (s-msg-60-tanstack, message 82).</li>
+    <li data-kind="measured">A WebSocket message is handled in a main-thread task of queue FRAME_LOADING_TQ at normal priority; the network service and the renderer's IO thread only pass it on.</li>
+    <li data-kind="inferred">Two buffers separate the three paces: a queue of messages before the handler, and the DOM as a table of latest values before the frame.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> One message says little. What are the three ages over a whole run, and what happens to them when the rate goes from 60 to 8,000 a second?</p>
+</section>
+
+<section class="step" data-part="A · Three paces and two buffers" data-title="Three ages at four rates" data-node="handler dom present method"
+  data-ask="late|Why is the same page one frame later on screen in some recordings than in others?">
+  <p class="holding"><span class="label">Question I hold</span><span>Handled, in the DOM, on screen: how do the three ages distribute over a run, and which of them moves with the message rate?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Four recordings of the keyed panel, each message applied as it arrives, at 60, 500, 2,000 and 8,000 messages a second. For every message the analysis computes the three ages. <code>ageWhenHandled</code> is our mark minus <code>sentUs</code>; <code>ageWhenApplied</code> is the end of the apply minus the oldest <code>sentUs</code> in it; <code>ageOnScreen</code> is the presentation time of the first frame whose main-thread work ended after the apply, minus the same.</p>
+  </div></div>
+  <table class="mtable" data-rows="s-msg-60-tanstack,s-msg-500-tanstack,s-msg-2000-tanstack,s-msg-8000-tanstack" data-names="60 /s,500 /s,2000 /s,8000 /s" data-head="Messages per second"
+    data-hi="s-msg-2000-tanstack:ticks.ageOnScreen.p50,s-msg-2000-tanstack:ticks.ageOnScreen.p95"
+    data-cols="ticks.perSecondHandled|handled|/s,ticks.ageWhenHandled.p50|age handled p50|ms,ticks.ageWhenApplied.p50|age in DOM p50|ms,ticks.ageOnScreen.p50|age on screen p50|ms,ticks.ageOnScreen.p95|p95|ms,ticks.ageOnScreen.max|max|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Handled and in the DOM</b>: a fraction of a millisecond at every rate. The page keeps up; buffer 1 is empty.</p>
+    <p><b>On screen</b>: three shapes. At 60 a second the p50 and p95 are almost the same number (<b data-m="s-msg-60-tanstack/ticks.ageOnScreen.p50"></b> and <b data-m="s-msg-60-tanstack/ticks.ageOnScreen.p95"></b> ms): messages and frames have the same frequency, so every message waits the same fraction of a frame. At 500 and at 8,000 a second the p50 is near 10 ms and the p95 near 17.5 ms. And the 2,000 row is the same shape moved up by one frame: <b data-m="s-msg-2000-tanstack/ticks.ageOnScreen.p50"></b> and <b data-m="s-msg-2000-tanstack/ticks.ageOnScreen.p95"></b> ms.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The spread is arithmetic. Messages arrive evenly; a frame starts every 16.67 ms; so the wait for the next frame is spread evenly between 0 and 16.67 ms. Half the messages wait less than 8.3 ms, 95% less than 15.8 ms. Add a constant <i>L</i>, the time from "frame starts" to "frame presented":</p>
+<pre>age on screen  ≈  wait for the next vsync  +  L          p50 ≈ 8.3 + L      p95 ≈ 15.8 + L
+ 500 /s and 8000 /s:   p50 ≈ 9.9, p95 ≈ 17.5   →   L ≈ 1.6 ms
+2000 /s:               p50 ≈ 25.3, p95 ≈ 32.8  →   L ≈ 17 ms</pre>
+    <p>So the message rate does not show in these ages at all. What differs between the rows is <i>L</i>, and it differs by one whole frame. I check with the frame list of two of the traces (read once):</p>
+<pre>node lab/harness/q.mjs <b>s-msg-8000-tanstack</b> frames 300 400     node lab/harness/q.mjs <b>s-msg-2000-tanstack</b> frames 300 400
+vsync ms   state  seq   presented-after-ms                    vsync ms   state  seq   presented-after-ms
+  311.94   all     86   <mark>1.32</mark>                                    310.18   all     86   <mark>17.02</mark>
+  328.60   all     87   1.41                                    326.84   all     87   17.03
+  345.27   all     88   1.55                                    343.51   all     88   17.09</pre>
+    <p>Every frame of the 2,000 run is presented 17 ms after its vsync; every frame of the 8,000 run after 1.3 to 2 ms. Both are labelled "presented with the main thread's update". Nothing in our page differs between the two except the message rate, and the heavier one is the faster.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/harness/analyze-lib.mjs:376–381, 445–452</span>
+      <p>To know exactly what "on screen" means before trusting it.</p>
+<pre><span class="n">376</span>  const mainFrames = allFrames.filter((f) => f.main &amp;&amp; (f.state === "all" || f.state === "partial"))…
+<span class="n">378</span>    // The main frame that picks up a change made at `ts` is the first whose BeginMainFrame work ends after ts.
+<span class="n">379</span>    for (const f of mainFrames) if (<mark>f.main[1] >= ts</mark>) return f.end;
+<span class="n">445</span>    ageWhenApplied: quantiles(applies.filter((a) => a.d.oldestUs).map((a) => (a.ts + a.dur - <mark>a.d.oldestUs</mark>) / 1000)),</pre>
+      <p>Two things to remember. The age is of the <b>oldest</b> value in an apply; with one message per apply that is the message itself, with batching (steps 10 to 13) it is the worst value of the batch. And "on screen" is the compositor's presentation timestamp for the frame, which in headless Chrome is when the software display compositor finished drawing.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Uniform wait</dt><dd>If arrivals are unrelated to a periodic deadline of period T, the wait for the next deadline is spread evenly over 0…T: mean T/2, worst case T.</dd>
+      <dt>Phase lock</dt><dd>Two clocks of the same frequency keep a constant offset. 60 messages against 60 frames a second gives one age, not a distribution, and which one is luck.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> while the page keeps up, age on screen is "wait for the next frame, plus what the pipeline takes after that". Per-message apply contributes almost nothing to it at any of these rates.</p>
+    <p><b>No:</b> that 2,000 messages a second cost a frame of latency. A difference between two recordings is not yet an effect of the knob that differs between them; the next step finds what this one is.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Run the two <code>frames</code> commands above. Then <code>node lab/harness/q.mjs s-msg-500-tanstack frames 300 400</code>. Expected: "presented-after" near 1.5 ms, like the 8,000 run, not like the 2,000 run.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Age handled and age in the DOM stay below a millisecond from 60 to 8,000 messages a second on the keyed panel.</li>
+    <li data-kind="inferred">While the page keeps up, age on screen is a uniform 0…16.7 ms wait for the next vsync plus a constant L (frame start to presentation): p50 ≈ 8.3 + L, p95 ≈ 15.8 + L.</li>
+    <li data-kind="measured">L is about 1.5 ms in some recordings and about 17 ms in others, constant within a run and unrelated to the message rate.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Who holds a finished frame for 16 ms in some runs and not in others?</p>
+</section>
+
+<section class="step" data-part="A · Three paces and two buffers" data-title="A frame of latency that is not ours" data-node="frame present method"
+  data-ask="age|How old is a value when it reaches the screen, and which part of that age can an apply policy change?">
+  <p class="holding"><span class="label">Question I hold</span><span>The same page presents each frame 1.5 ms after its vsync in one recording and 17 ms after it in another. Where does the frame wait?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I put the two traces of step 2 on top of each other, one vsync wide, with the renderer's compositor thread and the display compositor ("viz", in the GPU process) in view. Then I look for a recording that changes from one behaviour to the other in the middle, so that everything else is held equal.</p>
+  </div></div>
+  <div class="tracelink" data-trace="s-msg-2000-tanstack">Pin <code>Compositor</code> (Renderer) and <code>VizCompositorThread</code> (GPU Process).</div>
+  <div class="lanes" data-lanes='{"traces":["s-msg-8000-tanstack","s-msg-2000-tanstack"],"titles":["s-msg-8000-tanstack: presented 1.3 ms after the vsync","s-msg-2000-tanstack: presented 17 ms after the vsync"],"from":309,"to":331,"rows":["mainFrames","compositor","viz","frames"],"pins":[[1,312.95,"compositor",0],[2,313.08,"viz",0],[3,310.28,"viz",1],[4,311.37,"compositor",1],[5,326.96,"viz",1]]}'></div>
+  <ol class="pins">
+    <li><i>1</i><b>Fast run.</b> The main frame commits; the renderer's compositor draws and submits at 312.95.</li>
+    <li><i>2</i>The display compositor was waiting for exactly that. It draws 0.1 ms later. Presented 1.3 ms after the vsync.</li>
+    <li><i>3</i><b>Late run.</b> The display compositor draws 0.04 ms after its own tick, <i>before</i> the renderer has produced anything for this vsync. It draws the frame the renderer submitted during the previous interval.</li>
+    <li><i>4</i>The renderer submits this vsync's frame at 311.37, one millisecond too late for the draw at pin 3.</li>
+    <li><i>5</i>That frame is drawn at the next tick, 15.6 ms later.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The main thread does the same work in both. The difference is one decision of the display compositor: wait for the renderer's new frame, or draw now with what it already has. In the late run it always has something: the frame that arrived too late for the last draw. So it never waits, the next frame is late again, and the state keeps itself alive.</p>
+    <p>The instants on the viz thread say it in words. Fast run, each vsync: <code>No damage yet</code>, then <code>All active surfaces ready</code>. Late run, each vsync: only <code>All active surfaces ready</code>, 120 times in 120 vsyncs.</p>
+    <p>There is a second way to be one frame late, with a different label. In <code>s-conflate-8000-tanstack</code> (step 13) the first 42 vsyncs are "presented without the pending main update", then it stops:</p>
+  </div></div>
+  <div class="tracelink" data-trace="s-conflate-8000-tanstack"></div>
+  <div class="lanes" data-lanes='{"traces":["s-conflate-8000-tanstack"],"from":640,"to":752,"rows":["app","mainFrames","compositor","frames"],"pins":[[6,679.09,"compositor"],[7,695.83,"app"],[8,695.75,"compositor"],[9,712.42,"mainFrames"]]}'></div>
+  <ol class="pins" start="6">
+    <li><i>6</i><b>Compositor late.</b> At the start of vsync 108 the renderer's compositor draws at once (679.09), before the main frame it has just requested answers. What it draws is the tree the main thread committed during vsync 107. This vsync's commit lands at 679.8 and waits 15.8 ms for the next draw. The frame is reported twice: an amber box (the draw without this vsync's update) and a main frame that takes 17 ms to be presented.</li>
+    <li><i>7</i>The server's message for this interval arrives at 695.83, a hair <i>after</i> vsync 109 began. At the vsync nothing was dirty, so no main frame was requested.</li>
+    <li><i>8</i>Vsync 109: the compositor draws the waiting tree and, for the first time, has no new commit left over.</li>
+    <li><i>9</i>Vsync 110: nothing is waiting to be drawn, so the compositor waits for the main frame and draws it in the same vsync. Green from here on, presented after 1.5 ms.</li>
+  </ol>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The pipeline behind the main thread has two stages that each hold at most one finished frame, and each can settle into "always one behind". One vsync without a commit empties the slot and the latency is gone. A stream that dirties the DOM in every frame never offers that vsync.</p>
+<pre>state of the pipeline            frames lane   presented after its vsync
+fast                             green         ≈ 1.5 ms
+display compositor one behind    green         ≈ 17 ms
+renderer compositor one behind   amber         ≈ 17 ms
+
+which recording was in which (2026-11-16, read once with q.mjs &lt;id&gt; frames)
+fast            s-msg-60/500/8000-tanstack, s-raf-8000-tanstack, s-raf-2000-regular, s-react-memo-2000
+display behind  s-msg-2000-tanstack, s-raf-2000-tanstack, s-bin-8000-tanstack, s-msg-2000-react
+renderer behind s-worker-8000-tanstack, s-msg-8000-react, s-conflate-8000-tanstack until 695 ms</pre>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:components/viz/service/display/display_damage_tracker.cc;l=169">components/viz/service/display/display_damage_tracker.cc:169–172</a>
+      <p>Why the display compositor does not wait in the late run: a client with a frame it has not acknowledged yet counts as ready.</p>
+<pre><span class="n">169</span>    // Surface is ready if there is an unacked active CompositorFrame, because
+<span class="n">170</span>    // its producer is CompositorFrameAck throttled.
+<span class="n">171</span>    <mark>if (SurfaceHasUnackedFrame(surface_id))</mark>
+<span class="n">172</span>      continue;</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:components/viz/service/display/display_scheduler.cc;l=751">components/viz/service/display/display_scheduler.cc:751–755</a>
+<pre><span class="n">751</span>  if (all_surfaces_ready &amp;&amp;
+<span class="n">752</span>      (needs_draw_ || allow_early_deadline_without_draw)) {
+<span class="n">753</span>    TRACE_EVENT_INSTANT("viz", <mark>"All active surfaces ready"</mark>);
+<span class="n">754</span>    return BeginFrameDeadlineMode::kImmediate;</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:cc/scheduler/scheduler_state_machine.cc;l=1400">cc/scheduler/scheduler_state_machine.cc:1400–1401, 1325–1328</a>
+      <p>The renderer's compositor has the same shape of rule: a tree that was activated but not drawn is drawn immediately at the next vsync.</p>
+<pre><span class="n">1400</span>  <mark>if (active_tree_needs_first_draw_)</mark>
+<span class="n">1401</span>    return true;                         <span class="c">// trigger the deadline immediately</span>
+<span class="n">1325</span>  // If a new or undrawn active tree is pending after the deadline,
+<span class="n">1326</span>  // then the main thread is in a high latency mode.
+<span class="n">1327</span>  main_thread_missed_last_deadline_ =
+<span class="n">1328</span>      CommitPending() || has_pending_tree_ || active_tree_needs_first_draw_;</pre>
+      <p>In <code>s-worker-8000-tanstack</code> the argument <code>main_thread_missed_last_deadline</code> of <code>Scheduler::BeginImplFrame</code> is true in 72 of 72 vsyncs; in <code>s-msg-8000-tanstack</code> in none.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Display compositor (viz)</dt><dd>The process that combines the frames of all renderers and the browser UI into the picture that is shown. It has its own deadline per vsync.</dd>
+      <dt>Commit, activate, draw, submit</dt><dd>The renderer's compositor takes the main thread's result (commit), makes it current (activate), builds a frame from it (draw) and sends it to viz (submit). Module 2 walks these.</dd>
+      <dt>High latency mode</dt><dd>cc's own name for "the main thread's result is one vsync behind the frame that is drawn".</dd>
+      <dt>Presented without the main update</dt><dd>The amber frame state: the compositor drew at this vsync, but the main frame it requested for this vsync was not in it.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a constant of about 16.7 ms in "age on screen" can come from the state of the pipeline behind the main thread; the state persists while every vsync carries a commit and ends with the first vsync that carries none (seen once, at 695 ms).</p>
+    <p><b>No:</b> how the late states are entered. Every recording that has one was already in it when tracing began. And these are headless recordings with software compositing; whether a GPU-composited window on a real display settles the same way is not shown here.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read the first table as "2,000 messages a second cost a frame of latency compared with 500". The page's code had nothing to do with it: the display compositor was one frame behind for that whole run. <b>Rule I keep:</b> before comparing on-screen ages between two recordings, read "presented-after" for both (<code>q.mjs &lt;id&gt; frames</code>). If it differs by a frame, the comparison is between two pipeline states, not between two policies. Compare within a state, or compare the age at the DOM.</p></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: report data age at two points and keep them apart. "Age at commit" is ours: transport, queueing, apply policy, the wait for the frame. "Commit to presentation" belongs to the browser and has at least two stable values a frame apart. A latency budget that adds them hides which half moved.</p></div>
+  <div class="try"><span class="label">Try it</span>In Perfetto, open <code>s-msg-2000-tanstack</code>, search <code>All active surfaces ready</code> and step through the hits: each is followed at once by <code>Display::DrawAndSwap</code>. Do the same in <code>s-msg-8000-tanstack</code>: each hit comes about a millisecond after a <code>No damage yet</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">In the late runs the display compositor draws 0.04 ms after its tick with the previous frame; the renderer's frame for this vsync arrives 1 ms later and is shown at the next tick (s-msg-2000-tanstack).</li>
+    <li data-kind="read">viz treats a surface with an unacknowledged frame as ready (display_damage_tracker.cc:169–172) and then draws immediately (display_scheduler.cc:751–754); cc draws an undrawn active tree immediately at the next vsync (scheduler_state_machine.cc:1400).</li>
+    <li data-kind="measured">One vsync without a commit ends the late state: s-conflate-8000-tanstack goes from 17 ms to 1.5 ms "presented-after" at 695 ms, with the load unchanged.</li>
+    <li data-kind="rejected">"The 2,000/s run is a frame slower on screen because of its message rate." The whole run was in a late pipeline state; the 8,000/s run was not.</li>
+  </ul>
+  <p class="next" data-answer="late"><b>Next question →</b> With the pipeline's share set aside: the page kept up at 8,000 messages a second. How close to its limit was it?</p>
+</section>
+
+<!-- ═════════════════════════ PART B ═════════════════════════ -->
+
+<section class="step" data-part="B · Per message, cheap apply" data-title="8,000 messages a second into a keyed table: no knee" data-node="queue handler method"
+  data-ask="knee|At what message rate does applying per message stop keeping up, and how do I recognise that in a trace?">
+  <p class="holding"><span class="label">Question I hold</span><span>Each message is its own task and its own DOM write. As the rate rises 130-fold, how much of the main thread does that take, and can I predict the limit from a quiet run?</span></p>
+
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>At 60 messages a second one message task takes 0.2 ms (step 1: 0.215 ms). Utilisation is rate × cost per message. What will the main thread's busy share be at 8,000 a second?</p>
+    <div class="opts"><button data-k="a">About 160%: 8,000 × 0.2 ms is 1.6 s of work per second, so it cannot keep up</button><button data-k="b">Close to 100%, just keeping up</button><button data-k="c">Around a third</button></div>
+    <div class="reveal"><p><b>Around a third</b>: <b data-m="s-msg-8000-tanstack/threads.mainUtilPct"></b>%. The cost of a message is not a constant. The median message task takes 199 µs at 60 a second and 23 µs at 8,000 a second.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The same four recordings, read for work instead of age: how many tasks the main thread ran from the queue that carries WebSocket messages, how long they took together, and how busy the thread was overall. Then the ramp <code>s-ramp-tanstack</code>, where one page sees 500, 1,000, 2,000, 4,000, 8,000 and 16,000 messages a second for 400 ms each.</p>
+  </div></div>
+  <div class="bars" data-bars='{"ids":["s-msg-60-tanstack","s-msg-500-tanstack","s-msg-2000-tanstack","s-msg-8000-tanstack"],"labels":["60 /s","500 /s","2000 /s","8000 /s"],"series":[{"path":"threads.mainUtilPct","label":"main thread busy","color":"#d9a800"}],"unit":"% of the run","title":"Keyed panel, one apply per message: main thread busy","max":100,"line":100,"lineLabel":"saturated"}'></div>
+  <table class="mtable" data-rows="s-msg-60-tanstack,s-msg-500-tanstack,s-msg-2000-tanstack,s-msg-8000-tanstack" data-names="60 /s,500 /s,2000 /s,8000 /s" data-head="Messages per second"
+    data-cols="marks.tick message|messages handled,taskQueues.FRAME_LOADING_TQ.n|tasks on FRAME_LOADING_TQ,taskQueues.FRAME_LOADING_TQ.ms|their total|ms,threads.mainUtilPct|main busy|%,main.maxTaskMs|longest task|ms,frames.all|frames with main update,frames.dropped|dropped"></table>
+<pre>read once (q.mjs &lt;id&gt; tasks):      60 /s    500 /s   2000 /s   8000 /s
+median message task, µs             199       77        35        23
+s-ramp-tanstack, 200 ms buckets:   500 /s → 6% busy   4000 /s → 15%   8000 /s → 22%   16000 /s → 40–47%;  median age handled 0.06 → 0.4 ms</pre>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>One message, one task</b>, at every rate: the count of tasks on <code>FRAME_LOADING_TQ</code> equals the count of messages to within a handful. Chrome does not hand several messages to one task here, even when eight arrive in the same millisecond.</p>
+    <p><b>The busy share grows much more slowly than the rate.</b> 133 times the messages, 7 times the busy time. The longest task of the whole 8,000 run is <b data-m="s-msg-8000-tanstack/main.maxTaskMs"></b> ms; no frame is dropped; data is handled at a median age of <b data-m="s-msg-8000-tanstack/ticks.ageWhenHandled.p50"></b> ms. On the ramp, 16,000 a second still leaves more than half the thread idle and the largest age handled over the whole ramp is <b data-m="s-ramp-tanstack/ticks.ageWhenHandled.max"></b> ms.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>There is no knee in this range because the apply is tiny: one cell lookup and one <code>textContent</code> write (the keyed panel's <code>update()</code>). And the per-message cost falls as the thread gets busier. A thread that wakes 60 times a second runs each task cold: caches, branch predictors and the CPU's frequency have all moved on. A thread that runs 8,000 near-identical tasks a second runs them warm.</p>
+    <p>The consequence for method: utilisation ρ = rate × cost per message is only usable with a cost measured <i>near the rate in question</i>. From the 60-a-second cost I would have declared 8,000 impossible.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/tanstack.ts:193–200</span>
+      <p>What "apply" is for this panel: the reason it is cheap.</p>
+<pre><span class="n">193</span>    update(cells: Update[]) {
+<span class="n">194</span>      for (const [r, col, v] of cells) {
+<span class="n">195</span>        const el = rowEl(r);                       <span class="c">// keyed pool: row index → element</span>
+<span class="n">196</span>        if (!el || !el._ready || col &lt; el._x0 || col > el._x1) continue;
+<span class="n">197</span>        <mark>writeCell(el.children[col - el._x0] as HTMLElement, v, col);</mark></pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:mojo/public/cpp/bindings/lib/connector.cc;l=611">mojo/public/cpp/bindings/lib/connector.cc:611–613</a>
+      <p>Why one message is one task. After dispatching a message, mojo's connector posts one task for each message still waiting in the pipe:</p>
+<pre><span class="n">611</span>  while (pending_message_count > num_pending_dispatch_tasks_) {
+<span class="n">612</span>    <mark>PostDispatchNextMessageFromPipe();</mark>
+<span class="n">613</span>  }</pre>
+      <p>In the 8,000 run 8,519 message tasks were posted from there and 1,091 by <code>Notify</code> (the pipe became readable while the thread was idle): one <code>Notify</code> per producer wake-up, then the other seven or eight messages of the burst.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Utilisation ρ</dt><dd>The share of time a server (here: the main thread) must be busy to keep up: arrival rate × service time. Below 1 the queue stays short; at 1 it stops draining.</dd>
+      <dt>Knee</dt><dd>The rate at which ρ reaches 1. Below it, delay is flat; above it, delay grows for as long as the load lasts.</dd>
+      <dt>Warm and cold</dt><dd>The same code takes several times longer when it runs rarely. A cost per operation always belongs to a rate.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with an apply of one cell write, per-message apply keeps up to at least 16,000 messages a second on this machine with tracing on, and data age at the DOM stays under a millisecond.</p>
+    <p><b>No:</b> that per-message apply is "fine". The claim holds for an apply this small. And the 23 µs has not been taken apart yet: how much of it is the page's work at all?</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I expected to compute the knee from one quiet measurement. The cost per message fell by a factor of eight between the quiet run and the busy one. <b>Rule I keep:</b> measure the service time at the highest rate that still keeps up, and treat ρ computed from a quiet run as an upper bound that may be several times too high.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-msg-8000-tanstack tasks 600 602 0</code> prints every task of two milliseconds with its queue, priority and poster. Expected: per millisecond one <code>Notify</code> task of 40 to 60 µs followed by seven or eight <code>PostDispatchNextMessageFromPipe</code> tasks of 20 to 30 µs, then 0.7 ms of idle time.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Keyed panel, apply per message: main thread 5% busy at 60/s and 34% at 8,000/s; 40–47% at 16,000/s on the ramp; no dropped frame, age at the DOM under 1 ms.</li>
+    <li data-kind="measured">One WebSocket message is one main-thread task at every rate recorded, also inside a burst of eight.</li>
+    <li data-kind="read">mojo posts one dispatch task per message waiting in the pipe (connector.cc:611–613).</li>
+    <li data-kind="rejected">"ρ at 8,000/s can be computed from the cost of a message at 60/s." The median message task shrinks from 199 µs to 23 µs.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> What are those 23 µs made of?</p>
+</section>
+
+<section class="step" data-part="B · Per message, cheap apply" data-title="What a message costs: mostly our own instruments" data-node="handler method">
+  <p class="holding"><span class="label">Question I hold</span><span>At 8,000 messages a second the handler dominates the thread. Which lines of it?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>I read the sampled JavaScript profile of <code>s-msg-8000-tanstack</code> by self time. Then I record the same load with <code>marks=0</code>, which turns the page's <code>performance.mark</code> and <code>performance.measure</code> calls into no-ops (<code>s-quiet-msg-8000-tanstack</code>), and compare what is left. Without marks there is no data-age metric; tasks and frames are still in the trace.</p>
+  </div></div>
+  <div class="prof" data-prof="s-msg-8000-tanstack" data-top="8" data-by="self"></div>
+  <table class="mtable" data-rows="s-msg-8000-tanstack,s-quiet-msg-8000-tanstack" data-names="with mark + measure per message,marks=0" data-head="8000 /s, keyed, per message"
+    data-cols="windowMs|window|ms,taskQueues.FRAME_LOADING_TQ.n|message tasks,taskQueues.FRAME_LOADING_TQ.ms|their total|ms,main.scriptMs|script|ms,threads.mainUtilPct|main busy|%"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>The two functions at the top are <code>measure</code> and <code>mark</code>: Blink's User Timing implementation, called once each per message. Together they take more than nine tenths of the time sampled inside <code>socket.onmessage</code>. The work the handler exists for is far down the list: <code>writeCell</code> (the DOM write), <code>decode</code> (<code>JSON.parse</code> of a 63-byte message), <code>update</code>.</p>
+    <p>With marks off, a message task averages about 15 µs instead of 27 µs (total ÷ count in the table), and the thread is <b data-m="s-quiet-msg-8000-tanstack/threads.mainUtilPct"></b>% busy instead of <b data-m="s-msg-8000-tanstack/threads.mainUtilPct"></b>%.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Three layers of cost per message, largest first in the quiet run:</p>
+    <p><b>The task itself</b>, about 10 µs: mojo hands over the message, Blink builds a <code>MessageEvent</code>, enters V8, and the scheduler does its bookkeeping after the task. Tracing adds to this: every task writes several trace events. <b>Our instruments</b>, about 12 µs when on: each mark and measure serialises its <code>detail</code> object and writes a trace event. <b>The handler's real work</b>, a few microseconds: parse, two map writes, one cell.</p>
+    <p>So the floor for "one message, one task" is set by Chrome, not by the page, and it is low: tens of thousands of messages a second per thread. What a page adds on top decides everything. The next part adds something expensive.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/timing.ts:5–10</span>
+      <p>The switch that makes the comparison possible.</p>
+<pre><span class="n"> 5</span>export const measure = config.marks
+<span class="n"> 6</span>  ? (name, options) => void performance.measure(name, options)
+<span class="n"> 7</span>  : () => {};
+<span class="n"> 8</span>export const mark = config.marks
+<span class="n"> 9</span>  ? (name, options) => void performance.mark(name, options)
+<span class="n">10</span>  : () => {};</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Observer effect</dt><dd>The instrument changes what it measures (Module 2 measures it for scrolling). It grows with the number of instrumented operations: negligible at 60 a second, the largest item at 8,000.</dd>
+      <dt>Self time (sampled)</dt><dd>Time during which a function was at the top of the sampled stack. <code>(program)</code> is native code outside JavaScript, including the task machinery.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> in the instrumented 8,000 run most of the handler's time is the marks. All per-message numbers in this module include them; comparisons between policies that write different numbers of marks (per message or per frame) are tilted by them.</p>
+    <p><b>No:</b> an exact cost per mark. The two runs differ in length and were recorded minutes apart on a busy machine; "about 12 µs for the pair" is one subtraction.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I was ready to write "per-message apply costs a third of the main thread at 8,000 a second". A third of that third was my own ruler. <b>Rule I keep:</b> when the unit of work is small and frequent, record once with the instruments off and report both numbers. In a product, sample marks (one message in a hundred) or stamp ages into a ring buffer and emit one measure per frame.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-msg-8000-tanstack prof 0 1200</code>. Expected, under "self time": <code>measure</code> about 92 ms and <code>mark</code> about 75 ms, then <code>writeCell</code> under 5 ms and <code>decode</code> about 1 ms. In DevTools the same trace's Bottom-Up tab shows the same order.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">At 8,000 msg/s on the keyed panel, performance.mark + performance.measure are over 90% of the sampled time inside the message handler; the DOM write and JSON.parse together are a few percent.</li>
+    <li data-kind="measured">With marks off the same load takes about 15 µs per message task instead of 27 µs, and 25% of the main thread instead of 34% (s-quiet-msg-8000-tanstack, one run).</li>
+    <li data-kind="inferred">The floor of "one message, one task" is Chrome's task and mojo overhead, roughly 10 µs per message with tracing on.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> What happens when the apply is not one cell write but a whole redraw?</p>
+</section>
+
+<!-- ═════════════════════════ PART C ═════════════════════════ -->
+
+<section class="step" data-part="C · Per message, expensive apply: the knee" data-title="A draw per message: what regular-table does with 2,000 requests a second" data-node="handler dom method">
+  <p class="holding"><span class="label">Question I hold</span><span>regular-table cannot patch one cell from outside; a pushed value means "draw again". Its <code>draw()</code> has a lock that lets one draw run and one wait. How many draws actually run when 2,000 are requested per second?</span></p>
+
+  <div class="predict" data-right="c"><span class="label">Predict first</span>
+    <p>The lab's <code>update()</code> for regular-table calls <code>table.draw()</code> once per message. regular-table's lock drops requests that arrive while a draw is running and another is already waiting. At 2,000 requests a second, how many draws run per second?</p>
+    <div class="opts"><button data-k="a">About 60: draws line up with frames</button><button data-k="b">Fewer than requested: the lock merges those that overlap</button><button data-k="c">2,000: every request draws</button></div>
+    <div class="reveal"><p><b>Every request draws.</b> Over the page's life the panel counted <b data-m="s-msg-2000-regular/state.counters.drawRequests"></b> requests and <b data-m="s-msg-2000-regular/state.counters.draws"></b> draws. A lock can only merge requests that arrive while it is held, and here it is never held when the next message arrives.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three recordings of regular-table with a draw per message: 60, 500 and 2,000 messages a second. I count draws and layouts in each, and zoom into 14 ms of the 500 run to read what one message task contains. (The 2,000 run has the same tasks four times as densely; its chart is too crowded to pin, so the picture is of the 500 run and the counts are of all three.)</p>
+  </div></div>
+  <div class="tracelink" data-trace="s-msg-500-regular"></div>
+  <div class="lanes" data-lanes='{"traces":["s-msg-500-regular"],"from":599.5,"to":613.5,"rows":["main","app","mainFrames"],"pins":[[1,600.15,"main.js"],[2,600.19,"main.layout"],[3,602.27,"main.js"],[4,612.1,"mainFrames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>One message task, 0.16 ms of JavaScript: <code>socket.onmessage</code> parses, marks and calls <code>table.draw()</code>, which starts synchronously; the rest of the draw runs in the microtasks of the same task, because every <code>await</code> inside it resolves at once (our data listener answers from memory).</li>
+    <li><i>2</i>A <b>forced layout</b> inside the draw (red), 6 of 185 layout objects dirty: the draw reads <code>clientWidth</code>, <code>clientHeight</code> and <code>scrollTop</code>, and the previous draw's cell write has left layout stale.</li>
+    <li><i>3</i>The next message, 2.1 ms later: the same again. Five messages in view, five draws, five forced layouts.</li>
+    <li><i>4</i>The frame. Its own layout has only the last draw's write left to do.</li>
+  </ol>
+  <table class="mtable" data-rows="s-msg-60-regular,s-msg-500-regular,s-msg-2000-regular" data-names="60 /s,500 /s,2000 /s" data-head="regular-table, draw per message"
+    data-cols="ticks.messages|messages,main.microtaskRuns|microtask runs,main.layouts|layouts,main.forcedLayouts|of them forced by JS,main.layoutMs|layout|ms,main.scriptMs|script|ms,threads.mainUtilPct|main busy|%"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>One layout per message at every rate. At 60 a second none is forced: a frame runs between two messages and does the layout itself. From 500 a second on, several messages share a frame interval and every draw after the first pays for a layout the previous one made necessary.</p>
+    <p>Each draw calls our data listener twice (once with an empty window, to learn the table's size, once for the rows), formats all 84 visible cells, and rewrites the table. One changed cell costs a table.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">regular-table src/ts/utils.ts:57–77 (v0.9.2)</span>
+      <p>The lock. To know when it can merge anything.</p>
+<pre><span class="n">57</span>export async function throttle_tag&lt;T>(tag: any, f: () => Promise&lt;T>) {
+<span class="n">61</span>    if (<mark>TAGS.has(tag)</mark>) {                 <span class="c">// only if an operation is in flight right now</span>
+<span class="n">62</span>        await TAGS.get(tag)?.promise;
+<span class="n">63</span>        if (TAGS.has(tag)) {
+<span class="n">64</span>            await TAGS.get(tag)?.promise;
+<span class="n">65</span>            return;                      <span class="c">// dropped: someone else is already queued</span>
+<span class="n">66</span>        }
+<span class="n">67</span>    }
+<span class="n">69</span>    TAGS.set(tag, Promise.withResolvers());
+<span class="n">71</span>        return await f();                <span class="c">// f starts synchronously, in the caller's task</span></pre>
+      <span class="path">regular-table src/ts/scroll_panel.ts:996–1000, 1014</span>
+<pre><span class="n"> 996</span>    this._container_size = this._resolve_container_size(
+<span class="n"> 997</span>        () => <mark>this._table_clip.clientWidth</mark>,
+<span class="n"> 998</span>        () => this._table_clip.clientHeight,
+<span class="n"> 999</span>        () => this.clientHeight,
+<span class="n">1014</span>        <mark>this.scrollTop</mark>,</pre>
+      <p>Layout reads at the start of every <code>draw()</code>. There is no <code>requestAnimationFrame</code> anywhere on this path (the scroll path has one; <a href="anatomy.html">Module 3</a>).</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Microtask</dt><dd>A promise continuation. Microtasks run to exhaustion before the current task ends, so a chain of already-resolved awaits never leaves its task.</dd>
+      <dt>Forced layout</dt><dd>A layout computed inside JavaScript because a script read a geometry value while layout was stale (<a href="rendering.html">Module 5</a>).</dd>
+      <dt>Coalescing</dt><dd>Merging several requests for the same work into one execution. It needs a moment in which requests can pile up.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> with a data listener that answers synchronously, <code>draw()</code> per message means a full draw and, beyond 60 a second, a forced layout per message. The lock does not reduce the work.</p>
+    <p><b>No:</b> that the lock is useless. It merges whenever a draw spans tasks: a listener that waits for a network reply (<a href="backend.html">Module 6</a>), or the scroll path, which waits for an animation frame.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I believed "regular-table coalesces draws requested while one is running" protected it from a flood; the lab's own source comment says so. In the trace no draw is ever running when a request arrives: the draw is over before its task ends. <b>Rule I keep:</b> a lock coalesces only across a gap. If request and work happen in the same task, every request is first in line.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-msg-2000-regular tree 600.3 601.3 main 15</code>. Expected: under each <code>RunTask</code> a <code>FunctionCall socket.onmessage</code>, then <code>RunMicrotasks</code> containing a <code>Layout</code> with 6 of 185 objects dirty.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">regular-table with draw() per message: one draw and one layout per message; from 500 msg/s nearly all layouts are forced inside the draw (s-msg-500/2000-regular).</li>
+    <li data-kind="read">throttle_tag merges only calls that arrive while an operation is in flight (utils.ts:61–66); draw() reads clientWidth, clientHeight and scrollTop first (scroll_panel.ts:996–1014) and never awaits an animation frame.</li>
+    <li data-kind="rejected">"The draw lock coalesces a draw per message." With a synchronous data listener the draw completes inside the message's own task; draws equal requests.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> A draw is some 150 to 250 µs. At what rate does that fill the thread, and what does the trace look like when it does?</p>
+</section>
+
+<section class="step" data-part="C · Per message, expensive apply: the knee" data-title="The ramp: utilisation step by step, and the moment it reaches 1" data-node="queue handler frame method">
+  <p class="holding"><span class="label">Question I hold</span><span>Where is the knee for a draw per message, and which signals in a trace tell me I have passed it?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>s-ramp-regular</code>: one page, the rate doubling every 400 ms from 250 to 8,000 messages a second, then the producer stops. For each step I count the messages handled (<code>WebSocketReceive</code> instants on the main thread) and add up the main thread's tasks (<code>RunTask</code>). Busy time ÷ step length is ρ. Busy time ÷ messages is a cost per message that includes the frames.</p>
+  </div></div>
+  <div class="tracelink" data-trace="s-ramp-regular">Pin <code>tick producer</code> (Backend) and <code>CrRendererMain</code>; the rate changes are instants named <code>rate → N/s</code> on the producer's track.</div>
+<pre>s-ramp-regular, read once            asked    handled   main busy    busy per    main frames   median age handled
+window (ms)                           /s       /s        ρ            message     /s            start → end of step, ms
+[   0,  401]                           250      252      17%          684 µs      60            0.18 → 0.14
+[ 401,  803]                           500      498      25%          502 µs      60            0.16 → 0.10
+[ 803, 1203]                          1000      998      30%          301 µs      60            0.09 → 0.04
+[1203, 1604]                          2000     1993      38%          189 µs      60            0.19 → 0.18
+[1604, 2004]                          4000     3995      66%          165 µs      60            0.61 → 0.33
+<mark>[2004, 2480]                          8000     6716      99%          148 µs      25            5.3  → 73.7</mark>
+[2480, 2564]  producer stopped           0     7238      99%          138 µs      24            76.6 → 77.7   <span class="c">← the drain</span>
+[2564, 2700]                             0        0       2%</pre>
+  <div class="lanes" data-lanes='{"traces":["s-ramp-regular"],"from":1900,"to":2700,"rows":["backendTicks","app","mainFrames","frames"],"pins":[[1,2004.1,"backendTicks"],[2,2043.7,"frames"],[3,2190,"mainFrames"],[4,2480.1,"backendTicks"],[5,2563.6,"app"],[6,2560.4,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The server switches to 8,000 a second. Until here every frame is green and every main frame a sliver.</li>
+    <li><i>2</i>40 ms later the first frame is dropped.</li>
+    <li><i>3</i>The main-frame bars grow: each is the time from "the compositor asked for a frame" to "the main thread committed it". Its wait for the main thread goes 8.8, 16.6, 20, 23, 28, 34, 43, 50, 59, 63, 73, 78 ms.</li>
+    <li><i>4</i>The producer stops (<code>rate → 0/s</code> at 2480.1).</li>
+    <li><i>5</i>The page is still applying: the last message, sent at 2479.8, is handled at 2563.6, 83.8 ms old.</li>
+    <li><i>6</i>The first green frame after the flood.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Below the knee</b> (250 to 4,000): handled equals asked, age stays under a millisecond, 60 frames a second. ρ rises from 17% to 66%, again more slowly than the rate.</p>
+    <p><b>Above it</b> (8,000): the thread is 99% busy and handles about 6,700 a second, so about 1,300 a second are left over. Three things happen together: age at handling climbs steadily (5 → 74 ms in 476 ms), main frames arrive later and later, and frames are dropped (<b data-m="s-ramp-regular/frames.dropped"></b> in this trace).</p>
+    <p><b>After the producer stops</b>: 84 ms in which the thread is still saturated, working through 608 messages the server sent before it stopped.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The last step below the knee predicts it: at 4,000 a second ρ is 0.66, so ρ = 1 near 4,000 ÷ 0.66 ≈ 6,100 a second. The overloaded step measures the capacity directly: 6,700 to 7,200 messages a second, a little higher, because under overload the page sheds frames and runs warmer.</p>
+    <p>Above the knee the slope of the age says how far above. If messages arrive at λ and are served at μ, age grows by 1 − μ/λ milliseconds per millisecond: 1 − 6,716/8,000 = 0.16, and the table shows 68 ms gained in 476 ms, 0.14.</p>
+    <p>A second recording, <code>s-ramp-fine-regular</code>, climbs in steps of 1,000 through the interval (4,000, 5,000, 6,000, 7,000, then stop). It was recorded 25 minutes later on the same machine while other programs were running:</p>
+<pre>s-ramp-fine-regular, read once       asked    handled   ρ       median age handled, start → end
+[   0,  253]                          4000     4008     90%      0.5 → 1.5
+[ 253,  504]                          5000     4980     94%      1.3 → 0.7
+<mark>[ 504,  780]                          6000     5435     99%      3.6 → 25.4</mark>
+[ 780, 1133]                          7000     5405     99%     25.8 → 93.6
+[1133, 1272]  producer stopped           0     4993     99%    111.9 → 138     <span class="c">← drain: 139 ms</span></pre>
+    <p>Here the knee is between 5,000 and 6,000, and the capacity about 5,400 a second, not 7,000. The method gives the same kind of answer; the number moved by a quarter.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Arrival rate λ, service rate μ</dt><dd>Messages arriving per second, and messages the thread can handle per second when it does nothing else. ρ = λ/μ.</dd>
+      <dt>Backlog</dt><dd>Messages sent but not yet handled. Above the knee it grows by λ − μ per second; data age at handling is backlog ÷ λ.</dd>
+      <dt>Drain</dt><dd>The time to empty the backlog once arrivals stop: backlog ÷ μ, about the age of the last message.</dd>
+    </dl></div>
+    <div class="box"><span class="label">Signs of a passed knee, in order of appearance</span><dl>
+      <dt>1 · Age at handling has a slope</dt><dd><code>ticks.ageFirstHalf</code> against <code>ticks.ageSecondHalf</code>: <b data-m="s-ramp-regular/ticks.ageFirstHalf"></b> and <b data-m="s-ramp-regular/ticks.ageSecondHalf"></b> ms in this trace.</dd>
+      <dt>2 · Main frames wait</dt><dd><code>frames.mainQueueMs</code>: p95 <b data-m="s-ramp-regular/frames.mainQueueMs.p95"></b> ms here, against <b data-m="s-msg-2000-regular/frames.mainQueueMs.p95"></b> ms at a steady 2,000 a second.</dd>
+      <dt>3 · Work continues after the input stops</dt><dd>The drain. Mean FPS and "CPU busy" show neither 1 nor 3.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> for this panel on this machine the knee of "a draw per message" lies between 4,000 and 8,000 messages a second in one recording and between 5,000 and 6,000 in another; past it, age and frame delay grow together and a drain follows the stop.</p>
+    <p><b>No:</b> "regular-table's limit is 6,000 updates a second". The limit belongs to a draw per message of an 84-cell table with five User Timing entries per draw, on a shared machine, in one run. Step 9 shows the instruments' share.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>Reproduce one row: <code>node lab/harness/q.mjs s-ramp-regular slices "^WebSocketReceive$" main 1604 2004</code> ends with "1598 events"; <code>… slices "^RunTask$" main 1604 2004</code> ends with "total 264 ms". 264 ÷ 400 = 0.66. Then do the same for 2004 to 2480.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Ramp into regular-table, draw per message: ρ = 0.66 at 4,000/s; at 8,000/s the thread handles about 6,700/s at ρ = 0.99, age at handling climbs from 5 to 74 ms in 476 ms and 20 frames are dropped (s-ramp-regular).</li>
+    <li data-kind="measured">After the producer stops the page works 84 ms more; the last message is 83.8 ms old when handled.</li>
+    <li data-kind="measured">A second ramp 25 minutes later puts the knee between 5,000 and 6,000/s (capacity ≈ 5,400/s): the knee is a property of code, machine and moment.</li>
+    <li data-kind="inferred">Above the knee, age grows at 1 − μ/λ per unit time; the last step below the knee predicts the knee as rate ÷ ρ.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Where exactly are the 600 leftover messages while they wait, and what else waits behind them?</p>
+</section>
+
+<section class="step" data-part="C · Per message, expensive apply: the knee" data-title="Where the backlog sits, and what is stuck behind it" data-node="wire queue scheduler"
+  data-ask="first|When messages flood the main thread, who runs first: the messages, the frame, or anything else that needs the thread?">
+  <p class="holding"><span class="label">Question I hold</span><span>Buffer 1 is a chain: kernel socket, network service, mojo pipe, task queue. In which link does an overloaded page keep its backlog, and does the server ever notice?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three observations, each a by-product of how the harness drives the page. In the ramps the harness changes the rate by evaluating <code>window.__lab.setRate(…)</code> in the page, exactly every 400 ms (250 ms in the fine ramp); the server logs when the new rate arrives. In <code>s-msg-8000-regular</code>, a steady 8,000 a second into regular-table, the harness asks the page to write the "trace: end" mark after 1,500 ms. And the backend records how many bytes its socket had buffered.</p>
+  </div></div>
+<pre>rate changes as logged by the server (ms)              asked by the harness every …   late by
+s-ramp-regular       401.2   802.6  1203.2  1603.7  2004.1   <mark>2480.1</mark>     400 ms              ≈ 0, 0, 0, 0, 0, <mark>75 ms</mark>
+s-ramp-fine-regular  252.8   504.0   <mark>780.4  1133.0</mark>                    250 ms              ≈ 0, 0, <mark>25, 100 ms</mark>
+
+the task that carried one of them (q.mjs s-ramp-fine-regular tasks):
+ queue <mark>DEFAULT_TQ</mark>   priority <mark>NORMAL_PRIORITY</mark>   posted from ipc_mojo_bootstrap.cc (Accept)</pre>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>The command to slow down is late by the age of the data.</b> When the backlog was 75 ms deep, "set the rate to 0" reached the server 75 ms late. The fine ramp's last two changes are 25 and 100 ms late, at moments when messages were 25 and 94 ms old. The evaluate arrives as a main-thread task at normal priority and takes its place in line.</p>
+    <p><b>The end mark waited 352 ms.</b> The measured window of <code>s-msg-8000-regular</code> is <b data-m="s-msg-8000-regular/windowMs"></b> ms for a scenario of 1,500. But the data handled at that moment was 587 ms old (<b data-m="s-msg-8000-regular/ticks.ageWhenHandled.max"></b> ms is the largest age in the trace). So only part of the backlog was in front of the mark.</p>
+    <p><b>The server noticed nothing</b>: its socket's buffered bytes peaked at <b data-m="s-msg-8000-regular/backend.socketBufferedMaxKb"></b> kB.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The backlog has two parts. The first is the main thread's own task queue: mojo posts one task per waiting message (step 4), so every queued message is a queued task, and anything posted later at the same priority runs after all of them. The second part is upstream. The message bytes travel through a mojo data pipe of 131,000 bytes; when it is full the network service stops reading the socket. At 63 bytes a message the pipe holds about 2,080 of them, which at 6,000 handled per second is about 350 ms of work. That matches the 352 ms the end mark waited: a full pipe's worth of tasks ahead of it. The other 240 ms of age were in the network service and the kernel, where nothing on the main thread queues behind them.</p>
+    <p>Only when every link is full does the kernel stop accepting bytes from the server. At an excess of 2,000 small messages a second that takes megabytes, so tens of seconds. For that long the server produces at full rate for a page that is seconds behind.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc;l=1038">third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc:1040–1057</a>
+      <p>The renderer's receive loop: it consumes frames as long as their bytes are in the pipe. JavaScript has no way to say "not now".</p>
+<pre><span class="n">1040</span>  while (!pending_data_frames_.empty() &amp;&amp; <mark>!backpressure_</mark> &amp;&amp;
+<span class="n">1041</span>         GetState() == State::kOpen) {
+<span class="n">1053</span>    const MojoResult begin_result =
+<span class="n">1054</span>        readable_->BeginReadData(MOJO_READ_DATA_FLAG_NONE, buffer);
+<span class="n">1055</span>    if (begin_result == MOJO_RESULT_SHOULD_WAIT) {
+<span class="n">1056</span>      readable_watcher_.ArmOrNotify();
+<span class="n">1057</span>      return;</pre>
+      <p>The research notes for this course trace <code>backpressure_</code> to the <code>WebSocketStream</code> API only, and the pipe's size to <code>kReceiveDataPipeCapacity = 131000</code> in <code>services/network/websocket.cc:69–70</code>; I did not re-read those two lines, so they are quoted from the notes. <a href="network.html">Module 8</a> studies backpressure on a constrained link.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Backpressure</dt><dd>A full buffer telling the stage before it to stop. It travels upstream one buffer at a time, and only after each has filled.</dd>
+      <dt>Head-of-line</dt><dd>In a first-in-first-out queue, everything behind a backlog waits for it, whatever its own urgency.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> on an overloaded page a control action that needs the main thread (here: sending "slow down") is delayed by the main thread's share of the backlog; observed three times, 25 to 100 ms.</p>
+    <p><b>No:</b> that the pipe's capacity explains the 352 ms. The numbers agree (2,080 messages ÷ 6,000 per second), but I did not observe the pipe's fill level; it is an inference from source and one coincidence of numbers.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposals. (1) The feedback path must not share a queue with the flood: let the thread that owns the socket (a worker) decide to conflate or to tell the server, from its own measurements. (2) Do not rely on transport backpressure to protect a page from small frequent messages: megabytes of buffers lie between. Give the protocol an explicit credit or pull (one request in flight), so that the producer's pace is set by the consumer and not by TCP.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-ramp-regular slices "^WebSocketSend$"</code> lists six sends from the page (the rate changes). Expected: the first five about 400 ms apart, the sixth 476 ms after the fifth.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Under overload, "set rate" commands evaluated in the page reached the server 25, 75 and 100 ms late, matching the data age at those moments; they ran as DEFAULT_TQ tasks at normal priority.</li>
+    <li data-kind="measured">At a steady 8,000 msg/s into regular-table the end mark waited 352 ms while handled data was up to 587 ms old; the server's socket buffer stayed at 0 bytes.</li>
+    <li data-kind="inferred">The main thread's part of the backlog is bounded by the mojo data pipe (131 kB ≈ 2,080 messages of 63 bytes); the rest waits in the network service and the kernel.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The React panel got the same 8,000 messages a second and a render per message. Did it overload too?</p>
+</section>
+
+<section class="step" data-part="C · Per message, expensive apply: the knee" data-title="Three panels, one flood: why React bends where regular-table breaks" data-node="queue handler method">
+  <p class="holding"><span class="label">Question I hold</span><span>8,000 messages a second, "apply per message", into all three panels. Which keep up, and what does the one in the middle do differently?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The three recordings side by side, and for regular-table also the run with marks off. For React I count renders (our <code>app: draw</code> measure, written in <code>useLayoutEffect</code>) against messages.</p>
+  </div></div>
+  <table class="mtable" data-rows="s-msg-8000-tanstack,s-msg-8000-react,s-msg-8000-regular" data-names="keyed: patch one cell,React: rerender(),regular-table: draw()" data-head="8000 /s, apply per message"
+    data-hi="s-msg-8000-regular:ticks.ageSecondHalf,s-msg-8000-regular:threads.mainUtilPct"
+    data-cols="threads.mainUtilPct|main busy|%,ticks.perSecondHandled|handled|/s,ticks.ageFirstHalf|age handled 1st half|ms,ticks.ageSecondHalf|2nd half|ms,frames.all|frames green,frames.partial|amber,frames.dropped|dropped,frames.mainQueueMs.p50|main frame waits p50|ms"></table>
+  <table class="mtable" data-rows="s-msg-8000-regular,s-quiet-msg-8000-regular" data-names="regular-table: draw() · with marks,regular-table: draw() · marks=0 (no age data)" data-head="The same load, instruments off"
+    data-cols="windowMs|window|ms,taskQueues.FRAME_LOADING_TQ.n|message tasks,taskQueues.FRAME_LOADING_TQ.ms|their total|ms,threads.mainUtilPct|main busy|%,frames.mainQueueMs.p50|main frame waits p50|ms,frames.mainQueueMs.max|max|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Keyed</b>: a third of the thread. <b>regular-table</b>: saturated, handling about 6,000 of 8,000, age growing through the run, most frames dropped, each main frame waiting 100 ms (step 15 is about that number). <b>React</b>: under half the thread, age flat. (Its frames are all amber: that is step 3's "renderer compositor one behind" state, present from the start of the recording, not a sign of load. Each is presented 17 ms after its vsync.)</p>
+    <p>React received <b data-m="s-msg-8000-react/ticks.messages"></b> messages and rendered <b data-m="s-msg-8000-react/app.draw.n"></b> times. At 2,000 a second it was <b data-m="s-msg-2000-react/ticks.messages"></b> and <b data-m="s-msg-2000-react/app.draw.n"></b>: nearly one for one.</p>
+    <p><b>regular-table with marks off</b>: still <b data-m="s-quiet-msg-8000-regular/threads.mainUtilPct"></b>% busy, but it handles every message (6,796 message tasks in 835 ms), and main frames wait around 50 ms instead of growing to 100. It sits on the knee instead of beyond it. A message task averages 113 µs instead of 150 µs.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The lab's React <code>update()</code> does not render. It bumps a version and calls <code>rerender()</code>, which asks React's scheduler for a render; the scheduler posts <i>one</i> task through a <code>MessageChannel</code>. Everything that arrives before that task runs is absorbed by it. The trace shows the pattern per producer wake-up: message 1, a render, messages 2 to 8, a render. Eight messages, two renders. The busier the queue, the more each render absorbs: the coalescing adapts by itself.</p>
+    <p>That is the gap regular-table's lock lacked in step 6: a request, and the work in a <i>later</i> task. One unit of work in flight; requests that arrive meanwhile only mark "again".</p>
+    <p>And the last row answers step 7's caution: five User Timing entries per draw were a quarter of regular-table's cost per message and moved its knee from about 8,000 a second to about 6,000.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/node_modules/scheduler/cjs/scheduler.development.js:220–225 (scheduler 0.27.0)</span>
+      <p>Where React's "later task" comes from.</p>
+<pre><span class="n">220</span>    else if ("undefined" !== typeof MessageChannel) {
+<span class="n">221</span>      var channel = new MessageChannel(),
+<span class="n">222</span>        port = channel.port2;
+<span class="n">223</span>      channel.port1.onmessage = performWorkUntilDeadline;
+<span class="n">224</span>      schedulePerformWorkUntilDeadline = function () {
+<span class="n">225</span>        <mark>port.postMessage(null);</mark></pre>
+      <span class="path">lab/pages/src/react.tsx:131–134 · lab/pages/src/regular.ts:114–117</span>
+<pre><span class="n">131</span>    update(cells) {                                 <span class="c">// React</span>
+<span class="n">132</span>      for (const [r] of cells) rowVersion.set(r, (rowVersion.get(r) ?? 0) + 1);
+<span class="n">133</span>      (Grid as any).rerender?.();                   <span class="c">// a request; the render is another task</span>
+<span class="n">114</span>    update() {                                      <span class="c">// regular-table</span>
+<span class="n">115</span>      c.drawRequests++;
+<span class="n">116</span>      void table.draw();                            <span class="c">// the work, now</span></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Notification coalescing</dt><dd>Many "something changed" signals, one piece of work that reads the current state when it runs. No data is dropped by the coalescing itself; the state already holds the latest values.</dd>
+      <dt>One in flight</dt><dd>At most one scheduled unit of work at a time; the work rate adapts to how long the work takes.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> "apply per message" overloads only where the apply itself does heavy work synchronously. A request for work that is carried out in a later task degrades gracefully.</p>
+    <p><b>No:</b> that React is cheap here. It spends <b data-m="s-msg-8000-react/main.scriptMs"></b> ms of script in <b data-m="s-msg-8000-react/windowMs"></b> ms to change 24 cells 60 times a second; it renders 1,900 times a second for a display that shows 60.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-msg-8000-react tasks 600 602.2 0</code>. Expected, per millisecond: a <code>FRAME_LOADING_TQ</code> task, a <code>FRAME_PAUSABLE_TQ</code> task (React's <code>MessageChannel</code>), seven <code>FRAME_LOADING_TQ</code> tasks, another <code>FRAME_PAUSABLE_TQ</code> task.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">8,000 msg/s, apply per message: keyed panel 34% busy; React 47% busy with 12,000 messages coalesced into 2,789 renders; regular-table saturated, handling about 6,000/s with age growing.</li>
+    <li data-kind="read">React's scheduler posts its work as one MessageChannel task (scheduler.development.js:220–225); requests before it runs are absorbed.</li>
+    <li data-kind="measured">With marks off regular-table handles all 8,000/s at 99% busy: the instruments moved its knee from about 8,000 to about 6,000 msg/s.</li>
+  </ul>
+  <p class="next" data-answer="knee"><b>Next question →</b> React's scheduler bounds work by "one render in flight". The display offers a simpler bound: one apply per frame. What does that buy, and what does it cost?</p>
+</section>
+
+<!-- ═════════════════════════ PART D ═════════════════════════ -->
+
+<section class="step" data-part="D · Once per frame" data-title="Apply once per frame: work bounded by the display" data-node="handler dom frame"
+  data-ask="where|Where should updates be conflated: in the page, in a worker, or on the server?">
+  <p class="holding"><span class="label">Question I hold</span><span>If a message only records the value and one <code>requestAnimationFrame</code> callback per frame applies whatever changed, how much of the work disappears, and which part stays?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>apply=raf</code>: the handler writes the value into a map keyed by cell (<code>dirty</code>) and requests one animation frame if none is pending; the callback applies the map and clears it. I compare with <code>apply=msg</code> for each panel at 2,000 a second, and for regular-table at the 8,000 a second that overloaded it.</p>
+  </div></div>
+  <table class="mtable" data-rows="s-msg-2000-tanstack,s-raf-2000-tanstack,s-msg-2000-react,s-raf-2000-react,s-react-memo-2000,s-msg-2000-regular,s-raf-2000-regular,s-msg-8000-regular,s-raf-8000-regular" data-names="keyed · per message,keyed · per frame,React · per message,React · per frame,React memo rows · per frame,regular-table · per message,regular-table · per frame,regular-table 8000 /s · per message,regular-table 8000 /s · per frame" data-head="2000 /s unless stated"
+    data-hi="s-raf-2000-regular:threads.mainUtilPct,s-raf-8000-regular:threads.mainUtilPct"
+    data-cols="ticks.messages|messages,ticks.applies|applies,ticks.cellsApplied|cell values applied,main.forcedLayouts|forced layouts,main.scriptMs|script|ms,threads.mainUtilPct|main busy|%,frames.dropped|frames dropped"></table>
+  <div class="bars" data-bars='{"ids":["s-msg-2000-tanstack","s-raf-2000-tanstack","s-msg-2000-react","s-raf-2000-react","s-msg-2000-regular","s-raf-2000-regular","s-msg-8000-regular","s-raf-8000-regular"],"labels":["keyed · msg","keyed · frame","React · msg","React · frame","regular · msg","regular · frame","regular 8000 · msg","regular 8000 · frame"],"series":[{"path":"threads.mainUtilPct","label":"main thread busy","color":"#d9a800"}],"unit":"% of the run","title":"Per message against per frame","max":100,"line":100,"lineLabel":"saturated"}'></div>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Applies fall to the frame rate</b>: 120 in two seconds whatever arrives. <b>regular-table</b> gains most: from <b data-m="s-msg-2000-regular/threads.mainUtilPct"></b>% to <b data-m="s-raf-2000-regular/threads.mainUtilPct"></b>% busy at 2,000 a second, no forced layout left (the one draw per frame runs just before the frame's own layout), and at 8,000 a second from overload to <b data-m="s-raf-8000-regular/threads.mainUtilPct"></b>% with no frame dropped. <b>React</b> drops by a third. <b>The keyed panel</b> hardly moves.</p>
+    <p><b>Values applied are fewer than messages.</b> About 2,190 of 4,000: the stream touches only 24 distinct cells, so within one frame later values overwrite earlier ones in the map. The page conflates without having decided to.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Per-frame apply removes the cost that scales with <i>applies</i>. It leaves the cost that scales with <i>messages</i>: the task, the parse, the map write (and our mark). For the keyed panel the apply was a few microseconds, so there was nothing to remove; most of the small difference between its two rows is 3,900 fewer <code>measure</code> calls (step 5). For regular-table the apply was most of a message's cost.</p>
+    <p>What remains at 8,000 a second, <b data-m="s-raf-8000-regular/threads.mainUtilPct"></b>% busy, is almost all per-message overhead. Per-frame apply moves the knee from "rate × draw cost" to "rate × task cost", further out by the ratio of the two, but it does not remove it: every message still crosses the main thread.</p>
+    <p>The <code>dirty</code> map is buffer 2 moved one step earlier: a latest-value table in front of the DOM instead of the DOM itself. That is data conflation, not only notification coalescing: intermediate values are gone before anything could show them.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/ticks.ts:58–65, 82–88</span>
+<pre><span class="n">58</span>  const flush = (start: number) => {
+<span class="n">59</span>    const cells = [...dirty.values()];       <span class="c">// latest value per cell</span>
+<span class="n">60</span>    dirty.clear();
+<span class="n">61</span>    apply(cells);
+<span class="n">82</span>    else if (!scheduled) {
+<span class="n">83</span>      scheduled = true;
+<span class="n">84</span>      <mark>requestAnimationFrame(() => {</mark>
+<span class="n">85</span>        scheduled = false;
+<span class="n">86</span>        flush(performance.now());</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Data conflation</dt><dd>Keeping only the latest value per key while a consumer is not ready. Bounded memory (one slot per key), bounded work (one apply per key per frame), and intermediate values are lost.</dd>
+      <dt>requestAnimationFrame</dt><dd>A callback run inside the next main frame, before that frame's style and layout. Writes made there are in that frame's picture.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> applying once per frame bounds apply work by the frame rate and the number of visible keys, and removes the knee of step 7 at the rates recorded.</p>
+    <p><b>No:</b> that it bounds <i>all</i> work. Message handling still grows with the rate, on the main thread. And "values applied &lt; messages" is only acceptable if nobody needs the values in between; step 13 returns to that.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-raf-2000-regular tree 310 313 main 40</code>. Expected: inside <code>ProxyMain::BeginMainFrame</code> a <code>FireAnimationFrame</code> whose <code>RunMicrotasks</code> (the draw, 0.2 ms) is followed by one ordinary <code>Layout</code>, then paint and commit, all in one task of about 1 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Per-frame apply at 2,000 msg/s: regular-table 54% → 12% busy with no forced layout, React 30% → 18%, keyed 16% → 15%; at 8,000 msg/s regular-table goes from overload to 38% busy with no dropped frame.</li>
+    <li data-kind="measured">With 24 distinct cells, a per-frame map applies about 2,190 of 4,000 values: later values overwrite earlier ones before any apply.</li>
+    <li data-kind="inferred">Per-frame apply removes work proportional to applies and keeps work proportional to messages (task, parse, map write).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Holding a value until the next frame sounds like added latency. Is it?</p>
+</section>
+
+<section class="step" data-part="D · Once per frame" data-title="Does waiting for the frame make the picture older?" data-node="dom frame present method">
+  <p class="holding"><span class="label">Question I hold</span><span>Per message, a value is in the DOM after 0.2 ms. Per frame, it waits up to 16.7 ms for the callback. Which of the two does the viewer see sooner?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The keyed panel at 8,000 messages a second, applied per message or per frame; both recordings have the pipeline in its fast state. How do the on-screen ages of individual values compare?</p>
+    <div class="opts"><button data-k="a">Per message is about half a frame fresher on screen</button><button data-k="b">The same</button><button data-k="c">Per frame is fresher, because its write is nearer the paint</button></div>
+    <div class="reveal"><p><b>The same</b>, to a tenth of a millisecond: median 9.9 against 10.0 ms, 95th percentile 17.5 against 17.5 ms. A value written by a message task is shown by the next frame that starts after it. A value written in the animation-frame callback is shown by that frame. For a given arrival time both are the same frame.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>The metric <code>ageOnScreen</code> is per apply and uses the oldest value in it, so for per-frame apply it reports the unluckiest value of each batch. To compare like with like I compute, once, the on-screen age of every single message in both policies: its <code>sentUs</code>, the apply that follows it, the frame that shows that apply.</p>
+  </div></div>
+<pre>per message value, window of the run only, read once       in the DOM p50 / p95     on screen p50 / p95     pipeline state
+s-msg-8000-tanstack    apply per message                    0.2 /  0.6 ms            <mark> 9.9 / 17.5 ms</mark>        fast
+s-raf-8000-tanstack    apply per frame                      8.6 / 16.1 ms            <mark>10.0 / 17.5 ms</mark>        fast
+s-msg-2000-tanstack    apply per message                    0.1 /  0.3 ms            25.3 / 32.8 ms          display one behind
+s-raf-2000-tanstack    apply per frame                      8.7 / 16.1 ms            25.3 / 32.8 ms          display one behind
+s-msg-2000-regular     draw per message                     0.3 /  1.0 ms            25.4 / 32.9 ms          display one behind
+s-raf-2000-regular     draw per frame                       8.5 / 16.0 ms             9.8 / 17.4 ms          fast</pre>
+  <table class="mtable" data-rows="s-msg-8000-tanstack,s-raf-8000-tanstack,s-msg-2000-tanstack,s-raf-2000-tanstack" data-names="8000 /s per message,8000 /s per frame,2000 /s per message,2000 /s per frame" data-head="The bound metric (oldest value of each apply)"
+    data-cols="ticks.ageWhenApplied.p50|age in DOM p50|ms,ticks.ageOnScreen.p50|age on screen p50|ms,ticks.ageOnScreen.p95|p95|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p>In the DOM, per-frame values are 8.6 ms older at the median and 16 ms at worst: exactly the wait for the callback. On screen there is no difference within a pipeline state. In the bound table the per-frame p50 equals the per-message p95, because "oldest of the batch" is the per-message worst case.</p>
+    <p>regular-table drawn per frame is not a frame later either: its <code>draw()</code> completes inside the callback (step 10's Try it) and is painted by the same frame. The last two rows differ by 16 ms only because the two recordings are in different pipeline states (step 3).</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The two observation points answer different questions. "When is it in the DOM" matters to code that reads the DOM between frames: a test, an accessibility tool, a selection handler, another script. "When is it on screen" matters to the person looking. Per-frame apply delays the first and not the second.</p>
+    <p>The trade, stated precisely: per-frame apply bounds work by the frame rate at the price of a DOM that is up to one frame stale between frames, and of intermediate values never being written. It costs no on-screen latency.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> for a page that keeps up, applying in <code>requestAnimationFrame</code> shows each value in the same frame as applying on arrival.</p>
+    <p><b>No:</b> that this holds when the per-message policy is overloaded (then per frame is far fresher: <b data-m="s-raf-8000-regular/ticks.ageOnScreen.p50"></b> ms against <b data-m="s-msg-8000-regular/ticks.ageOnScreen.p50"></b> ms for regular-table at 8,000 a second), or for React per message, where "applied" is the <code>rerender()</code> call and the commit follows in a later task.</p>
+  </div></div>
+  <div class="hard"><span class="label">Hard learning</span><p>I read <code>ageWhenApplied</code> going from 0.2 to 16.5 ms as "per-frame apply costs a frame of latency", and the first-pass note for this module said that regular-table's own frame wait adds another. Neither survives the per-value numbers: the screen shows the same frame, and regular-table's <code>draw()</code> has no frame wait. <b>Rule I keep:</b> a latency claim names its observation point; and before comparing a per-batch metric with a per-item metric, compute both per item.</p></div>
+  <div class="try"><span class="label">Try it</span>Module 2's pair <code>f-obs-msg</code> and <code>f-obs-raf</code> shows the same rule with five updates a second, slow enough to follow each one: <code>node lab/harness/q.mjs f-obs-raf marks . 0 700</code> and <code>… frames 0 700</code>. Expected: each apply sits inside a main frame and is presented by it.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Per value, on-screen age is identical for per-message and per-frame apply in the same pipeline state: 9.9/17.5 ms against 10.0/17.5 ms (p50/p95) at 8,000 msg/s; in the DOM the per-frame value is 8.6 ms older at the median.</li>
+    <li data-kind="rejected">"Applying in requestAnimationFrame adds a frame of on-screen latency", and "regular-table adds one more because draw() waits for a frame": the same frame shows the value; draw() never awaits an animation frame.</li>
+  </ul>
+  <p class="next" data-answer="age"><b>Next question →</b> Per-frame apply still runs one task per message on the main thread. Can the messages go somewhere else?</p>
+</section>
+
+<!-- ═════════════════════════ PART E ═════════════════════════ -->
+
+<section class="step" data-part="E · Elsewhere: worker, server, wire" data-title="Parse in a worker, pull once per frame" data-node="worker handler frame">
+  <p class="holding"><span class="label">Question I hold</span><span>If the socket lives in a worker that keeps the latest value per cell, and the page asks for the changes once per frame, what does the main thread still pay, and what does the round trip cost?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The page asks the worker from its animation-frame callback ("pull"). The worker answers in 0.05 ms. In which frame are the answered values painted?</p>
+    <div class="opts"><button data-k="a">The frame that asked</button><button data-k="b">The next frame, 16.7 ms later</button><button data-k="c">It varies with how busy the worker is</button></div>
+    <div class="reveal"><p><b>The next frame, always.</b> The answer is ready 0.05 ms after the question, but the main thread is still inside the frame that asked: it has style, layout, paint and commit to finish. The reply is a task; it runs after the frame's task ends. By construction it misses.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>s-worker-8000-tanstack</code>: <code>apply=worker</code>, 8,000 messages a second. I compare the main thread's load with the per-message and per-frame runs, then follow one pull.</p>
+  </div></div>
+  <table class="mtable" data-rows="s-msg-8000-tanstack,s-raf-8000-tanstack,s-worker-8000-tanstack" data-names="per message (main),per frame (main),worker + pull per frame" data-head="8000 /s, keyed"
+    data-hi="s-worker-8000-tanstack:threads.mainUtilPct,s-worker-8000-tanstack:ticks.ageOnScreen.p50"
+    data-cols="main.tasks|main-thread tasks,threads.mainUtilPct|main busy|%,threads.workerBusyMs|worker busy|ms,ticks.applies|applies,ticks.ageWhenApplied.p50|age in DOM p50 (oldest)|ms,ticks.ageOnScreen.p50|on screen p50 (oldest)|ms"></table>
+  <div class="tracelink" data-trace="s-worker-8000-tanstack">Pin <code>DedicatedWorker thread</code> and <code>CrRendererMain</code>; search <code>SchedulePostMessage</code> and follow the flow arrows.</div>
+  <div class="lanes" data-lanes='{"traces":["s-worker-8000-tanstack"],"from":324,"to":347,"rows":["worker","main","app","mainFrames","frames"],"pins":[[1,327.49,"main.js"],[2,327.51,"worker"],[3,327.93,"app"],[4,343.61,"mainFrames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>Inside the main frame for vsync 87, the animation-frame callback <code>pull</code> posts the request (327.51).</li>
+    <li><i>2</i>The worker handles it at once: copies its dirty map into a <code>Float64Array</code>, transfers it back at 327.56. (The lane draws worker tasks of 50 µs or more; the 9,600 message tasks of about 17 µs each are below that and are counted in "worker busy".)</li>
+    <li><i>3</i>The main thread finishes its frame at 327.88 and runs the reply at 327.92: 24 values applied, the oldest 16.8 ms old.</li>
+    <li><i>4</i>They are painted by the main frame for vsync 88, 15.7 ms later.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Main thread</b>: <b data-m="s-worker-8000-tanstack/main.tasks"></b> tasks instead of ten thousand, <b data-m="s-worker-8000-tanstack/threads.mainUtilPct"></b>% busy instead of <b data-m="s-raf-8000-tanstack/threads.mainUtilPct"></b>%. The per-message cost that per-frame apply could not remove is on another thread: <b data-m="s-worker-8000-tanstack/threads.workerBusyMs"></b> ms of worker time in 1.2 s.</p>
+    <p><b>Age</b>: the oldest value of each batch is on screen at <b data-m="s-worker-8000-tanstack/ticks.ageOnScreen.p50"></b> ms. Three frames: one waiting in the worker for the pull, one between the reply and the frame that paints it (the answer to the prediction), and one because this recording's pipeline is in the "renderer compositor one behind" state.</p>
+    <p><b>Every frame is amber.</b> That is step 3's third state, and it is not the worker's doing: <code>s-msg-8000-react</code>, without a worker, is amber throughout as well, and the conflation trace left the state by itself. The colour does not mark the cost; "presented 17 ms after its vsync" does, and the green late runs pay the same.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Two different costs must be kept apart. The pipeline state is not caused by how the page pulls. The frame between reply and paint <i>is</i>: the page takes its snapshot at the start of a frame interval and shows it at the end. A design that takes the snapshot late in the interval would show values a frame fresher at the same main-thread cost: the worker posting its batch on its own timer shortly before the vsync, or the page pulling from a timer instead of from the frame callback and applying what it has when the callback runs.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/pages/src/ticks.ts:115–123 · ticks.worker.ts:29–38</span>
+<pre><span class="n">116</span>  const pull = () => {
+<span class="n">117</span>    if (!asked) {                 <span class="c">// at most one pull in flight</span>
+<span class="n">118</span>      asked = true;
+<span class="n">119</span>      <mark>worker.postMessage({ pull: true });</mark>
+<span class="n">120</span>    }
+<span class="n">121</span>    requestAnimationFrame(pull);  <span class="c">// asks for a frame every frame, changes or not</span>
+
+<span class="n">29</span>  else if (ev.data.pull) {
+<span class="n">30</span>    const cells = new Float64Array(dirty.size * 3);
+<span class="n">37</span>    dirty.clear();
+<span class="n">38</span>    self.postMessage({ seq, oldestUs: oldest, newestUs: newest, messages, bytes, cells }, <mark>[cells.buffer]</mark>);</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/core/workers/dedicated_worker_object_proxy.cc;l=64">third_party/blink/renderer/core/workers/dedicated_worker_object_proxy.cc:64–67</a>
+<pre><span class="n">64</span>void DedicatedWorkerObjectProxy::PostMessageToWorkerObject(
+<span class="n">66</span>  PostCrossThreadTask(
+<span class="n">67</span>      *GetParentExecutionContextTaskRunners()->Get(<mark>TaskType::kPostedMessage</mark>),</pre>
+      <p>The reply is an ordinary posted task on the main thread (queue <code>FRAME_PAUSABLE_TQ</code>, normal priority in the trace). It cannot interrupt the frame that is running.</p>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Transfer</dt><dd>Passing an <code>ArrayBuffer</code> in <code>postMessage</code>'s transfer list moves it instead of copying it; the sender loses access.</dd>
+      <dt>One pull in flight</dt><dd>The consumer asks when it is ready, and not again until answered. The producer's side conflates meanwhile.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> moving the socket into a worker removes the per-message cost from the main thread (28% → 7% busy here) and bounds main-thread work by frames; pulling from the frame callback makes values one frame older on screen than applying them in that callback from a main-thread map.</p>
+    <p><b>No:</b> that 50 ms is "the worker's latency": one of the three frames is this recording's pipeline state. Like for like the worker costs one frame more than per-frame apply on the main thread.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: ingestion and decoding in a worker, a latest-value table per visible key there, one pull in flight; but schedule the hand-over <i>late</i> in the frame interval (worker-timed push, or a pull issued by timer about 10 ms after the frame), and apply in the frame callback. Measure it as "age at commit" against the per-frame main-thread baseline before adopting it; the expected gain is one frame.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-worker-8000-tanstack slices "PostMessage" 326 345</code>. Expected: <code>SchedulePostMessage</code> on the main thread at 327.51, <code>HandlePostMessage</code> on the worker in the same hundredth of a millisecond, the worker's <code>SchedulePostMessage</code> at 327.56, and <code>HandlePostMessage</code> on the main thread at 327.92.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Socket in a worker with one pull per frame at 8,000 msg/s: main thread 7% busy and about 500 tasks, against 28% and 10,000 for per-frame apply on the main thread; the worker is busy 167 ms in 1.2 s.</li>
+    <li data-kind="measured">The worker answers a pull in 0.05 ms; the reply runs 0.4 ms later, after the frame that asked has committed, and is painted by the next frame.</li>
+    <li data-kind="rejected">"Amber frames are the cost of the worker pull." The amber state also appears without a worker (s-msg-8000-react) and ends by itself in s-conflate-8000-tanstack; the pull's own cost is one frame between reply and paint.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> The worker conflates after the messages have crossed the network. What if the server does it before?</p>
+</section>
+
+<section class="step" data-part="E · Elsewhere: worker, server, wire" data-title="Conflate on the server" data-node="server wire handler">
+  <p class="holding"><span class="label">Question I hold</span><span>The server keeps the latest value per cell and sends one message every 16 ms. What reaches the page, what never does, and how old is it?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p><code>s-conflate-8000-tanstack</code>: the producer still makes 8,000 updates a second, into a map; a second timer sends the map every 16 ms (<code>conflate=16</code>). The page applies per message.</p>
+  </div></div>
+  <table class="mtable" data-rows="s-msg-8000-tanstack,s-raf-8000-tanstack,s-worker-8000-tanstack,s-conflate-8000-tanstack" data-names="per message,per frame,worker + pull,server conflation 16 ms" data-head="8000 updates /s, keyed"
+    data-cols="ticks.perSecondHandled|messages to the page|/s,ticks.cellsApplied|cell values applied,threads.mainUtilPct|main busy|%,threads.ioBusyMs|renderer IO thread|ms,ticks.ageWhenApplied.p50|age in DOM p50 (oldest)|ms,traceBytes|trace size|bytes"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b data-m="s-conflate-8000-tanstack/ticks.perSecondHandled"></b> messages a second reach the browser instead of 8,000, each carrying 24 cells. The main thread is as idle as with the worker (<b data-m="s-conflate-8000-tanstack/threads.mainUtilPct"></b>%), and the renderer's IO thread has almost nothing to pass on; no worker is needed. The oldest value of a message is 16 ms old when applied: it waited in the server's map.</p>
+    <p>Of the roughly 9,600 updates the server produced in this window, <b data-m="s-conflate-8000-tanstack/ticks.cellsApplied"></b> were sent. Four fifths never left the server.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>All three batching policies end at the same picture: 24 cells, 60 times a second. They differ in how far the discarded updates travel first. Per-frame apply carries every update across the network, through two processes and a main-thread task before overwriting it. The worker carries it as far as a worker thread. Server conflation discards it at the source, and is the only one that also relieves the network (<a href="network.html">Module 8</a>: on a 256 kbit/s link that is the difference between keeping up and a growing queue).</p>
+    <p>What is lost is the same in all three: every value that was overwritten within one interval. That is right for "show the current price" and wrong for anything that must see each event: a trade log, an alert on a threshold crossed for a moment, a sum over updates. Those need the unconflated stream or a server-side aggregate; a display does not.</p>
+    <p>The server's timer and the display's vsync are two clocks of nearly the same frequency (62.4 against 60 a second here). They drift through each other: usually one message per frame, sometimes two, and once in this trace a frame with none, the vsync that ended the late pipeline state in step 3. A push on a fixed timer is never aligned to frames; a pull is.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <span class="path">lab/server/backend.mjs:147–150, 154–163</span>
+<pre><span class="n">147</span>      if (conflate) {
+<span class="n">148</span>        if (!dirty.size) oldest = now;                <span class="c">// age of the batch = its oldest update</span>
+<span class="n">149</span>        for (const u of updates) <mark>dirty.set(u[0] * 4096 + u[1], u);</mark>
+<span class="n">150</span>      } else send(updates, now, now);
+<span class="n">154</span>  const flush = () => {
+<span class="n">155</span>    if (!dirty.size) return;
+<span class="n">157</span>    const updates = [...dirty.values()];
+<span class="n">159</span>    send(updates, t0, oldest);
+<span class="n">163</span>  const flusher = conflate ? <mark>setInterval(flush, conflate)</mark> : null;</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Conflation key</dt><dd>What "the same thing" means: here a cell (row, column). Updates with the same key replace each other; different keys never do.</dd>
+      <dt>Conflation interval</dt><dd>How long the producer collects before sending. It is added to the age of the oldest value in each batch.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> conflating at the source gives the page the load of 62 messages a second whatever the update rate, at the price of up to one interval of age and of all intermediate values.</p>
+    <p><b>No:</b> that a fixed 16 ms timer is the right publication pace. It is unrelated to the viewer's frames and to whether the viewer is keeping up; a pull-driven publication (send the map when the client asks) gives the same conflation with the consumer setting the pace. The lab has no such mode; this is a design inference.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-conflate-8000-tanstack marks "tick apply" 590 760</code>. Expected: applies at 598.0, 614.0, 630.1, 646.9, 663.4, 678.9, 695.8, 714.1 ms: gaps of 16 to 18 ms, each with <code>"cells":24</code>.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Server conflation at 16 ms turns 8,000 updates/s into 62 messages/s of 24 cells; main thread 6% busy; four fifths of the updates are never sent; the oldest value of a batch is 16 ms old at the DOM.</li>
+    <li data-kind="inferred">Per-frame apply, worker pull and server conflation show the same picture and lose the same intermediate values; they differ in how far a discarded update travels before it is discarded.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Two cheaper-sounding fixes remain: a binary wire format, and bigger messages. What does each remove?</p>
+</section>
+
+<section class="step" data-part="E · Elsewhere: worker, server, wire" data-title="Wire format and batching: cost per message, per update, per changed cell" data-node="wire handler dom">
+  <p class="holding"><span class="label">Question I hold</span><span>Is the cost of a stream in its bytes, in its messages, in its updates, or in the cells that change on screen?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Two contrasts on the keyed panel. <b>Format</b>: 8,000 one-cell messages a second as JSON text (<code>s-raf-8000-tanstack</code>) and as <code>Float64</code> records (<code>s-bin-8000-tanstack</code>), both applied per frame. <b>Batching</b>: 2,000 messages a second of one cell, 2,000 of twenty cells (<code>s-msg-2000x20-tanstack</code>), and 60 of fifty cells (<code>s-batch-60x50</code>), applied per message.</p>
+  </div></div>
+  <table class="mtable" data-rows="s-raf-8000-tanstack,s-bin-8000-tanstack" data-names="JSON text,Float64 records" data-head="8000 messages /s × 1 cell, per frame"
+    data-cols="ticks.messages|messages,main.scriptMs|script|ms,threads.ioBusyMs|renderer IO thread|ms,threads.mainUtilPct|main busy|%"></table>
+  <table class="mtable" data-rows="s-msg-60-tanstack,s-batch-60x50,s-msg-2000-tanstack,s-msg-2000x20-tanstack" data-names="60 /s × 1 cell,60 /s × 50 cells,2000 /s × 1 cell,2000 /s × 20 cells" data-head="Apply per message"
+    data-cols="ticks.messages|messages,ticks.cellsApplied|cell values applied,main.scriptMs|script|ms,main.layoutMs|layout|ms,main.paintMs|paint|ms,threads.mainUtilPct|main busy|%"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>Format: no difference.</b> <b data-m="s-raf-8000-tanstack/threads.mainUtilPct"></b>% against <b data-m="s-bin-8000-tanstack/threads.mainUtilPct"></b>% busy. In the JSON run's profile <code>decode</code>, which contains <code>JSON.parse</code>, has 1 ms of self time for 9,600 messages: a tenth of a microsecond each, next to a task of 25 µs. A binary message is 48 bytes instead of 63.</p>
+    <p><b>Twenty cells per message instead of one</b>, same message rate: 55,000 cell values applied instead of 4,000, and the thread goes from <b data-m="s-msg-2000-tanstack/threads.mainUtilPct"></b>% to <b data-m="s-msg-2000x20-tanstack/threads.mainUtilPct"></b>% busy. Fourteen times the values for a fifth more work: about 1 µs per extra value.</p>
+    <p><b>Fifty cells in 60 messages</b> against one cell in 60 messages: script is the same within noise; layout and paint double. More cells change per frame (about 21 instead of 1), and each changed cell is laid out and painted.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Three unit costs, from these recordings and with our marks on:</p>
+<pre>per message          20 – 40 µs      task, mojo, event, handler entry (+ our mark)       scales with the message rate
+per update            ≈ 1 µs         parse, map write, one textContent                    scales with updates
+per changed cell     ≈ 15 – 20 µs    style, layout and paint of that cell, once a frame   bounded by visible cells × 60</pre>
+    <p>A message costs as much as 20 to 40 updates inside it. So the first thing to reduce is the number of messages; the encoding of a small message is the last. The binary format would matter for large messages (<a href="backend.html">Module 6</a> measures the parse of a 1 MB reply), and its records are not even smaller in general: three <code>Float64</code> are 24 bytes per update, where JSON's <code>[3,2,187.25]</code> is 12.</p>
+    <p>The third line is the display's own cost. No ingestion policy changes it; it is bounded because the screen is.</p>
+  </div></div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> at one small update per message, message count dominates and the wire format is irrelevant to main-thread time; batching the same updates into fewer messages removes most of the cost.</p>
+    <p><b>No:</b> the unit costs as constants. Each is a subtraction between two single runs, and step 4 showed how much a "cost per message" moves with the rate.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-raf-8000-tanstack prof 0 1200</code>. Expected: after <code>(idle)</code> and <code>(program)</code>, <code>mark</code> near 90 ms, <code>measure</code> near 8 ms (72 calls: one per frame), and <code>decode</code> near 1 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Binary Float64 records against JSON at 8,000 one-cell messages/s: the same main-thread time; JSON.parse is about 0.1 µs per message.</li>
+    <li data-kind="measured">2,000 messages/s carrying 20 cells instead of 1: fourteen times the applied values for a fifth more main-thread time, about 1 µs per extra value.</li>
+    <li data-kind="inferred">Three unit costs: per message (tens of µs), per update (about 1 µs), per changed cell per frame (layout and paint, bounded by the screen).</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Back to the overloaded page of step 9. The main frame waited exactly 100 ms, every time. Who decided that?</p>
+</section>
+
+<!-- ═════════════════════════ PART F ═════════════════════════ -->
+
+<section class="step" data-part="F · The scheduler under a flood" data-title="Who gets the main thread: FIFO, then the 100 ms rule" data-node="queue scheduler frame">
+  <p class="holding"><span class="label">Question I hold</span><span>Thousands of message tasks are queued and the compositor asks for a main frame. Where in the line does the frame's task go?</span></p>
+
+  <div class="predict" data-right="b"><span class="label">Predict first</span>
+    <p>The page is overloaded and messages are 60 ms old when handled (the backlog is 60 ms deep). The compositor posts a BeginMainFrame task to the main thread. No one is touching the page. How long does that task wait?</p>
+    <div class="opts"><button data-k="a">Hardly at all: rendering has priority over network tasks</button><button data-k="b">About 60 ms: it queues behind the messages already waiting</button><button data-k="c">Until the backlog is gone</button></div>
+    <div class="reveal"><p><b>About 60 ms.</b> With no input, the frame's task and the message tasks have the same priority and are served in the order they were posted. The frame waits exactly as long as a message does, until that wait would exceed 100 ms. Then the scheduler raises the frame's priority and it jumps the line.</p></div>
+  </div>
+
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Two traces. From the ramp (step 7) I read, for every main frame after the knee, how long its task waited and at what priority it was finally selected; next to it the age of the messages handled at that moment. From <code>s-msg-8000-regular</code>, where the overload is older and deeper, the same.</p>
+  </div></div>
+<pre>s-ramp-regular after the knee, read once                         s-msg-8000-regular, read once
+BeginMainFrame   waited    selected at       data age            BeginMainFrame   waited     selected at
+starts (ms)      (ms)      priority          then (ms)           starts (ms)      (ms)       priority
+2011.8             1.2     NORMAL              1.4                -251.7            61.9     NORMAL
+2035.9             8.8     NORMAL                                 -173.1            77.8     NORMAL
+2060.5            16.7     NORMAL             ≈ 21                 <mark>-72.0           100.4     VERY_HIGH</mark>
+2134.1            28.2     NORMAL             ≈ 32                  28.7            99.9     VERY_HIGH
+2212.8            43.2     NORMAL             ≈ 42                 129.4            99.9     VERY_HIGH
+2322.4            58.9     NORMAL             ≈ 57                 230.1           100.0     VERY_HIGH
+2459.3            73.0     NORMAL             ≈ 72                 330.8           100.0     VERY_HIGH   <span class="c">… 19 more, all 99.9–100.1</span>
+2537.9            77.9     NORMAL             ≈ 78</pre>
+  <div class="tracelink" data-trace="s-msg-8000-regular">In Perfetto: select a <code>ThreadControllerImpl::RunTask</code> slice on <code>CrRendererMain</code> and read <code>sequence_manager_task.queue_name</code> and <code>.priority</code> in its arguments.</div>
+  <div class="lanes" data-lanes='{"traces":["s-msg-8000-regular"],"from":0,"to":460,"rows":["mainFrames","frames"],"pins":[[1,80,"mainFrames"],[2,129.4,"mainFrames"],[3,63.7,"frames"],[4,113.7,"frames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>A main frame requested at 29.4 ms. Its bar is waiting, not work.</li>
+    <li><i>2</i>At 129.37, 99.9 ms later, its task is selected at <code>VERY_HIGH_PRIORITY</code> and runs for 0.57 ms. In the task list it sits between two message tasks 0.2 ms apart: the line was not empty, it was overtaken.</li>
+    <li><i>3</i>Five vsyncs in a row with nothing to show: dropped.</li>
+    <li><i>4</i>One vsync in six presents something, amber: "without the pending main update" (Module 2), and more than 100 ms after its vsync.</li>
+  </ol>
+  <table class="mtable" data-rows="s-msg-8000-tanstack,s-msg-8000-react,s-msg-8000-regular" data-names="keyed,React,regular-table (overloaded)" data-head="8000 /s, tasks by queue"
+    data-cols="taskQueues.FRAME_LOADING_TQ.n|FRAME_LOADING_TQ tasks,taskQueues.FRAME_LOADING_TQ.ms|ms,taskQueues.COMPOSITOR_TQ.n|COMPOSITOR_TQ tasks,taskQueues.COMPOSITOR_TQ.ms|ms,frames.mainFrames|main frames,frames.mainQueueMs.p50|their wait p50|ms,frames.mainQueueMs.max|max|ms"></table>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>First regime, FIFO.</b> On the ramp the frame's wait tracks the data age step for step, at <code>NORMAL_PRIORITY</code>. The frame rate falls as the backlog grows: a frame every 24, 29, 35, 44, 50, 59, 63, 73 ms.</p>
+    <p><b>Second regime, the cap.</b> In the deeper overload every main frame waits 100 ms, to within a tenth of a millisecond, and is selected at <code>VERY_HIGH_PRIORITY</code>: <b data-m="s-msg-8000-regular/frames.mainFrames"></b> main frames in <b data-m="s-msg-8000-regular/windowMs"></b> ms, ten a second, while data age climbs past 500 ms. The trace begins just as the first regime turns into the second.</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>Chrome's main thread is not one queue but many, each with a priority; the selector always takes the oldest task of the highest non-empty priority. WebSocket messages arrive as <i>networking</i> tasks on the frame's loading queue, normal priority. BeginMainFrame arrives on the compositor queue, whose priority is computed: normal when nothing special is going on. Same priority means first posted, first served, across queues. And since mojo posts one task per waiting message, "the messages ahead of the frame" are real tasks ahead of it.</p>
+    <p>The cap is a starvation rule. After every task the scheduler checks how long ago the last main frame ended; at 100 ms it marks rendering as starved and raises the compositor queue to very high until a main frame has run. So a flood of short tasks cannot push the page below ten frames a second. One long task still can: the check runs between tasks.</p>
+    <p>Notice what the page gives up on its way down: frames first, messages never. At 8,000 a second the overloaded page spends 99% of the thread on data that is half a second old and 1% on showing it.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc;l=592">third_party/blink/renderer/modules/websockets/websocket_channel_impl.cc:592–594</a> · <span class="path">platform/scheduler/main_thread/frame_scheduler_impl.cc:508–510</span>
+      <p>Which queue a WebSocket message lands on.</p>
+<pre><span class="n">592</span>  client_receiver_.Bind(
+<span class="n">593</span>      std::move(client_receiver),
+<span class="n">594</span>      execution_context_->GetTaskRunner(<mark>TaskType::kNetworking</mark>));
+
+<span class="n">508</span>    case TaskType::kInternalLoading:
+<span class="n">509</span>    case TaskType::kNetworking:
+<span class="n">510</span>      return <mark>LoadingTaskQueueTraits()</mark>;</pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:base/task/sequence_manager/task_queue_selector.cc;l=176">base/task/sequence_manager/task_queue_selector.cc:176, 184, 207</a>
+      <p>How the next task is chosen: highest priority with work, then the oldest.</p>
+<pre><span class="n">176</span>  auto highest_priority = GetHighestPendingPriority(option);
+<span class="n">184</span>  TaskQueue::QueuePriority priority = highest_priority.value();
+<span class="n">207</span>                             <mark>ChooseWithPriority&lt;SetOperationOldest>(priority);</mark></pre>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc;l=2900">platform/scheduler/main_thread/main_thread_scheduler_impl.cc:2683–2684, 2900–2903, 2952–2955 · .h:118–119</a>
+      <p>The compositor queue's priority is a variable; the starvation rule sets it.</p>
+<pre><span class="n">2683</span>    case MainThreadTaskQueue::QueueTraits::PrioritisationType::kCompositor:
+<span class="n">2684</span>      return main_thread_only().compositor_priority;
+
+<span class="n">2900</span>      if (task_timing.end_time() - main_thread_only().last_frame_time >=
+<span class="n">2901</span>          <mark>kDefaultRenderingStarvationThreshold</mark>) {
+<span class="n">2902</span>        main_thread_only().main_frame_prioritization_state =
+<span class="n">2903</span>            RenderingPrioritizationState::kRenderingStarved;
+
+<span class="n">2952</span>    case RenderingPrioritizationState::kRenderingStarved:
+<span class="n">2955</span>      return <mark>TaskPriority::kVeryHighPriority</mark>;
+
+<span class="n"> 118</span>  static constexpr base::TimeDelta kDefaultRenderingStarvationThreshold =
+<span class="n"> 119</span>      <mark>base::Milliseconds(100)</mark>;</pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Task queue, task type</dt><dd>Blink sorts main-thread work into queues by type (networking, timers, posted messages, compositor, input …). The trace names both on every task when the <code>scheduler</code> category is on.</dd>
+      <dt>Strict priority</dt><dd>A lower priority runs only when every higher one is empty. Priorities in descending order: control, highest, extremely high, very high, high, normal, low, best effort (<code>task_priority.h:14–27</code>).</dd>
+      <dt>BeginMainFrame</dt><dd>The task in which the main thread produces a frame: animation-frame callbacks, style, layout, paint, commit (Module 1).</dd>
+      <dt>Starvation rule</dt><dd>A guard that raises the priority of work that has waited too long behind others.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> without input, a main frame waits behind queued message tasks like any other task, and its wait equals the main-thread backlog up to 100 ms; beyond that Chrome guarantees roughly ten main frames a second against a flood of short tasks.</p>
+    <p><b>No:</b> that ten frames a second is acceptable or that the rule helps data age: it does nothing for the backlog. And the trace does not record the scheduler's state variables; that the priority came from this rule is read from the source and the exact 100.0 ms, not from a state event.</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-msg-8000-regular tasks 128.9 130.2 0</code>. Expected: <code>FRAME_LOADING_TQ NORMAL_PRIORITY</code> tasks every 0.15 to 0.2 ms, and at 129.37 one <code>COMPOSITOR_TQ VERY_HIGH_PRIORITY</code> task of 0.57 ms between them. Then <code>… frames 0 340</code>: main frames with a queue wait of 99.9 to 100.0 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">After the knee the BeginMainFrame task waits as long as the data is old (1 → 78 ms on the ramp), selected at NORMAL priority: FIFO with the message tasks.</li>
+    <li data-kind="measured">In a deeper overload every main frame waits 100.0 ± 0.1 ms and is selected at VERY_HIGH priority: 17 main frames in 1.85 s (s-msg-8000-regular).</li>
+    <li data-kind="read">WebSocket messages are kNetworking tasks on the loading queue (websocket_channel_impl.cc:592–594, frame_scheduler_impl.cc:508–510); the selector serves the oldest task of the highest pending priority (task_queue_selector.cc:176–207); after 100 ms without a main frame the compositor queue goes to very high priority (main_thread_scheduler_impl.cc:2900–2903, .h:118–119).</li>
+  </ul>
+  <p class="next" data-answer="first"><b>Next question →</b> That was a page nobody touched. What changes when the user scrolls during the flood?</p>
+</section>
+
+<section class="step" data-part="F · The scheduler under a flood" data-title="Scrolling during a stream" data-node="scheduler frame present">
+  <p class="holding"><span class="label">Question I hold</span><span>A wheel scroll runs on the compositor thread. While it runs, what priority does the main frame get, and what do the scroll and the table's content each look like under a flood?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>Three shared recordings scroll for about two seconds (two wheel gestures back to back) under a stream the page can easily handle: 2,000 a second into regular-table, per message and per frame, and 4,000 a second into the keyed panel. A fourth, <code>s-scroll-flood-regular</code>, scrolls while the page is overloaded: the main thread is throttled four times, so that 3,000 draw requests a second are already half again too many. I read the priority of every BeginMainFrame task and the scroll's own latency.</p>
+  </div></div>
+  <table class="mtable" data-rows="s-scroll-msg-2000-regular,s-scroll-raf-2000-regular,s-scroll-msg-4000-tanstack,s-scroll-flood-regular" data-names="regular 2000 /s · per message,regular 2000 /s · per frame,keyed 4000 /s · per message,regular 3000 /s · CPU ÷4 (overloaded)" data-head="Scrolling during a stream"
+    data-hi="s-scroll-flood-regular:content.completeMarks,s-scroll-flood-regular:frames.mainQueueMs.p50"
+    data-cols="threads.mainUtilPct|main busy|%,eventLatency.GESTURE_SCROLL_UPDATE.p50|scroll update → screen p50|ms,eventLatency.GESTURE_SCROLL_UPDATE.p95|p95|ms,frames.mainQueueMs.p50|main frame waits p50|ms,frames.mainQueueMs.p95|p95|ms,frames.mainFrames|main frames,content.completeMarks|times the right rows were in the DOM"></table>
+<pre>priority at which the task containing each ProxyMain::BeginMainFrame was selected (read once from the raw traces)
+s-scroll-msg-2000-regular    before the scroll: NORMAL
+                             first 6 frames of the scroll: HIGHEST
+                             then <mark>119 × LOW</mark>, each waited ≈ 0.01 ms
+s-scroll-flood-regular       before the scroll: VERY_HIGH, one per 100 ms
+                             1.7 – 92 ms:    7 × HIGHEST, one per vsync
+                             200 – 625 ms:   5 × <mark>VERY_HIGH, one per 100 ms</mark>
+                             642 – 726 ms:   6 × HIGHEST, one per vsync
+                             after:          VERY_HIGH, one per 100 ms</pre>
+  <div class="tracelink" data-trace="s-scroll-flood-regular"></div>
+  <div class="lanes" data-lanes='{"traces":["s-scroll-flood-regular"],"from":-60,"to":1000,"rows":["inputs","mainFrames","frames"],"pins":[[1,50,"mainFrames"],[2,160,"mainFrames"],[3,158.1,"frames"],[4,358.1,"frames"],[5,683,"mainFrames"]]}'></div>
+  <ol class="pins">
+    <li><i>1</i>The first gesture starts. For about 100 ms the main frame is selected at <code>HIGHEST_PRIORITY</code>: one per vsync, although the thread is saturated with messages.</li>
+    <li><i>2</i>Then the main frame waits again: one per 100 ms, selected at <code>VERY_HIGH</code> by the starvation rule.</li>
+    <li><i>3</i>Meanwhile the compositor presents a frame every vsync, 0.8 ms after it: the scroll position moves. These frames are amber: the scroll is shown, the main thread's rows for the new position are not in them.</li>
+    <li><i>4</i>Between the gestures nothing moves on the compositor, and only the main thread could change the picture: five vsyncs dropped per frame shown.</li>
+    <li><i>5</i>A second run of main frames at <code>HIGHEST</code>, during the second gesture.</li>
+  </ol>
+  <div class="beat"><span class="label">What I see</span><div>
+    <p><b>The scroll itself does not notice the flood.</b> From wheel event to presented scroll position: <b data-m="s-scroll-flood-regular/eventLatency.GESTURE_SCROLL_UPDATE.p50"></b> ms median, <b data-m="s-scroll-flood-regular/eventLatency.GESTURE_SCROLL_UPDATE.p95"></b> ms p95, the same as under the light stream (<b data-m="s-scroll-msg-2000-regular/eventLatency.GESTURE_SCROLL_UPDATE.p50"></b> and <b data-m="s-scroll-msg-2000-regular/eventLatency.GESTURE_SCROLL_UPDATE.p95"></b>).</p>
+    <p><b>The content does.</b> The right rows for the scroll position were in the DOM <b data-m="s-scroll-flood-regular/content.completeMarks"></b> times during the overloaded scroll, against <b data-m="s-scroll-msg-2000-regular/content.completeMarks"></b> times under the light stream, in a scroll about three times as long. regular-table's table is <code>position: sticky</code>, so the viewer sees no blank area: the old rows stay put under a moving scrollbar and jump ten times a second.</p>
+    <p><b>Under the light stream</b> the main frame is selected at <code>LOW_PRIORITY</code> for almost the whole scroll, and it costs nothing: the thread is idle most of the time, so a low-priority task still starts at once.</p>
+    <p><b>Scroll draws and update draws do not merge</b> in regular-table. Over the page's life the per-message scroll run counted <b data-m="s-scroll-msg-2000-regular/state.counters.drawRequests"></b> draw requests from updates and <b data-m="s-scroll-msg-2000-regular/state.counters.draws"></b> draws; the difference is about one draw per scroll event (<b data-m="s-scroll-msg-2000-regular/main.scrollEvents"></b> in the window).</p>
+  </div></div>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>During a scroll that the compositor handles alone, Chrome deliberately puts the main frame <i>below</i> ordinary tasks: the compositor keeps the scroll smooth by itself, and main-thread work should not be delayed for frames the scroll does not need. The source says what that risks ("can also increase checkerboarding") and names the same 100 ms rule as the balance. So in a flood during a scroll, messages win outright and the content gets the floor of ten frames a second, even when the backlog is short.</p>
+    <p>For a virtualized table that is the wrong way round: its content for the new scroll position exists only if the main thread runs. The two runs at <code>HIGHEST</code> show the scheduler can put frames first; which input state triggers that here is not recorded in these traces. Two candidates in the source are the "blocking input expected soon" branch at line 2913 and the use cases that vote highest before a gesture is classified as compositor-driven. I leave that open.</p>
+  </div></div>
+  <div class="boxes">
+    <div class="box file"><span class="label">File I am reading, and why</span>
+      <a class="path" href="https://source.chromium.org/chromium/chromium/src/+/73c14f6228d7cd537c855007e8f88678969cc0eb:third_party/blink/renderer/platform/scheduler/main_thread/main_thread_scheduler_impl.cc;l=2912">platform/scheduler/main_thread/main_thread_scheduler_impl.cc:2912–2919</a>
+<pre><span class="n">2912</span>    case UseCase::kCompositorGesture:
+<span class="n">2913</span>      if (main_thread_only().blocking_input_expected_soon)
+<span class="n">2914</span>        return TaskPriority::kHighestPriority;
+<span class="n">2915</span>      // Deprioritizing compositor tasks can improve smoothness, but this can
+<span class="n">2916</span>      // also can increase checkerboarding. This tradeoff is balanced by
+<span class="n">2917</span>      // increasing priority if rendering is being starved, which is controlled
+<span class="n">2918</span>      // with `kDefaultRenderingStarvationThreshold`.
+<span class="n">2919</span>      <mark>return TaskPriority::kLowPriority;</mark></pre>
+    </div>
+    <div class="box"><span class="label">Knowledge I am using</span><dl>
+      <dt>Compositor-driven scroll</dt><dd>The compositor thread moves already-painted content without asking the main thread (Module 1). The main thread is needed only for content that was not painted yet.</dd>
+      <dt>Use case</dt><dd>The scheduler's guess at what the user is doing, from recent input. It sets the compositor queue's priority and can disable other queues.</dd>
+      <dt>CPU throttling</dt><dd>The harness slows the main thread by a factor (here 4) through the DevTools protocol. It makes an overload cheap to record; durations of main-thread work in that trace are four times longer than they would be.</dd>
+    </dl></div>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> a compositor scroll stays smooth under a main-thread flood, and the table's content falls to about ten updates a second; under a light stream the low priority of the main frame during a scroll has no visible cost.</p>
+    <p><b>No:</b> a statement about which input state gives the main frame highest priority. And the overloaded scroll is one throttled recording on a busy machine; its absolute numbers describe that run.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span><p>Proposal: never let per-message work on the main thread approach ρ = 1, because the scheduler's answer to that during a scroll is "ten content frames a second". With ingestion off the main thread and one apply per frame, the main thread's queue is empty when BeginMainFrame is posted and its priority stops mattering.</p></div>
+  <div class="try"><span class="label">Try it</span><code>node lab/harness/q.mjs s-scroll-flood-regular frames -40 1000</code>. Expected: runs of <code>partial … compositor_thread</code> presented after 0.7 to 0.9 ms during the gestures, runs of <code>dropped</code> between them, and main frames whose queue wait is either under 2 ms or 85 to 101 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="measured">Scroll-update latency is the same under overload as under a light stream (about 9 ms median, 17.5 ms p95); the right rows were in the DOM 16 times instead of 118.</li>
+    <li data-kind="measured">During a compositor-driven scroll BeginMainFrame is selected at LOW priority under a light stream (119 of 132), and at VERY_HIGH once per 100 ms under overload, with two 100 ms runs at HIGHEST.</li>
+    <li data-kind="read">kCompositorGesture votes kLowPriority for the compositor queue unless blocking input is expected soon (main_thread_scheduler_impl.cc:2912–2919).</li>
+    <li data-kind="measured">regular-table's scroll draws and update draws do not merge: draws exceed update requests by about the number of scroll events.</li>
+  </ul>
+  <p class="next"><b>Next question →</b> Six policies, three places to conflate. What would I build, and what would I measure to know it works?</p>
+</section>
+
+<!-- ═════════════════════════ PART G ═════════════════════════ -->
+
+<section class="step" data-part="G · What to carry away" data-title="Six policies side by side, and proposals for a table engine" data-node="server worker handler frame method">
+  <p class="holding"><span class="label">Question I hold</span><span>Put every policy on one page. Which cost does each remove, and what would a table engine that takes them seriously look like?</span></p>
+  <div class="beat"><span class="label">What I do</span><div>
+    <p>All recordings that receive 8,000 updates a second, ordered by where the update is absorbed.</p>
+  </div></div>
+  <div class="bars" data-bars='{"ids":["s-msg-8000-regular","s-msg-8000-react","s-msg-8000-tanstack","s-raf-8000-regular","s-raf-8000-tanstack","s-bin-8000-tanstack","s-worker-8000-tanstack","s-conflate-8000-tanstack"],"labels":["draw per message (regular)","render per message (React)","patch per message (keyed)","draw per frame (regular)","patch per frame (keyed)","… binary wire","worker + pull per frame","server conflation 16 ms"],"series":[{"path":"threads.mainUtilPct","label":"main thread busy","color":"#d9a800"}],"unit":"% of the run","title":"8,000 updates a second: main thread busy by policy","max":100,"line":100,"lineLabel":"saturated"}'></div>
+  <table class="mtable" data-rows="s-msg-8000-regular,s-msg-8000-react,s-msg-8000-tanstack,s-raf-8000-regular,s-raf-8000-tanstack,s-worker-8000-tanstack,s-conflate-8000-tanstack" data-names="draw per message (regular),render per message (React),patch per message (keyed),draw per frame (regular),patch per frame (keyed),worker + pull per frame,server conflation 16 ms" data-head="8000 updates /s"
+    data-cols="ticks.applies|applies,ticks.cellsApplied|values applied,threads.mainUtilPct|main busy|%,ticks.ageWhenApplied.p50|age in DOM p50 (oldest)|ms,ticks.ageWhenApplied.p95|p95|ms,frames.mainQueueMs.p95|main frame waits p95|ms,frames.dropped|frames dropped"></table>
+<table>
+    <tr><th>Policy</th><th>What waits, and where</th><th>Main-thread work scales with</th><th>Lost</th><th>Added age at the DOM</th></tr>
+    <tr><td>apply per message</td><td>nothing, until the knee; then a queue of tasks</td><td>messages × apply cost</td><td>nothing</td><td>≈ 0; unbounded past the knee</td></tr>
+    <tr><td>request per message, work in a later task (React)</td><td>requests coalesce in the task queue</td><td>messages × task, plus renders</td><td>nothing</td><td>≈ 0</td></tr>
+    <tr><td>apply per frame</td><td>latest value per key, main thread</td><td>messages × task, plus frames</td><td>values between frames</td><td>0 to 1 frame (none on screen)</td></tr>
+    <tr><td>worker + pull per frame</td><td>latest value per key, worker</td><td>frames (messages go to the worker)</td><td>values between pulls</td><td>1 to 2 frames as built here</td></tr>
+    <tr><td>server conflation</td><td>latest value per key, server</td><td>frames</td><td>values between sends</td><td>0 to 1 interval</td></tr>
+    <tr><td>binary wire</td><td>—</td><td>unchanged for small messages</td><td>—</td><td>—</td></tr>
+    <tr><td>batching</td><td>updates wait for their batch</td><td>batches, not updates</td><td>—</td><td>up to the batch interval</td></tr>
+  </table>
+  <div class="beat"><span class="label">What I think</span><div>
+    <p>The summary in one sentence: a queue between two paces is safe only while the consumer is faster; a latest-value table between them is safe always, and costs the values in between. Everything else is where to put the table and who sets the pace of reading it.</p>
+  </div></div>
+  <div class="insight"><span class="label">For a table engine</span>
+    <p><b>What to conflate where</b> (proposals, each tied to a step):</p>
+    <p>1 · <b>At the engine</b>, per subscribed viewport and keyed by cell: publication is a latest-value table, read on a pull from the client, one pull in flight (steps 8, 13). The producer's pace is then set by the consumer, not by timers and TCP buffers.</p>
+    <p>2 · <b>Off the main thread</b>: the socket and decoding live in a worker; what crosses to the main thread is one transferred batch per frame, handed over late in the frame interval (step 12).</p>
+    <p>3 · <b>On the main thread</b>: one apply per frame inside the animation-frame callback, touching only cells that changed and are visible (steps 10, 11). A renderer that can only redraw (regular-table today) must never be asked per message (step 6).</p>
+    <p>4 · <b>Notification coalescing is not data conflation.</b> React's scheduler and regular-table's lock merge <i>requests</i>; they bound redraws but not the messages behind them, and a lock merges nothing unless the work spans tasks (steps 6, 9).</p>
+    <p><b>What to measure</b>: data age at commit, p50, p95 and max, with its slope over the run; the wait of the main frame for the main thread; the drain time after the producer stops; and the pipeline state ("presented-after") of the recording. Not mean FPS: the overloaded page of step 15 presents ten clean frames a second of half-second-old data. And once with the instruments off (step 5).</p>
+  </div>
+  <div class="beat conclude"><span class="label">May conclude</span><div>
+    <p><b>Yes:</b> the ordering of the policies by main-thread work, and which cost each removes: every row has a recorded pair behind it.</p>
+    <p><b>No:</b> that the proposed design has been shown. No recording here has pull-driven server publication or a late hand-over from a worker; they are inferences from what the recorded variants lack. The lab would need two knobs for them (see the last step).</p>
+  </div></div>
+  <div class="try"><span class="label">Try it</span>The two ends of the chart as frame lists: <code>node lab/harness/q.mjs s-msg-8000-regular frames 0 340</code> and <code>node lab/harness/q.mjs s-raf-2000-regular frames 300 340</code>. Expected: in the first, one <code>partial</code> vsync in six presented more than 100 ms late and the rest <code>dropped</code>; in the second, every vsync <code>all</code>, presented after about 1.7 ms.</div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">A queue between two paces is safe only while the consumer is faster; a latest-value table is always safe and costs the intermediate values. Policies differ in where the table is and who paces its reads.</li>
+    <li data-kind="inferred">Proposal for a table engine: latest-value publication per viewport pulled by the client, ingestion in a worker, one apply per frame; report age at commit with its slope, main-frame wait and drain time.</li>
+  </ul>
+  <p class="next" data-answer="where"><b>Next question →</b> Can you answer these without scrolling back?</p>
+</section>
+
+<section class="step" data-part="G · What to carry away" data-title="Check yourself" data-node="method">
+  <p class="holding"><span class="label">Question I hold</span><span>Seven questions. Answer each before opening it.</span></p>
+  <div class="exercise"><span class="label">1</span><p>A value is written into the DOM 0.3 ms after the server produced it and is on screen 9 ms after. Name the three paces involved and say where the 8.7 ms went.</p>
+    <details><summary>Answer</summary><p>The server's timer, the page's task queue, the display's vsync. The value waited in the DOM (buffer 2) for the next vsync to start a main frame; that wait is spread evenly over 0 to 16.7 ms, plus the pipeline's time from frame start to presentation, about 1.5 ms in the fast state (steps 1, 2).</p></details></div>
+  <div class="exercise"><span class="label">2</span><p>Two recordings of the same page differ by 16 ms in <code>ageOnScreen</code> at every percentile. What do you check before blaming the knob that differs?</p>
+    <details><summary>Answer</summary><p>"Presented-after" in <code>q.mjs &lt;id&gt; frames</code>. If one is near 1.5 ms and the other near 17 ms, the display compositor or the renderer's compositor is one frame behind in one of them: a self-sustaining state that lasts while every vsync carries a commit (step 3). Compare within a state, or compare age at the DOM.</p></details></div>
+  <div class="exercise"><span class="label">3</span><p>At 4,000 messages a second the main thread is 66% busy and data age is flat. Estimate the knee. Then name three things you expect in a trace recorded at twice that rate.</p>
+    <details><summary>Answer</summary><p>4,000 ÷ 0.66 ≈ 6,000 a second (the measured capacity was a little higher, 6,700 to 7,200, and 5,400 in another recording). Past it: age at handling grows with slope 1 − μ/λ; the main frame's wait for the main thread grows with it, up to 100 ms; and work continues after the producer stops, for about as long as the last message was old (step 7).</p></details></div>
+  <div class="exercise"><span class="label">4</span><p>regular-table drops draw requests that arrive while one draw runs and another waits. Why did 2,000 requests a second still produce 2,000 draws?</p>
+    <details><summary>Answer</summary><p>With a data listener that answers synchronously every await in <code>draw()</code> resolves in microtasks, so the draw is finished before its task ends. No request ever arrives while the lock is held. Coalescing needs a gap between request and work: a later task (React's scheduler), a frame (per-frame apply), or a slow data source (step 6, 9).</p></details></div>
+  <div class="exercise"><span class="label">5</span><p>"Applying in <code>requestAnimationFrame</code> adds up to a frame of latency." True or false, and at which observation point?</p>
+    <details><summary>Answer</summary><p>True at the DOM (median 8.6 ms, worst 16.7 ms later), false on screen: a value written by a message task is shown by the next frame that starts after it, a value written in the callback by that same frame. Per value the on-screen ages were 9.9/17.5 and 10.0/17.5 ms (step 11).</p></details></div>
+  <div class="exercise"><span class="label">6</span><p>The page is overloaded and nobody is touching it. A BeginMainFrame task is posted. On which queue, at which priority, and how long does it wait? What changes during a compositor-driven scroll?</p>
+    <details><summary>Answer</summary><p>On <code>COMPOSITOR_TQ</code> at normal priority, the same as the WebSocket message tasks on <code>FRAME_LOADING_TQ</code>, so first in, first out: it waits as long as the main thread's backlog, until 100 ms without a main frame raise the queue to very high priority (ten frames a second). During a compositor-driven scroll the queue is at low priority, so under a flood the frame gets only that 100 ms floor; the scroll itself stays smooth on the compositor (steps 15, 16).</p></details></div>
+  <div class="exercise"><span class="label">7</span><p>Per-frame apply, a worker with a pull per frame, and server conflation all end up painting the same 24 cells 60 times a second. What distinguishes them, and what do all three lose?</p>
+    <details><summary>Answer</summary><p>How far a discarded update travels before it is overwritten: to the main thread's map (still one main-thread task per message), to a worker (main thread sees one batch per frame), or nowhere (four fifths never left the server, which also relieves the network). All three lose the values between two reads; acceptable for a display of current values, not for consumers that need every event (steps 10, 12, 13).</p></details></div>
+  <div class="beat conclude"><span class="label">What this module did not show</span><div>
+    <p>How the late pipeline states are entered; which scheduler use case put the main frame at highest priority during the scroll; a pull-driven server publication or a late hand-over from a worker (the lab has no knob for either); <code>dropAbove</code>, the server skipping sends when its socket backs up, which never triggered because the socket never backed up; and anything on a real display or a slow network (<a href="network.html">Module 8</a>).</p>
+  </div></div>
+  <ul class="add" hidden>
+    <li data-kind="inferred">Checked: three paces and two buffers, the pipeline's own frame of latency, the knee and its three signs, coalescing needs a gap, observation points for per-frame apply, FIFO and the 100 ms rule, where conflation happens.</li>
+  </ul>
+  <p class="next"><b>Next →</b> <a href="network.html">Module 8</a> puts a slow, lossy link between the server and this page: the same queues, with the first buffer made visible. <a href="perspective.html">Module 9</a> follows an update through Perspective, which makes several of these choices in its own way.</p>
+</section>
+
+</main>
+</div>
+<script src="assets/course.js"></script>
+</body>
+</html>
